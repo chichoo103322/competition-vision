@@ -50,10 +50,10 @@ robot-perception qr --camera 0 --timeout 15 --diagnostics
 ## 软件测试
 
 ```bash
-python -m pytest
+python -m pytest tests --ignore=tests/test_lidar.py
 ```
 
-测试不会打开真实相机或串口。硬件兼容性、光照变化下的识别率、坐标标定、抓取精度、串口闭环和长时间运行仍需在实际设备上验收。
+以上命令运行视觉与任务码软件测试，不运行雷达测试。测试不会打开真实相机或串口。硬件兼容性、光照变化下的识别率、坐标标定、抓取精度、串口闭环和长时间运行仍需在实际设备上验收。
 
 ## 数据与隐私
 
