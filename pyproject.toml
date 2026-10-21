@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robot-perception"
+version = "0.1.0"
+description = "Vision and lidar safety tools for the engineering competition robot"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "opencv-python-headless>=4.8", "PyYAML>=6.0"]
+
+[project.optional-dependencies]
+inference = ["onnxruntime>=1.16"]
+serial = ["pyserial>=3.5"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+robot-perception = "robot_perception.cli:main"
+pi-vision-stream = "pi_vision.stream:main"
+
+[tool.setuptools.packages.find]
+include = ["robot_perception*", "pi_vision*"]

@@ -1,0 +1,37 @@
+"""2027 智能搬运赛项视觉上位机包。"""
+
+from .protocol import (
+    CMD_ACK,
+    CMD_FOUND,
+    CMD_HEARTBEAT,
+    CMD_NOTFOUND,
+    CMD_OBSTACLE,
+    CMD_PLACE_CHK,
+    CMD_RESCAN,
+    CMD_RING_CENTER,
+    CMD_SCAN,
+    CMD_SET_COLOR,
+    CMD_STOP_SCAN,
+    CMD_TASKCODE,
+    SCAN_MODE_MATERIAL,
+    SCAN_MODE_QR,
+    SCAN_MODE_VERIFY,
+)
+
+__all__ = [
+    "CMD_ACK",
+    "CMD_FOUND",
+    "CMD_HEARTBEAT",
+    "CMD_NOTFOUND",
+    "CMD_OBSTACLE",
+    "CMD_PLACE_CHK",
+    "CMD_RESCAN",
+    "CMD_RING_CENTER",
+    "CMD_SCAN",
+    "CMD_SET_COLOR",
+    "CMD_STOP_SCAN",
+    "CMD_TASKCODE",
+    "SCAN_MODE_MATERIAL",
+    "SCAN_MODE_QR",
+    "SCAN_MODE_VERIFY",
+]

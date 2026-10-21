@@ -1,0 +1,27 @@
+serial:
+  port: /dev/ttyUSB0
+  baudrate: 115200
+
+camera:
+  source: "0"
+  backend: v4l2
+  width: 1280
+  height: 720
+  fps: 30
+  flip: 0
+  undistort: false
+
+detection:
+  qr: true
+  materials: true
+  rings: false
+  yolo_model_path: models/best.onnx
+  yolo_confidence: 0.3
+
+task:
+  group_count: 4
+  group_length: 3
+
+debug:
+  save_dir: debug_frames
+  show: false

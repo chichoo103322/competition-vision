@@ -1,0 +1,39 @@
+# Local hardware configuration and model/data assets
+/config/*
+!/config/vision_config.example.yaml
+/models/
+/datasets/
+/runs/
+
+# Captures, reports, backups, recovery bundles, and one-off update packages
+/output/
+/backups/
+/tmp/
+/rea-*/
+/vision_recovery/
+/docs/
+/*_update/
+/*.zip
+/tools/run_vision_recovery.py
+
+# Python and local editor artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.DS_Store
+.idea/
+.vscode/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+id_ed25519*
