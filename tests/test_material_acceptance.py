@@ -37,6 +37,24 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(result['fresh_unique_observations'], 0)
         self.assertEqual(result['sequence_regressions'], 1)
 
+    def test_fault_and_reprocessed_source_cannot_count_as_fresh_detection(self):
+        a, b, c = record(1), record(2), record(3)
+        a['state']['material_observation'].update(valid=False, status='error')
+        b['state']['material_observation'].update(source_sequence=10, valid=True)
+        c['state']['material_observation'].update(source_sequence=10, valid=True)
+        result = summarize([a, b, c], {1})
+        self.assertEqual(result['fresh_unique_observations'], 1)
+        self.assertEqual(result['invalid_observations'], 1)
+        self.assertEqual(result['duplicate_polls'], 1)
+
+    def test_a_new_process_session_is_not_mixed_with_the_original_baseline(self):
+        a, b = record(1), record(2)
+        a['state']['session_id'] = 'old'
+        b['state']['session_id'] = 'new'
+        result = summarize([a, b], {1})
+        self.assertEqual(result['fresh_unique_observations'], 1)
+        self.assertEqual(result['session_changes'], 1)
+
 
 if __name__ == '__main__':
     unittest.main()

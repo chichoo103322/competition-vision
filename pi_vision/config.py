@@ -31,6 +31,7 @@ class CameraConfig:
     width: int = 1280
     height: int = 720
     fps: int = 30
+    v4l2_controls: dict = field(default_factory=dict)
     flip: int = 0
     fov_h_deg: float = 60.0
     undistort: bool = True
@@ -150,6 +151,13 @@ def _update_camera(config: CameraConfig, raw: dict) -> None:
     config.width = int(raw.get("width", config.width))
     config.height = int(raw.get("height", config.height))
     config.fps = int(raw.get("fps", config.fps))
+    controls = raw.get('v4l2_controls', config.v4l2_controls)
+    allowed = {'white_balance_automatic', 'white_balance_temperature',
+               'auto_exposure', 'exposure_time_absolute', 'gain', 'power_line_frequency'}
+    if (not isinstance(controls, dict) or set(controls) - allowed
+            or any(type(v) is not int for v in controls.values())):
+        raise ValueError('camera.v4l2_controls: unsupported control or non-integer value')
+    config.v4l2_controls = dict(controls)
     config.flip = int(raw.get("flip", config.flip))
     config.fov_h_deg = float(raw.get("fov_h_deg", config.fov_h_deg))
     config.undistort = bool(raw.get("undistort", config.undistort))

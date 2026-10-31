@@ -10,28 +10,27 @@ import cv2
 import numpy as np
 
 from ..types import Material
+from ..hsv_profile import validate_profile
 
 
 class HSVMaterialDetector:
-    def __init__(self, min_area_ratio=.012, max_area_ratio=.4):
+    def __init__(self, min_area_ratio=.012, max_area_ratio=.4, profile=None):
+        self.profile = validate_profile(profile)
+        if profile is not None:
+            min_area_ratio = self.profile['shape']['min_area_ratio']
+            max_area_ratio = self.profile['shape']['max_area_ratio']
         if not 0 < min_area_ratio < max_area_ratio < 1:
             raise ValueError('invalid contour area ratios')
         self.min_area_ratio = min_area_ratio
         self.max_area_ratio = max_area_ratio
+        self.profile['shape'].update(min_area_ratio=min_area_ratio, max_area_ratio=max_area_ratio)
 
     def detect(self, frame):
         if frame is None or frame.size == 0:
             return []
         hsv = cv2.cvtColor(cv2.GaussianBlur(frame, (5, 5), 0), cv2.COLOR_BGR2HSV)
-        ranges = {
-            1: [((0, 130, 120), (9, 255, 255)), ((170, 130, 120), (179, 255, 255))],
-            2: [((20, 70, 100), (34, 255, 255))],
-            # Extract a whole blue-family region before assigning its color.
-            # Local hue changes across one object must not create two identities.
-            3: [((86, 60, 60), (135, 255, 255))],
-            4: [((35, 65, 65), (85, 255, 255))],
-            5: [((0, 0, 0), (179, 255, 80))],
-        }
+        ranges = self.profile['bands']
+        shape = self.profile['shape']
         height, width = frame.shape[:2]
         area = width * height
         # Scale morphology with image size, preserving shape at different resolutions.
@@ -63,7 +62,8 @@ class HSVMaterialDetector:
                 aspect = max(w, h)/min(w, h)
                 hull_area = cv2.contourArea(cv2.convexHull(contour))
                 solidity = contour_area/hull_area if hull_area else 0
-                if circularity < .3 or solidity < .65 or fill < .4 or aspect > 3:
+                if (circularity < shape['min_circularity'] or solidity < shape['min_solidity']
+                        or fill < shape['min_fill'] or aspect > shape['max_aspect']):
                     continue
                 # Purely a contour shape score, never a detection probability.
                 score = int(round(min(1., circularity)*100))
@@ -73,14 +73,14 @@ class HSVMaterialDetector:
         from dataclasses import replace
         return [replace(item, index=i+1) for i, item in enumerate(found)]
 
-    @staticmethod
-    def _blue_regions(frame, hsv, mask, contours):
+    def _blue_regions(self, frame, hsv, mask, contours):
         """Classify whole regions; split distinct touching blue/cyan cores.
 
         Same experimental color calibration as the prior component classifier.
         Watershed resolves mixed regions instead of dropping both materials.
         """
         regions = []
+        tuning = self.profile['blue']
         for contour in contours:
             x, y, w, h = cv2.boundingRect(contour)
             component = np.zeros((h, w), np.uint8)
@@ -91,10 +91,10 @@ class HSVMaterialDetector:
             samples = values[inside]
             if not len(samples):
                 continue
-            cyan = inside & (values[:, :, 0] <= 101) & (values[:, :, 1] <= 160) & (values[:, :, 2] >= 170)
-            blue = inside & ((values[:, :, 0] >= 106) | (values[:, :, 1] >= 190))
+            cyan = inside & (values[:, :, 0] <= tuning['cyan_h_max']) & (values[:, :, 1] <= tuning['cyan_s_max']) & (values[:, :, 2] >= tuning['cyan_v_min'])
+            blue = inside & ((values[:, :, 0] >= tuning['blue_h_min']) | (values[:, :, 1] >= tuning['blue_s_min']))
             count = np.count_nonzero(inside)
-            if np.count_nonzero(cyan)/count >= .25 and np.count_nonzero(blue)/count >= .25:
+            if np.count_nonzero(cyan)/count >= tuning['mixed_fraction'] and np.count_nonzero(blue)/count >= tuning['mixed_fraction']:
                 # An enclosed highlight is part of the surrounding object.
                 cyan_contours, _ = cv2.findContours(cyan.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 blue_contours, _ = cv2.findContours(blue.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -122,8 +122,8 @@ class HSVMaterialDetector:
                         regions.append((color, part_contour + np.array([[[x, y]]], np.int32)))
                 continue
             hue, saturation, value = np.median(samples, axis=0)
-            if hue >= 104 or saturation >= 170:
+            if hue >= tuning['classify_h_min'] or saturation >= tuning['classify_s_min']:
                 regions.append((3, contour))
-            elif value >= 140:
+            elif value >= tuning['classify_v_min']:
                 regions.append((6, contour))
         return regions

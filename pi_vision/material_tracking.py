@@ -15,6 +15,9 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+import math
+
 
 class MaterialStability:
     """记录最近稳定中心，并在遮挡漏检的容忍期内继续上报该中心。"""
@@ -49,4 +52,63 @@ class MaterialStability:
             return None
         if ts - self._last_stable_ts <= self.lost_tol_s:
             return self._last_good[0], self._last_good[1]
+
+
+class MaterialTracker:
+    """Short-lived image-space association; does not smooth or preserve output points."""
+
+    def __init__(self, max_gap_s=0.75, max_displacement_px=180.):
+        if not math.isfinite(max_gap_s) or max_gap_s <= 0 or not math.isfinite(max_displacement_px) or max_displacement_px <= 0:
+            raise ValueError('tracker limits must be finite and positive')
+        self.max_gap_s = float(max_gap_s)
+        self.max_displacement_px = float(max_displacement_px)
+        self._next_id = 1
+        self._tracks = {}
+
+    def reset(self):
+        self._tracks.clear()
+
+    def update(self, materials, acquired_at):
+        """Return this frame's detections with service-local IDs and association status."""
+        if not math.isfinite(acquired_at):
+            raise ValueError('acquisition time must be finite')
+        active = {track_id: track for track_id, track in self._tracks.items()
+                  if 0 <= acquired_at-track['time'] <= self.max_gap_s}
+        edges = []
+        for index, item in enumerate(materials):
+            candidates = []
+            for track_id, track in active.items():
+                if track['color_id'] != item.color_id:
+                    continue
+                distance = math.hypot(item.center_x-track['x'], item.center_y-track['y'])
+                allowed = min(self.max_displacement_px,
+                              35. + 240. * max(0., acquired_at-track['time']))
+                if distance <= allowed:
+                    candidates.append((distance, track_id))
+            candidates.sort()
+            if candidates and (len(candidates) == 1 or
+                               candidates[1][0]-candidates[0][0] > max(8., candidates[0][0]*.15)):
+                edges.append((candidates[0][0], index, candidates[0][1]))
+
+        assignments = {}
+        used_tracks = set()
+        for _, index, track_id in sorted(edges):
+            if index not in assignments and track_id not in used_tracks:
+                assignments[index] = track_id
+                used_tracks.add(track_id)
+
+        out = []
+        next_tracks = {track_id: track for track_id, track in active.items()
+                       if track_id not in used_tracks}
+        for index, item in enumerate(materials):
+            track_id = assignments.get(index)
+            status = 'updated' if track_id is not None else 'new'
+            if track_id is None:
+                track_id = self._next_id
+                self._next_id += 1
+            next_tracks[track_id] = dict(color_id=item.color_id, x=float(item.center_x),
+                                         y=float(item.center_y), time=float(acquired_at))
+            out.append(replace(item, track_id=track_id, tracking_status=status))
+        self._tracks = next_tracks
+        return out
         return None

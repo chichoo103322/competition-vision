@@ -1,6 +1,7 @@
 # Local hardware configuration and model/data assets
 /config/*
 !/config/vision_config.example.yaml
+!/config/hsv_profile.example.yaml
 /models/
 /datasets/
 /runs/

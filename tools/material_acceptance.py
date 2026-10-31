@@ -17,11 +17,18 @@ def summarize(records, expected, max_age_ms=1000):
     fresh = []
     counts = Counter()
     last_sequence = None
+    initial_session = None
     for record in records:
         if 'error' in record:
             counts['request_errors'] += 1
             continue
         state = record['state']
+        session = state.get('session_id')
+        if initial_session is None:
+            initial_session = session
+        elif session is not None and session != initial_session:
+            counts['session_changes'] += 1
+            continue
         obs = state.get('material_observation', {})
         sequence, age = obs.get('sequence'), obs.get('age_ms')
         capture_age = state.get('capture', {}).get('age_ms')
@@ -32,10 +39,14 @@ def summarize(records, expected, max_age_ms=1000):
             counts['sequence_regressions'] += 1
             continue
         last_sequence = sequence
-        if sequence in seen:
+        source = obs.get('source_sequence', sequence)
+        if source in seen:
             counts['duplicate_polls'] += 1
             continue
-        seen.add(sequence)
+        seen.add(source)
+        if obs.get('valid') is False or state.get('capture', {}).get('valid') is False:
+            counts['invalid_observations'] += 1
+            continue
         ages = (age, capture_age)
         if any(not isinstance(a, (int, float)) or not math.isfinite(a)
                or a < 0 or a + record['request_ms'] > max_age_ms for a in ages):

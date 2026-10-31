@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import subprocess
 
 import cv2
 import numpy as np
@@ -35,6 +36,19 @@ class Camera:
         self._capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.width)
         self._capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.height)
         self._capture.set(cv2.CAP_PROP_FPS, self.config.fps)
+        try:
+            if self.config.v4l2_controls:
+                if self.config.backend != 'v4l2' or not (source.isdigit() or source.startswith('/dev/')):
+                    raise ValueError('camera controls require a V4L2 device')
+                device = f'/dev/video{source}' if source.isdigit() else source
+                # Auto/manual mode selectors must be applied before dependent values.
+                for name in sorted(self.config.v4l2_controls, key=lambda n: (n not in ('auto_exposure', 'white_balance_automatic'), n)):
+                    subprocess.run(['v4l2-ctl', '--device', device, '--set-ctrl',
+                                    f'{name}={self.config.v4l2_controls[name]}'],
+                                   check=True, capture_output=True, text=True, timeout=3)
+        except Exception:
+            self.release()
+            raise
         self._prepare_undistort()
 
     def read(self):

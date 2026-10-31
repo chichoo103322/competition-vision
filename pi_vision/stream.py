@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import json
 import logging
+import math
+import signal
 import threading
 import time
+import uuid
 from urllib.parse import urlsplit
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cv2
@@ -16,10 +20,13 @@ import numpy as np
 
 from .camera import Camera
 from .config import CameraConfig, VisionConfig, load_config
+from .hsv_profile import load_profile, profile_hash
+from .diagnostics import DiagnosticRecorder
+from .observation import Observation, age_ms
 from .pipeline import VisionPipeline
 from .preview import draw_materials, draw_qr, draw_rings
 from .rotation_gate import RotationGate
-from .material_tracking import MaterialStability
+from .material_tracking import MaterialStability, MaterialTracker
 from .task_confirmation import TaskCodeConfirmation, parse_competition_task
 from .preview_page import FRAME_CLIENT_JS
 from .material_region import MaterialRegionDetector, ordered_materials
@@ -78,8 +85,35 @@ class FrameStreamer:
         draw_overlay: bool = True,
         preview_width: int = 640,
         preview_fps: float = 5.0,
+        diagnostic_recorder=None,
+        capture_timeout: float = 1.0,
+        result_timeout: float = 1.0,
+        qr_timeout: float = 10.0,
+        preview_timeout: float = 3.0,
+        preview_enabled: bool = True,
     ) -> None:
+        for name, value in (('capture_timeout', capture_timeout), ('result_timeout', result_timeout), ('qr_timeout', qr_timeout), ('preview_timeout', preview_timeout)):
+            if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f'{name} must be a finite positive number')
+        self.capture_timeout = capture_timeout
+        self.result_timeout = result_timeout
+        self.qr_timeout = qr_timeout
+        # Browser-only display budget; never extends acquisition/result validity.
+        self.preview_timeout = preview_timeout
+        self.preview_enabled = preview_enabled
+        self.session_id = uuid.uuid4().hex
+        self._observations = {name: Observation() for name in ('materials', 'rings', 'qr')}
+        self._capture_error = None
+        self._capture_errors = 0
+        self._capture_failures = 0
+        self._capture_reopens = 0
+        self._capture_epoch = 0
+        self._preview_error = None
+        self._stopped = False
+        self._qr_live = None
+        self._qr_confirmed_source = None
         self._camera = camera
+        self._diagnostic_recorder = diagnostic_recorder
         self._qr_camera = qr_camera if qr_camera is not None else (pipeline.qr_camera or camera)
         self._pipeline = pipeline
         self.enable_qr = enable_qr
@@ -103,11 +137,15 @@ class FrameStreamer:
         self._qr_candidate = None
         self._qr_generation = 0
         self._qr_session_started_at = time.monotonic()
+        self._capture_started_at = self._qr_session_started_at
+        self._mode_source_floor = 0
         self._last_qr_sequence = -1
         self._raw_sequence = 0
         self._raw_acquired_at = 0.0
+        self._raw_wall_time = 0.0
         self._independent_qr_sequence = 0
         self._latest_materials = []
+        self._material_tracker = MaterialTracker()
         self._material_sequence = 0
         self._material_source_sequence = 0
         self._material_acquired_at = 0.0
@@ -128,7 +166,15 @@ class FrameStreamer:
         self._executor = ThreadPoolExecutor(max_workers=2)
 
     def start(self) -> None:
-        self._camera.open()
+        self._stopped = False
+        self._capture_started_at = time.monotonic()
+        try:
+            self._camera.open()
+        except Exception:
+            self._camera.release()
+            if self._diagnostic_recorder is not None:
+                self._diagnostic_recorder.close()
+            raise
         if self._qr_camera is not self._camera:
             try:
                 self._qr_camera.open()
@@ -142,62 +188,130 @@ class FrameStreamer:
         self._detect_thread.start()
 
     def stop(self) -> None:
+        with self._lock:
+            self._stopped = True
+            self._qr_generation += 1
+            self._latest_qr = self._qr_live = self._qr_candidate = None
+            self._qr_confirmed_source = None
+            self._qr_confirmation.reset()
+            self._latest_materials = []
+            self._latest_rings = []
+            self._material_tracker.reset()
         self._running = False
         if self._thread is not None:
             self._thread.join(timeout=1.0)
         if self._detect_thread is not None:
             self._detect_thread.join(timeout=1.0)
-        self._executor.shutdown(wait=False)
-        self._camera.release()
-        if self._qr_camera is not self._camera:
+        self._executor.shutdown(wait=False, cancel_futures=True)
+        # Never reopen/release a camera concurrently with a blocked native read.
+        if self._thread is None or not self._thread.is_alive():
+            self._camera.release()
+        else:
+            LOGGER.error('Camera read did not stop; results invalid, process restart may be required')
+        if self._diagnostic_recorder is not None:
+            self._diagnostic_recorder.close()
+        if self._qr_camera is not self._camera and (self._detect_thread is None or not self._detect_thread.is_alive()):
             self._qr_camera.release()
 
     def get_jpeg(self):
         """返回最新一帧的 JPEG 字节，没有帧时返回 None。"""
-        with self._lock:
-            return self._latest_jpeg
+        return self.get_preview_frame()[0]
 
     def get_preview_frame(self):
         """原子返回 JPEG 与采集信息，HTTP 客户端用序号跳过重复帧。"""
         with self._lock:
-            return self._latest_jpeg, self._jpeg_sequence, self._jpeg_acquired_at
+            now = time.monotonic()
+            age = age_ms(now, self._jpeg_acquired_at, self._jpeg_sequence)
+            valid = self._capture_state_locked(now)['valid'] and not self._preview_error and age is not None and now-self._jpeg_acquired_at < self.capture_timeout
+            return self._latest_jpeg if valid else None, self._jpeg_sequence, self._jpeg_acquired_at
+
+    def _capture_state_locked(self, now):
+        age = age_ms(now, self._raw_acquired_at, self._raw_sequence)
+        status = ('stopped' if self._stopped else 'error' if self._capture_error else
+                  ('waiting' if now-self._capture_started_at < self.capture_timeout else 'stale') if not self._raw_sequence else
+                  'stale' if age is None or now-self._raw_acquired_at >= self.capture_timeout else 'ok')
+        return {'sequence': self._raw_sequence, 'age_ms': age,
+                'acquired_monotonic_s': self._raw_acquired_at if self._raw_sequence else None,
+                'acquired_unix_s': self._raw_wall_time if self._raw_sequence else None,
+                'timestamp_semantics': 'host_read_completed_not_sensor_exposure',
+                'started_monotonic_s': self._capture_started_at,
+                'status': status, 'valid': status == 'ok',
+                'timeout_ms': self.capture_timeout*1000, 'error': self._capture_error,
+                'errors': self._capture_errors, 'consecutive_failures': self._capture_failures,
+                'reopen_attempts': self._capture_reopens, 'epoch': self._capture_epoch}
+
+    def _observation_locked(self, kind, now):
+        target = {'materials': self._latest_materials, 'rings': self._latest_rings, 'qr': self._qr_live}[kind]
+        enabled = {'materials': self.enable_materials, 'rings': self.enable_rings, 'qr': self.enable_qr}[kind]
+        state = self._observations[kind].state(now, enabled, self._capture_state_locked(now), self.result_timeout, bool(target))
+        state.update(session_id=self.session_id, generation=self._qr_generation, capture_epoch=self._capture_epoch,
+                     coordinate_frame='camera_image', coordinate_units='pixels')
+        return state
+
+    def get_material_snapshot(self):
+        """Atomic effective results plus source metadata; never refresh cached timestamps."""
+        with self._lock:
+            observation = self._observation_locked('materials', time.monotonic())
+            return (list(self._latest_materials) if observation['valid'] else []), observation
 
     def get_qr(self):
-        """仅返回本轮已锁定结果；候选不会交给串口。"""
+        """Return this session's latched task; points require a fresh live observation."""
         with self._lock:
-            return self._latest_qr
+            if self._latest_qr is None:
+                return None
+            points = None
+            if (self._observation_locked('qr', time.monotonic())['valid'] and self._qr_live is not None
+                    and str(self._qr_live[0]) == str(self._latest_qr[0])):
+                points = np.asarray(self._qr_live[1]).copy()
+            return self._latest_qr[0], points
 
     def get_qr_generation(self):
         with self._lock:
             return self._qr_generation
 
-    def _accept_qr_observation(self, result, sequence, acquired_at, generation):
+    def _accept_qr_observation(self, result, sequence, acquired_at, generation, wall_time=None):
         """丢弃重扫前的在途解码和重复缓存帧，锁定后保留本轮任务。"""
         with self._lock:
+            now = time.monotonic()
             if (generation != self._qr_generation or not self.enable_qr
                     or acquired_at < self._qr_session_started_at
-                    or sequence <= self._last_qr_sequence):
+                    or sequence <= self._last_qr_sequence
+                    or not 0 <= now - acquired_at < self.result_timeout
+                    or (self._latest_qr is None and now-self._qr_session_started_at >= self.qr_timeout)):
                 return
             self._last_qr_sequence = sequence
+            self._observations['qr'].finish(sequence, acquired_at, time.time() if wall_time is None else wall_time, now)
             code = result[0] if result is not None else None
             if code is not None:
                 try:
                     code = parse_competition_task(str(code))
                 except ValueError:
                     code = None
+            if code is not None:
+                try:
+                    points = np.asarray(result[1], dtype=np.float32).reshape(-1, 2)
+                    if points.shape != (4, 2) or not np.isfinite(points).all():
+                        raise ValueError('invalid_qr_points')
+                except (TypeError, ValueError, IndexError):
+                    self._observations['qr'].error = 'invalid_qr_points'
+                    self._observations['qr'].errors += 1
+                    code = None
             self._qr_candidate = code
+            self._qr_live = result if code is not None else None
             locked = self._qr_confirmation.update(code, acquired_at)
             if locked is not None and self._latest_qr is None:
-                self._latest_qr = (locked, np.asarray(result[1]).copy())
+                self._latest_qr = (locked, points.copy())
+                self._qr_confirmed_source = {'source_sequence': sequence, 'acquired_monotonic_s': acquired_at,
+                                             'acquired_unix_s': self._observations['qr'].acquired_unix_s,
+                                             'confirmed_monotonic_s': now, 'confirmed_unix_s': time.time()}
                 print(f"[二维码] 已确认: {locked}", flush=True)
 
     def get_materials(self):
-        with self._lock:
-            return list(self._latest_materials)
+        return self.get_material_snapshot()[0]
 
     def get_rings(self):
         with self._lock:
-            return list(self._latest_rings)
+            return list(self._latest_rings) if self._observation_locked('rings', time.monotonic())['valid'] else []
 
     def set_target_color(self, color) -> None:
         with self._lock:
@@ -215,11 +329,19 @@ class FrameStreamer:
         """
         with self._lock:
             self._qr_generation += 1
+            self._mode_source_floor = self._raw_sequence
             self._qr_session_started_at = time.monotonic()
             self._qr_confirmation.reset()
             self._last_qr_sequence = -1
             self._qr_candidate = None
             self._latest_qr = None
+            self._qr_live = None
+            self._qr_confirmed_source = None
+            self._latest_materials = []
+            self._latest_rings = []
+            self._material_tracker.reset()
+            self._observations = {name: Observation() for name in self._observations}
+            self._rotation_allowed = False
             if mode == SCAN_MODE_QR:
                 self.enable_qr, self.enable_materials, self.enable_rings = True, False, False
             elif mode == SCAN_MODE_MATERIAL:
@@ -241,6 +363,8 @@ class FrameStreamer:
 
     def get_rotation_allowed(self) -> bool:
         with self._lock:
+            if not self._observation_locked('materials', time.monotonic())['valid']:
+                return False
             if self._rotation_gate is None:
                 return True
             return self._rotation_allowed
@@ -256,9 +380,23 @@ class FrameStreamer:
     def get_state(self) -> dict:
         with self._lock:
             now = time.monotonic()
+            capture = self._capture_state_locked(now)
+            material_observation = self._observation_locked('materials', now)
+            ring_observation = self._observation_locked('rings', now)
+            qr_observation = self._observation_locked('qr', now)
+            qr_session_status = ('disabled' if not self.enable_qr else 'confirmed' if self._latest_qr is not None
+                                 else 'timeout' if now-self._qr_session_started_at >= self.qr_timeout else 'scanning')
+            if qr_session_status == 'timeout':
+                qr_observation.update(status='timeout', valid=False, has_target=False, error='scan_timeout')
             qr = None
+            task = None
             if self._latest_qr is not None:
-                code, points = self._latest_qr
+                task = {'text': str(self._latest_qr[0]), 'confirmed': True, 'latched': True,
+                        'validity_scope': 'current_scan_session_until_stop_or_rescan',
+                        'generation': self._qr_generation, **(self._qr_confirmed_source or {})}
+            if (self._latest_qr is not None and qr_observation['valid'] and self._qr_live is not None
+                    and str(self._qr_live[0]) == str(self._latest_qr[0])):
+                code, points = self._qr_live
                 qr = {
                     "text": str(code),
                     "points": [
@@ -273,8 +411,11 @@ class FrameStreamer:
                     "center_x": item.center_x,
                     "center_y": item.center_y,
                     "confidence": item.confidence,
+                    "track_id": item.track_id,
+                    "tracking_status": item.tracking_status,
+                    "point_kind": "contour_bounding_box_center",
                 }
-                for item in self._latest_materials
+                for item in (self._latest_materials if material_observation['valid'] else [])
             ]
             rings = [
                 {
@@ -282,36 +423,48 @@ class FrameStreamer:
                     "center_x": item.center_x,
                     "center_y": item.center_y,
                     "radius": item.radius,
+                    "position_id": getattr(item, 'position_id', None),
+                    "position_status": getattr(item, 'position_status', 'not_enabled'),
+                    "digit_score": getattr(item, 'digit_score', None),
+                    "digit_margin": getattr(item, 'digit_margin', None),
+                    "digit_orientation_deg": getattr(item, 'digit_orientation_deg', None),
+                    "point_kind": getattr(item, 'point_kind', 'ring_candidate_center'),
                 }
-                for item in self._latest_rings
+                for item in (self._latest_rings if ring_observation['valid'] else [])
             ]
+            detector = getattr(self._pipeline, 'material_detector', None)
+            if isinstance(detector, MaterialRegionDetector):
+                detector = detector.detector
+            profile = getattr(detector, 'profile', None)
             return {
+                'schema_version': 2, 'session_id': self.session_id,
+                'server_monotonic_s': now, 'server_unix_s': time.time(),
+                'coordinate_frame': 'camera_image', 'coordinate_units': 'pixels',
+                'task': task,
+                'qr_observation': qr_observation,
+                'qr_session': {'status': qr_session_status, 'generation': self._qr_generation,
+                               'started_monotonic_s': self._qr_session_started_at, 'timeout_ms': self.qr_timeout*1000},
+                'ring_observation': ring_observation,
+                'hsv_profile_sha256': profile_hash(profile) if isinstance(profile, dict) else None,
+                'diagnostics': self._diagnostic_recorder.state() if self._diagnostic_recorder else {'enabled': False},
                 "qr": qr,
-                "qr_candidate": str(self._qr_candidate) if self._qr_candidate else None,
-                "qr_matching_frames": self._qr_confirmation.count,
+                "qr_candidate": str(self._qr_candidate) if self._qr_candidate and qr_observation['valid'] else None,
+                "qr_matching_frames": self._qr_confirmation.count if qr_observation['valid'] else 0,
                 "qr_confirmed": self._latest_qr is not None,
-                "capture": {
-                    "sequence": self._raw_sequence,
-                    "age_ms": round((now - self._raw_acquired_at) * 1000, 1)
-                    if self._raw_sequence else None,
-                },
+                "capture": capture,
                 "preview": {
                     "sequence": self._jpeg_sequence,
                     "age_ms": round((now - self._jpeg_acquired_at) * 1000, 1)
                     if self._jpeg_sequence else None,
                     "jpeg_bytes": len(self._latest_jpeg) if self._latest_jpeg else 0,
+                    'valid': capture['valid'] and bool(self._latest_jpeg) and not self._preview_error and self._jpeg_sequence > 0 and 0 <= now-self._jpeg_acquired_at < self.capture_timeout,
+                    'error': self._preview_error,
+                    'timeout_ms': self.capture_timeout*1000,
                     "source_width": self._latest_raw.shape[1] if self._latest_raw is not None else 0,
                     "source_height": self._latest_raw.shape[0] if self._latest_raw is not None else 0,
                 },
                 "materials": materials,
-                "material_observation": {
-                    "sequence": self._material_sequence,
-                    "source_sequence": self._material_source_sequence,
-                    "age_ms": round((now - self._material_acquired_at) * 1000, 1)
-                    if self._material_sequence else None,
-                    "processed_ms": round((self._material_completed_at - self._material_acquired_at) * 1000, 1)
-                    if self._material_sequence else None,
-                },
+                "material_observation": material_observation,
                 "material_roi": list(self._pipeline.material_detector.roi)
                 if isinstance(getattr(self._pipeline, "material_detector", None), MaterialRegionDetector)
                 else None,
@@ -321,6 +474,7 @@ class FrameStreamer:
                     else getattr(self._pipeline, "material_detector", None)
                 ).__name__,
                 "rings": rings,
+                "position_identity_enabled": getattr(getattr(self._pipeline, 'ring_detector', None), 'position_identity_enabled', False) is True,
                 "rotation": self._rotation_state,
                 # 识别开关状态（算法开关：电控 0x21/0x22 按环节开启/关闭三种识别）
                 "detection": {
@@ -330,135 +484,240 @@ class FrameStreamer:
                 },
             }
 
+    def _capture_failed(self, error):
+        with self._lock:
+            if self._capture_error is None:
+                self._capture_epoch += 1
+                for observation in self._observations.values():
+                    observation.error = 'capture_interrupted'
+                    observation.busy_since = None
+            self._capture_error = str(error)
+            self._capture_errors += 1
+            self._capture_failures += 1
+            self._latest_raw = None
+            self._latest_jpeg = None
+            self._latest_materials = []
+            self._latest_rings = []
+            self._material_tracker.reset()
+            self._qr_live = None
+            self._rotation_allowed = False
+            if self._latest_qr is None:
+                self._qr_confirmation.reset()
+                self._qr_candidate = None
+            if self._capture_failures == 1 or self._capture_failures % 30 == 0:
+                LOGGER.error('Camera acquisition failed: %s', error)
+
     def _capture_loop(self) -> None:
-        while self._running:
-            try:
-                ok, frame, _ = self._camera.read()
-                acquired_at = time.monotonic()
-                if not ok:
-                    time.sleep(0.05)
+        next_reopen = 0.
+        retry_delay = .5
+        try:
+            while self._running:
+                try:
+                    ok, frame, wall_time = self._camera.read()
+                    acquired_at = time.monotonic()
+                    if not ok or frame is None or frame.size == 0:
+                        raise RuntimeError('camera_read_failed')
+                    if not math.isfinite(wall_time) or wall_time <= 0:
+                        raise RuntimeError('invalid_capture_timestamp')
+                except Exception as exc:
+                    self._capture_failed(exc)
+                    now = time.monotonic()
+                    if self._running and self._capture_failures >= 5 and now >= next_reopen:
+                        with self._lock:
+                            self._capture_reopens += 1
+                        try:
+                            # Only this capture owner may reopen; never start a second reader.
+                            self._camera.release()
+                            self._camera.open()
+                        except Exception as reopen_error:
+                            self._capture_failed(reopen_error)
+                        next_reopen = now + retry_delay
+                        retry_delay = min(5., retry_delay*2)
+                    time.sleep(.05)
                     continue
                 with self._lock:
+                    self._capture_error = None
+                    self._capture_failures = 0
                     self._latest_raw = frame.copy()
                     self._raw_sequence += 1
                     self._raw_acquired_at = acquired_at
-                    qr_result = self._latest_qr
-                    materials = self._latest_materials
-                    rings = self._latest_rings
-
-                # 采集/识别持续更新全分辨率原图；独立限制预览编码频率。
-                if acquired_at < self._next_preview_at:
+                    self._raw_wall_time = wall_time
+                    qr_result = self._qr_live if self._observation_locked('qr', acquired_at)['valid'] else None
+                    materials = self._latest_materials if self._observation_locked('materials', acquired_at)['valid'] else []
+                    rings = self._latest_rings if self._observation_locked('rings', acquired_at)['valid'] else []
+                retry_delay = .5
+                if not self.preview_enabled or acquired_at < self._next_preview_at:
                     continue
                 self._next_preview_at = acquired_at + self.preview_interval
-                canvas = frame.copy()
-                if self.draw_overlay:
-                    if self.enable_qr:
-                        draw_qr(canvas, qr_result)
-                        draw_qr_status(canvas, qr_result)
-                    if self.enable_materials:
-                        draw_materials(canvas, materials)
-                    if self.enable_rings:
-                        draw_rings(canvas, rings)
-
-                # 编码耗时不占用共享锁，避免 /state、识别和取帧互相等待。
-                preview = canvas
-                if canvas.shape[1] > self.preview_width:
-                    height = max(1, round(canvas.shape[0] * self.preview_width / canvas.shape[1]))
-                    preview = cv2.resize(canvas, (self.preview_width, height), interpolation=cv2.INTER_AREA)
-                ok, buf = cv2.imencode(
-                    ".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, self.quality]
-                )
-                if ok:
+                try:
+                    canvas = frame.copy()
+                    if self.draw_overlay:
+                        if self.enable_qr:
+                            draw_qr(canvas, qr_result)
+                            draw_qr_status(canvas, qr_result)
+                        if self.enable_materials:
+                            draw_materials(canvas, materials)
+                        if self.enable_rings:
+                            draw_rings(canvas, rings)
+                    preview = canvas
+                    if canvas.shape[1] > self.preview_width:
+                        height = max(1, round(canvas.shape[0] * self.preview_width / canvas.shape[1]))
+                        preview = cv2.resize(canvas, (self.preview_width, height), interpolation=cv2.INTER_AREA)
+                    ok, buf = cv2.imencode('.jpg', preview, [cv2.IMWRITE_JPEG_QUALITY, self.quality])
+                    if not ok:
+                        raise RuntimeError('preview_encode_failed')
                     jpeg = buf.tobytes()
                     with self._lock:
+                        self._preview_error = None
                         self._latest = canvas
                         self._latest_jpeg = jpeg
                         self._jpeg_sequence += 1
                         self._jpeg_acquired_at = acquired_at
-            except Exception as exc:
-                LOGGER.exception("抓帧失败: %s", exc)
-                time.sleep(0.05)
-            time.sleep(0.005)
+                except Exception as exc:
+                    with self._lock:
+                        self._preview_error = str(exc)
+                        self._latest_jpeg = None
+                    LOGGER.warning('Preview encoding failed: %s', exc)
+                time.sleep(.005)
+        finally:
+            self._camera.release()
 
     def _detect_loop(self) -> None:
-        next_detect = time.time()
+        next_detect = time.monotonic()
+        last_source = 0
+        pending = []
         while self._running:
+            # A native detector cannot be killed safely in a Python thread. If it
+            # times out, discard its late result and never queue more work behind it.
+            pending = [future for future in pending if not future.done()]
+            if pending:
+                time.sleep(.02)
+                continue
             with self._lock:
                 frame = self._latest_raw
                 sequence = self._raw_sequence
                 acquired_at = self._raw_acquired_at
+                wall_time = self._raw_wall_time
                 generation = self._qr_generation
-                enable_qr = self.enable_qr
-                material_source_sequence = sequence
-                material_acquired_at = acquired_at
-            if frame is None:
-                time.sleep(0.01)
+                epoch = self._capture_epoch
+                floor = self._mode_source_floor
+                enabled = {'materials': self.enable_materials, 'rings': self.enable_rings,
+                           'qr': self.enable_qr and (self._latest_qr is not None or time.monotonic()-self._qr_session_started_at < self.qr_timeout)}
+                capture_valid = self._capture_state_locked(time.monotonic())['valid']
+            if frame is None or not capture_valid or sequence <= max(last_source, floor):
+                time.sleep(.01)
                 continue
-            qr_result = None
-            materials = []
-            rings = []
-            mat_f = ring_f = None
-            try:
-                if enable_qr:
+            last_source = sequence
+            with self._lock:
+                for kind, on in enabled.items():
+                    if on:
+                        self._observations[kind].busy_since = time.monotonic()
+            futures = {}
+            for kind in ('materials', 'rings'):
+                if enabled[kind]:
+                    detector = self._pipeline.material_detector if kind == 'materials' else self._pipeline.ring_detector
+                    futures[kind] = self._executor.submit(detector.detect, frame)
+            if enabled['qr']:
+                qr_source, qr_acquired, qr_wall = sequence, acquired_at, wall_time
+                try:
                     qr_frame = frame
                     if self._qr_camera is not self._camera:
-                        ok, qr_frame, _ = self._qr_camera.read()
-                        acquired_at = time.monotonic()
+                        ok, qr_frame, qr_wall = self._qr_camera.read()
+                        qr_acquired = time.monotonic()
                         self._independent_qr_sequence += 1
-                        sequence = self._independent_qr_sequence
-                        if not ok:
-                            qr_frame = None
-                    if qr_frame is not None:
-                        qr_result = self._pipeline.qr_detector.detect_with_points(qr_frame)
-                # 物料 + 圆环并行提交，避免串行叠加拖慢节拍
-                if self.enable_materials:
-                    mat_f = self._executor.submit(
-                        self._pipeline.material_detector.detect, frame
-                    )
-                if self.enable_rings:
-                    ring_f = self._executor.submit(
-                        self._pipeline.ring_detector.detect, frame
-                    )
-                if mat_f is not None:
-                    materials = mat_f.result()
-                if ring_f is not None:
-                    rings = ring_f.result()
-            except Exception as exc:
-                LOGGER.exception("检测失败: %s", exc)
-
-            if enable_qr:
-                self._accept_qr_observation(qr_result, sequence, acquired_at, generation)
-
-            with self._lock:
-                self._latest_materials = ordered_materials(materials)
-                if mat_f is not None:
-                    self._material_sequence += 1
-                    self._material_source_sequence = material_source_sequence
-                    self._material_acquired_at = material_acquired_at
-                    self._material_completed_at = time.monotonic()
-                self._latest_rings = rings
-                if self._rotation_gate is not None:
-                    target = None
-                    if self._target_color is not None:
-                        for item in materials:
-                            if item.color_id == self._target_color:
-                                target = item
-                                break
-                    if target is None and materials:
-                        target = materials[0]
-                    if target is not None:
-                        self._rotation_allowed = self._rotation_gate.update(
-                            target.center_x, target.center_y
-                        )
-                        self._rotation_state = self._rotation_gate.status
-                    else:
-                        self._rotation_state = "未检测到物料"
+                        qr_source = self._independent_qr_sequence
+                        if not ok or qr_frame is None or qr_frame.size == 0:
+                            raise RuntimeError('qr_camera_read_failed')
+                    qr_result = self._pipeline.qr_detector.detect_with_points(qr_frame)
+                    if time.monotonic()-qr_acquired >= self.result_timeout:
+                        raise TimeoutError('processing_timeout')
+                    with self._lock:
+                        current = generation == self._qr_generation and epoch == self._capture_epoch and self._capture_state_locked(time.monotonic())['valid']
+                    if current:
+                        self._accept_qr_observation(qr_result, qr_source, qr_acquired, generation, qr_wall)
+                except Exception as exc:
+                    self._finish_detection('qr', [], qr_source, qr_acquired, qr_wall, generation, epoch, str(exc))
+            material_error = None
+            material_published = False
+            for kind, future in futures.items():
+                result, error = [], None
+                try:
+                    result = future.result(timeout=max(.001, self.result_timeout-(time.monotonic()-acquired_at)))
+                    if time.monotonic()-acquired_at >= self.result_timeout:
+                        raise TimeoutError('processing_timeout')
+                except (TimeoutError, FutureTimeoutError):
+                    error = 'processing_timeout'
+                    pending.append(future)
+                except Exception as exc:
+                    error = f'{type(exc).__name__}: {exc}'
+                published = self._finish_detection(kind, result, sequence, acquired_at, wall_time, generation, epoch, error)
+                if kind == 'materials':
+                    material_error = error
+                    material_published = published
+            if enabled['materials'] and self._diagnostic_recorder is not None:
+                detector = self._pipeline.material_detector
+                roi = list(detector.roi) if isinstance(detector, MaterialRegionDetector) else None
+                base = detector.detector if isinstance(detector, MaterialRegionDetector) else detector
+                profile = getattr(base, 'profile', None)
+                with self._lock:
+                    materials = list(self._latest_materials) if material_published else []
+                self._diagnostic_recorder.offer(frame, {
+                    'version': 1, 'source_sequence': sequence,
+                    'acquired_monotonic_s': acquired_at,
+                    'acquired_unix_s': wall_time,
+                    'completed_monotonic_s': time.monotonic(),
+                    'coordinate_frame': 'camera_image', 'units': 'pixels',
+                    'coordinate_meaning': 'contour_bounding_box_center_not_calibrated_grasp',
+                    'frame_size': [frame.shape[1], frame.shape[0]], 'roi': roi,
+                    'camera_requested': asdict(self._camera.config) if isinstance(getattr(self._camera, 'config', None), CameraConfig) else None,
+                    'backend': type(base).__name__, 'profile': profile,
+                    'profile_sha256': profile_hash(profile) if profile else None,
+                    'valid': material_published and material_error is None and time.monotonic()-acquired_at < self.result_timeout,
+                    'error': material_error if material_published else 'source_invalidated',
+                    'materials': [asdict(m) for m in ordered_materials(materials)],
+                })
             next_detect += self.detect_interval
-            wait = next_detect - time.time()
+            wait = next_detect - time.monotonic()
             if wait > 0:
                 time.sleep(wait)
             else:
-                next_detect = time.time()
+                next_detect = time.monotonic()
+
+    def _finish_detection(self, kind, result, source, acquired, wall, generation, epoch, error=None):
+        with self._lock:
+            now = time.monotonic()
+            if generation != self._qr_generation or epoch != self._capture_epoch or not self._capture_state_locked(now)['valid']:
+                return False
+            if not 0 <= now-acquired < self.result_timeout:
+                error = 'processing_timeout'
+            observation = self._observations[kind]
+            observation.finish(source, acquired, wall, now, error)
+            effective = [] if error else result
+            if error and (observation.errors == 1 or observation.errors % 30 == 0):
+                LOGGER.error('%s detection failed: %s', kind, error)
+            if kind == 'materials':
+                self._latest_materials = self._material_tracker.update(
+                    ordered_materials(effective), acquired)
+                self._material_sequence = observation.sequence
+                self._material_source_sequence = source
+                self._material_acquired_at = acquired
+                self._material_completed_at = now
+                if self._rotation_gate is not None:
+                    target = next((m for m in effective if m.color_id == self._target_color), None) if self._target_color is not None else next(iter(effective), None)
+                    if target is not None:
+                        self._rotation_allowed = self._rotation_gate.update(target.center_x, target.center_y)
+                        self._rotation_state = self._rotation_gate.status
+                    else:
+                        self._rotation_allowed = False
+                        self._rotation_state = '视觉结果无效' if error else '未检测到物料'
+            elif kind == 'rings':
+                self._latest_rings = list(effective)
+            elif kind == 'qr':
+                self._qr_live = None
+                if self._latest_qr is None:
+                    self._qr_confirmation.reset()
+                    self._qr_candidate = None
+            return True
 
 
 class SerialController:
@@ -472,6 +731,8 @@ class SerialController:
         config: VisionConfig,
     ) -> None:
         self._streamer = streamer
+        qr_timeout = getattr(streamer, 'qr_timeout', 10.)
+        self._qr_timeout = qr_timeout if type(qr_timeout) in (int, float) else 10.
         self._config = config
         self._link = SerialLink(
             serial_port, baudrate=baudrate, on_frame=self._on_frame
@@ -546,8 +807,11 @@ class SerialController:
                 self._start_qr_loop()
             elif self._scan_mode == SCAN_MODE_MATERIAL:
                 self._scanning = True
+                self._streamer.set_scan_detection(SCAN_MODE_MATERIAL)
+                self._mat_stab.reset()
             elif self._scan_mode == SCAN_MODE_VERIFY:
                 self._scanning = True
+                self._streamer.set_scan_detection(SCAN_MODE_VERIFY)
                 self._start_ring_loop()
 
     def _send_qr_result(self) -> None:
@@ -571,7 +835,7 @@ class SerialController:
 
     def _qr_loop(self, stop_event, generation) -> None:
         """每条扫码/重扫命令最多上报一次；10 秒无确认才报告未找到。"""
-        deadline = time.monotonic() + 10.0
+        deadline = time.monotonic() + self._qr_timeout
         while not stop_event.is_set() and not self._stop.is_set():
             qr_result = self._streamer.get_qr()
             with self._qr_report_lock:
@@ -632,53 +896,25 @@ class SerialController:
     def _material_loop(self) -> None:
         while not self._stop.is_set():
             if self._scanning and self._scan_mode == SCAN_MODE_MATERIAL:
-                materials = self._streamer.get_materials()
-                target = None
-                if self._target_color is not None:
-                    for item in materials:
-                        if item.color_id == self._target_color:
-                            target = item
-                            break
-                now = time.time()
-                if target is None:
-                    # 遮挡漏检：容忍期内沿用最近稳定中心，避免上报中断
-                    report = self._mat_stab.report_center(now)
-                    if report is None:
-                        self._link.send_not_found()
-                    else:
-                        cx, cy = report
-                        width = self._streamer.get_frame_width()
-                        angle = self._offset_angle(
-                            cx, width, self._config.camera.fov_h_deg
-                        )
-                        self._link.send_found(
-                            self._target_color,
-                            int(round(cx)),
-                            int(round(cy)),
-                            angle,
-                            self._config.fixed_distance_cm,
-                        )
-                    continue
-                cx, cy = self._mat_stab.observe(
-                    target.center_x, target.center_y, now
-                )
-                allow = self._streamer.get_rotation_allowed()
-                if allow:
-                    width = self._streamer.get_frame_width()
-                    angle = self._offset_angle(
-                        cx, width, self._config.camera.fov_h_deg
-                    )
-                    self._link.send_found(
-                        target.color_id,
-                        int(round(cx)),
-                        int(round(cy)),
-                        angle,
-                        self._config.fixed_distance_cm,
-                    )
-                    self._mat_stab.mark_stable(now)
-                else:
-                    self._link.send_not_found()
-            time.sleep(0.1)
+                try:
+                    self._report_material_once()
+                except Exception as exc:
+                    LOGGER.warning('Material serial report failed: %s', exc)
+            self._stop.wait(.1)
+
+    def _report_material_once(self):
+        materials, observation = self._streamer.get_material_snapshot()
+        target = next((m for m in materials if m.color_id == self._target_color), None)
+        # The legacy wire protocol has no held/stale flag. Never send an old
+        # coordinate as a fresh FOUND response; re-observation is required.
+        if not observation['valid'] or target is None or not self._streamer.get_rotation_allowed():
+            self._mat_stab.reset()
+            self._link.send_not_found()
+            return
+        width = self._streamer.get_frame_width()
+        angle = self._offset_angle(target.center_x, width, self._config.camera.fov_h_deg)
+        self._link.send_found(target.color_id, target.center_x, target.center_y,
+                              angle, self._config.fixed_distance_cm)
 
     def _offset_angle(self, center_x: int, width: int, fov_h_deg: float) -> float:
         if width <= 0:
@@ -730,7 +966,8 @@ class StreamHandler(BaseHTTPRequestHandler):
             "function applyViewBox(){svg.setAttribute('viewBox','0 0 '+(sourceWidth||img.naturalWidth||640)+' '+(sourceHeight||img.naturalHeight||480));}"
             + FRAME_CLIENT_JS +
             "function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}"
-            "let qrCache=null,matCache=[],ringCache=[],qrT=0,matT=0,ringT=0,materialRoi=null;"
+            "let qrCache=null,matCache=[],ringCache=[],materialRoi=null,expiryTimers=[];"
+            "function clearCoordinates(){qrCache=null;matCache=[];ringCache=[];render();document.getElementById('coords').textContent='视觉坐标无效或已过期';}"
             "function render(){let h='';"
             "if(materialRoi){const [x,y,w,hgt]=materialRoi;h+='<rect x=\"'+x+'\" y=\"'+y+'\" width=\"'+w+'\" height=\"'+hgt+'\" fill=\"none\" stroke=\"#ffffff\" stroke-width=\"2\" stroke-dasharray=\"8 6\"/>';"
             "h+='<text x=\"'+(x+8)+'\" y=\"'+(y+24)+'\" fill=\"#ffffff\" font-size=\"18\">物料识别区域</text>';}"
@@ -742,25 +979,25 @@ class StreamHandler(BaseHTTPRequestHandler):
             "h+='<circle cx=\"'+r.center_x+'\" cy=\"'+r.center_y+'\" r=\"1\" fill=\"#ff3366\"/>';"
             "h+='<text x=\"'+(r.center_x+8)+'\" y=\"'+(r.center_y-6)+'\" fill=\"#ff3366\" font-size=\"16\">R'+r.ring_no+'</text>';});"
             "svg.innerHTML=h;}"
-            "async function loop(){const controller=new AbortController();const deadline=setTimeout(()=>controller.abort(),2500);try{"
+            "async function loop(){const controller=new AbortController();const requested=performance.now();const deadline=setTimeout(()=>controller.abort(),2500);try{"
             "const response=await fetch('/state',{cache:'no-store',signal:controller.signal});if(!response.ok)throw new Error('HTTP '+response.status);"
-            "const s=await response.json();const now=Date.now();let changed=false;"
+            "const s=await response.json();let changed=false;expiryTimers.forEach(clearTimeout);expiryTimers=[];"
             "materialRoi=s.material_roi||null;changed=true;"
-            "if(s.qr){qrCache=s.qr;qrT=now;changed=true;}else if(now-qrT>1000){qrCache=null;changed=true;}"
-            "if(s.materials.length){matCache=s.materials;matT=now;changed=true;}else if(now-matT>1000){matCache=[];changed=true;}"
-            "if(s.rings.length){ringCache=s.rings;ringT=now;changed=true;}else if(now-ringT>1000){ringCache=[];changed=true;}"
+            "qrCache=s.qr_observation?.valid?s.qr:null;matCache=s.material_observation?.valid?s.materials:[];ringCache=s.ring_observation?.valid?s.rings:[];"
+            "function expire(meta,clear){const remain=Number(meta?.timeout_ms)-Number(meta?.age_ms)-(performance.now()-requested);if(!meta?.valid||!Number.isFinite(remain)||remain<=0){clear();}else{expiryTimers.push(setTimeout(()=>{clear();render();document.getElementById('coords').textContent='坐标已过期，等待新结果';},remain));}}"
+            "expire(s.qr_observation,()=>{qrCache=null;});expire(s.material_observation,()=>{matCache=[];});expire(s.ring_observation,()=>{ringCache=[];});"
             "if(changed)render();"
             "let coords='物料:<br>';matCache.forEach(m=>{coords+=(m.color_name||('C'+m.color_id))+' ('+m.center_x+','+m.center_y+') 分数 '+m.confidence+'<br>';});"
             "coords+='圆环:<br>';ringCache.forEach(r=>{coords+='R'+r.ring_no+' ('+r.center_x+','+r.center_y+')<br>';});"
             "document.getElementById('coords').innerHTML=coords;"
             "const d=s.detection||{qr:false,materials:false,rings:false};"
-            "document.getElementById('status').textContent='QR:'+(s.qr?s.qr.text:'无')+' 物料:'+s.materials.length+' 圆环:'+s.rings.length+' 开关:二维码'+(d.qr?'开':'关')+' 物料'+(d.materials?'开':'关')+' 圆环'+(d.rings?'开':'关')+' 坐标画幅:'+sourceWidth+'x'+sourceHeight;"
+            "document.getElementById('status').textContent='任务码:'+(s.task?s.task.text:'未确认')+' 采集:'+s.capture.status+' 物料:'+s.material_observation.status+' 物料数:'+matCache.length+' 圆环数:'+ringCache.length+' 坐标画幅:'+sourceWidth+'x'+sourceHeight;"
             "const rs=s.rotation||'未扫描';const rot=document.getElementById('rot');"
             "rot.textContent='转盘:'+rs;"
             "rot.style.background=rs.indexOf('稳定')>=0?'#1b8f3c':(rs.indexOf('换位')>=0?'#c0392b':(rs.indexOf('等待')>=0?'#d68910':'#555'));"
-            "}catch(e){document.getElementById('status').textContent='识别状态暂时断开，正在重试…';}finally{clearTimeout(deadline);}}"
+            "}catch(e){clearCoordinates();document.getElementById('status').textContent='识别状态暂时断开，正在重试…';}finally{clearTimeout(deadline);}}"
             "let stateTimer=null,stateStopped=false;async function pollState(){await loop();if(!stateStopped)stateTimer=setTimeout(pollState,200);}pollState();"
-            "window.addEventListener('pagehide',()=>{stateStopped=true;clearTimeout(stateTimer);});"
+            "window.addEventListener('pagehide',()=>{stateStopped=true;clearTimeout(stateTimer);expiryTimers.forEach(clearTimeout);clearCoordinates();});"
             "window.addEventListener('pageshow',()=>{if(stateStopped){stateStopped=false;pollState();}});"
             "window.addEventListener('resize',applyViewBox);img.addEventListener('load',applyViewBox);applyViewBox();"
             "</script></body></html>"
@@ -794,6 +1031,8 @@ class StreamHandler(BaseHTTPRequestHandler):
             self.send_header("X-Source-Height", str(_streamer.get_frame_height()))
             self.send_header("X-Capture-Age-Ms", str(max(0, round(
                 (time.monotonic() - acquired_at) * 1000))))
+            self.send_header('X-Frame-Max-Age-Ms', str(_streamer.capture_timeout*1000))
+            self.send_header('X-Preview-Max-Age-Ms', str(_streamer.preview_timeout*1000))
         else:
             self.send_header("Retry-After", "1")
         self.end_headers()
@@ -909,6 +1148,14 @@ def main() -> None:
                         help="限定物料识别区域；输出坐标仍相对于完整画面")
     parser.add_argument("--material-backend", choices=['auto', 'hsv'], default='auto',
                         help="物料后端：auto沿用YOLO；hsv为实验性六色轮廓检测")
+    parser.add_argument('--hsv-profile', help='HSV YAML 参数文件；省略时保留原有基线')
+    parser.add_argument('--diagnostics-dir', help='新建诊断目录，限量保存同帧原图和识别结果')
+    parser.add_argument('--diagnostics-samples', type=int, default=30)
+    parser.add_argument('--diagnostics-interval', type=float, default=1.0)
+    parser.add_argument('--capture-timeout', type=float, default=1., help='采集帧最大年龄/秒，默认1')
+    parser.add_argument('--result-timeout', type=float, default=1., help='结果最大源帧年龄及处理时限/秒，默认1')
+    parser.add_argument('--qr-timeout', type=float, default=10., help='本轮任务码确认时限/秒，默认10')
+    parser.add_argument('--preview-timeout', type=float, default=3., help='仅网页画面的最大显示年龄/秒，默认3；不改变识别结果有效期')
     parser.add_argument("--fast", action="store_true", help="仅用 zxing 快速识别，关闭 OpenCV 兜底")
     parser.add_argument("--serial-port", default="", help="一体模式下打开串口，例如 /dev/ttyAMA0")
     parser.add_argument("--baud", type=int, default=115200, help="串口波特率")
@@ -919,6 +1166,13 @@ def main() -> None:
     parser.add_argument("--algorithms-on", action="store_true", default=None, help="启动时识别算法默认全开（覆盖 config algorithms_default_on；--no-qr/--no-materials/--no-rings 仍可单独关）")
     parser.add_argument("--no-algorithms-on", action="store_true", default=None, help="启动时识别算法默认全关（覆盖 config algorithms_default_on；--materials/--rings 仍可单独开）")
     args = parser.parse_args()
+    for name in ('capture_timeout', 'result_timeout', 'qr_timeout', 'preview_timeout'):
+        value = getattr(args, name)
+        if not math.isfinite(value) or value <= 0:
+            parser.error(f'--{name.replace("_", "-")} must be finite and positive')
+    if args.hsv_profile and args.material_backend != 'hsv':
+        parser.error('--hsv-profile requires --material-backend hsv')
+    hsv_profile = load_profile(args.hsv_profile) if args.hsv_profile else None
 
     logging.basicConfig(level=logging.INFO)
     config = load_config(args.config)
@@ -956,7 +1210,7 @@ def main() -> None:
         )
         qr_camera = Camera(qr_config)
     pipeline = VisionPipeline(config, camera=camera, qr_camera=qr_camera,
-                              material_backend=args.material_backend)
+                              material_backend=args.material_backend, hsv_profile=hsv_profile)
     if args.material_roi:
         pipeline.set_material_roi(args.material_roi)
     if args.fast:
@@ -980,6 +1234,8 @@ def main() -> None:
     )
 
     global _streamer
+    recorder = (DiagnosticRecorder(args.diagnostics_dir, args.diagnostics_samples,
+                                  args.diagnostics_interval) if args.diagnostics_dir else None)
     _streamer = FrameStreamer(
         camera,
         pipeline,
@@ -992,26 +1248,34 @@ def main() -> None:
         draw_overlay=args.overlay,
         preview_width=args.preview_width,
         preview_fps=args.preview_fps,
+        diagnostic_recorder=recorder,
+        capture_timeout=args.capture_timeout,
+        result_timeout=args.result_timeout,
+        qr_timeout=args.qr_timeout,
+        preview_timeout=args.preview_timeout,
     )
-    _streamer.start()
-
     serial_controller = None
-    if args.serial_port:
-        serial_controller = SerialController(
-            args.serial_port, args.baud, _streamer, config
-        )
-        serial_controller.start()
-        print(f"一体模式已启用，串口: {args.serial_port} @ {args.baud}", flush=True)
-
-    httpd = ThreadingHTTPServer(("0.0.0.0", args.port), StreamHandler)
-    print(f"预览地址: http://{primary_lan_ip()}:{args.port}/ （本机访问也可用 http://127.0.0.1:{args.port}/）", flush=True)
-    print("Ctrl+C 停止", flush=True)
+    httpd = None
     try:
+        # Reserve the port before acquiring the camera; every partial startup
+        # follows the same cleanup path, including serial-open/bind failures.
+        httpd = ThreadingHTTPServer(("0.0.0.0", args.port), StreamHandler)
+        _streamer.start()
+        if args.serial_port:
+            serial_controller = SerialController(args.serial_port, args.baud, _streamer, config)
+            serial_controller.start()
+            print(f"一体模式已启用，串口: {args.serial_port} @ {args.baud}", flush=True)
+        print(f"预览地址: http://{primary_lan_ip()}:{args.port}/ （本机访问也可用 http://127.0.0.1:{args.port}/）", flush=True)
+        print("Ctrl+C 停止", flush=True)
+        # Background shell jobs may inherit SIGINT=ignored. Restore orderly stop.
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        signal.signal(signal.SIGTERM, signal.default_int_handler)
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        httpd.server_close()
+        if httpd is not None:
+            httpd.server_close()
         if serial_controller is not None:
             serial_controller.stop()
         _streamer.stop()

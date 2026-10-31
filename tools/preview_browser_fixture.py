@@ -11,6 +11,8 @@ from pi_vision import stream
 
 
 class SyntheticPreview:
+    capture_timeout = 1.
+    preview_timeout = 3.
     def __init__(self):
         self.started = time.monotonic()
 
@@ -35,7 +37,10 @@ class SyntheticPreview:
         return 720
 
     def get_state(self):
-        return {'qr': None, 'materials': [
+        return {'task': None, 'capture': {'status': 'ok', 'valid': True},
+                'qr_observation': {'valid': False}, 'ring_observation': {'valid': False},
+                'material_observation': {'valid': True, 'status': 'ok', 'age_ms': 0, 'timeout_ms': 1000},
+                'qr': None, 'materials': [
                     {'color_id': 2, 'color_name': '黄', 'center_x': 180, 'center_y': 190, 'confidence': 38},
                     {'color_id': 3, 'color_name': '蓝', 'center_x': 340, 'center_y': 200, 'confidence': 36}],
                 'material_roi': [100, 80, 400, 220], 'rings': [], 'rotation': '已关闭',

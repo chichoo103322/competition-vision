@@ -1,0 +1,28 @@
+# OpenCV HSV: H 0..179, S/V 0..255. Missing fields keep baseline values.
+# Business IDs: 1 red, 2 yellow, 3 blue, 4 green, 5 black, 6 lightblue.
+# Band 3 extracts blue + lightblue together; section blue assigns 3/6.
+# These are the existing defaults, NOT a calibrated competition-site profile.
+version: 1
+bands:
+  1: [[[0, 130, 120], [9, 255, 255]], [[170, 130, 120], [179, 255, 255]]]
+  2: [[[20, 70, 100], [34, 255, 255]]]
+  3: [[[86, 60, 60], [135, 255, 255]]]
+  4: [[[35, 65, 65], [85, 255, 255]]]
+  5: [[[0, 0, 0], [179, 255, 80]]]
+shape:
+  min_area_ratio: 0.012
+  max_area_ratio: 0.4
+  min_circularity: 0.3
+  min_solidity: 0.65
+  min_fill: 0.4
+  max_aspect: 3.0
+blue:
+  cyan_h_max: 101
+  cyan_s_max: 160
+  cyan_v_min: 170
+  blue_h_min: 106
+  blue_s_min: 190
+  mixed_fraction: 0.25
+  classify_h_min: 104
+  classify_s_min: 170
+  classify_v_min: 140

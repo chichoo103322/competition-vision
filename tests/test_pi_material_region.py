@@ -93,9 +93,9 @@ class MaterialRegionTests(unittest.TestCase):
             streamer._running = False
             return [material(3, score=39), material(2, score=32)]
         detector.detect.side_effect = detect
-        with patch('pi_vision.stream.time.sleep'):
+        with patch('pi_vision.stream.time.sleep'), patch('pi_vision.stream.time.monotonic', return_value=1.1):
             streamer._detect_loop()
-        state = streamer.get_state()
+            state = streamer.get_state()
         self.assertEqual([item['color_id'] for item in state['materials']], [2, 3])
         self.assertEqual(state['material_observation']['sequence'], 1)
         self.assertEqual(state['material_observation']['source_sequence'], 10)

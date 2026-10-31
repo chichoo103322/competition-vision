@@ -46,6 +46,8 @@ class Material:
     center_y: int
     theta_deg: float
     confidence: int
+    track_id: int | None = None
+    tracking_status: str = 'new'
 
     def to_tuple(self):
         """转成串口协议要求的元组。"""

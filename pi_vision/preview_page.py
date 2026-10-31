@@ -3,8 +3,14 @@
 FRAME_CLIENT_JS = r"""
 const videoStatus=document.getElementById('video-status');
 const reconnectButton=document.getElementById('reconnect-video');
-let frameTimer=null,frameController=null,frameGeneration=0,videoUrl=null,videoStopped=false;
+let frameTimer=null,frameExpiryTimer=null,frameFreshnessTimer=null,frameController=null,frameGeneration=0,videoUrl=null,videoStopped=false,displayDeadline=0;
 function videoMessage(message){videoStatus.textContent=message;}
+function clearPreview(){
+  clearTimeout(frameExpiryTimer);clearTimeout(frameFreshnessTimer);
+  displayDeadline=0;img.removeAttribute('src');svg.style.visibility='hidden';
+  if(videoUrl){URL.revokeObjectURL(videoUrl);videoUrl=null;}
+}
+function delayedPreview(message){clearTimeout(frameFreshnessTimer);svg.style.visibility='hidden';videoMessage(message);}
 async function loadLatestFrame(){
   if(videoStopped||document.hidden)return;
   const generation=frameGeneration,controller=new AbortController();
@@ -21,18 +27,35 @@ async function loadLatestFrame(){
     const decoded=new Image();
     await new Promise((resolve,reject)=>{decoded.onload=resolve;decoded.onerror=reject;decoded.src=pendingUrl;});
     if(generation!==frameGeneration||videoStopped||document.hidden)return;
+    const ageHeader=response.headers.get('X-Capture-Age-Ms');
+    const age=Number(ageHeader);
+    const controlMaxAge=Number(response.headers.get('X-Frame-Max-Age-Ms'));
+    const displayMaxAge=Number(response.headers.get('X-Preview-Max-Age-Ms')||controlMaxAge);
+    const elapsed=performance.now()-requestStarted,estimatedAge=age+elapsed;
+    const remain=displayMaxAge-estimatedAge,controlRemain=controlMaxAge-estimatedAge;
+    if(ageHeader===null||!Number.isFinite(age)||age<0||!Number.isFinite(controlMaxAge)||controlMaxAge<=0||!Number.isFinite(remain)||remain<=0)
+      throw new Error('expired or unknown image age');
     const previousUrl=videoUrl;
     img.src=pendingUrl;videoUrl=pendingUrl;pendingUrl=null;
     if(previousUrl)URL.revokeObjectURL(previousUrl);
-    const age=Number(response.headers.get('X-Capture-Age-Ms')||0);
+    clearTimeout(frameExpiryTimer);clearTimeout(frameFreshnessTimer);
+    displayDeadline=performance.now()+remain;
+    frameExpiryTimer=setTimeout(()=>{clearPreview();videoMessage('预览已过期，等待新画面…');},remain);
     sourceWidth=Number(response.headers.get('X-Source-Width'))||decoded.naturalWidth;
     sourceHeight=Number(response.headers.get('X-Source-Height'))||decoded.naturalHeight;
-    videoMessage(age>2000?'相机画面超过 2 秒未更新，请检查相机':'画面已连接 · 预览 '+decoded.naturalWidth+'×'+decoded.naturalHeight);
+    if(controlRemain>0){
+      svg.style.visibility='';
+      videoMessage('画面已连接 · 预览 '+decoded.naturalWidth+'×'+decoded.naturalHeight+' · 仅供查看');
+      frameFreshnessTimer=setTimeout(()=>delayedPreview('预览有延迟，仅供查看；图上标记已隐藏'),controlRemain);
+    }else delayedPreview('预览有延迟，仅供查看；图上标记已隐藏');
     applyViewBox();
-    nextDelay=Math.max(200,Math.min(1500,Math.round((performance.now()-requestStarted)*0.5)));
+    nextDelay=100;
   }catch(error){
     if(generation===frameGeneration&&!videoStopped){
-      videoMessage('预览传输超时或失败，正在重试…');nextDelay=1000;
+      if(videoUrl&&performance.now()<displayDeadline)
+        delayedPreview('预览连接波动，暂显示上一帧（仅供查看），正在重试…');
+      else{clearPreview();videoMessage('预览传输超时或失败，正在重试…');}
+      nextDelay=200;
     }
   }finally{
     clearTimeout(deadline);
@@ -50,13 +73,13 @@ function reconnectVideo(){
 }
 reconnectButton.addEventListener('click',reconnectVideo);
 document.addEventListener('visibilitychange',()=>{
-  if(document.hidden){frameGeneration++;clearTimeout(frameTimer);if(frameController)frameController.abort();}
+  if(document.hidden){frameGeneration++;clearTimeout(frameTimer);clearPreview();if(frameController)frameController.abort();}
   else reconnectVideo();
 });
 window.addEventListener('pagehide',()=>{
   videoStopped=true;frameGeneration++;clearTimeout(frameTimer);
+  clearPreview();
   if(frameController)frameController.abort();
-  if(videoUrl){URL.revokeObjectURL(videoUrl);videoUrl=null;}
 });
 window.addEventListener('pageshow',()=>{if(videoStopped)reconnectVideo();});
 reconnectVideo();

@@ -65,7 +65,8 @@ class PreviewTests(unittest.TestCase):
             self.streamer._capture_loop()
         self.assertEqual(self.streamer._raw_sequence, 6)
         self.assertEqual(encode.call_count, 2)
-        self.assertEqual(self.streamer.get_preview_frame()[1], 2)
+        with patch.object(stream.time, 'monotonic', return_value=clock[0]):
+            self.assertEqual(self.streamer.get_preview_frame()[1], 2)
         self.assertEqual(self.streamer._latest_raw.shape, image.shape)
 
     def test_jpeg_encoding_never_holds_shared_state_lock(self):
@@ -94,7 +95,8 @@ class PreviewTests(unittest.TestCase):
         self.streamer._latest_jpeg = b'abc'
         with patch.object(stream.time, 'monotonic', return_value=6):
             state = self.streamer.get_state()
-        self.assertEqual(state['capture'], {'sequence': 10, 'age_ms': 100.0})
+        self.assertEqual({k:state['capture'][k] for k in ('sequence', 'age_ms')}, {'sequence': 10, 'age_ms': 100.0})
+        self.assertTrue(state['capture']['valid'])
         self.assertEqual({key:state['preview'][key] for key in ('sequence','age_ms','jpeg_bytes')},
                          {'sequence': 3, 'age_ms': 500.0, 'jpeg_bytes': 3})
 
@@ -108,6 +110,8 @@ class PreviewTests(unittest.TestCase):
         source.get_preview_frame.return_value = (b'latest-jpeg', 12, 5.5)
         source.get_frame_width.return_value = 1280
         source.get_frame_height.return_value = 720
+        source.capture_timeout = 1.
+        source.preview_timeout = 3.
         handler = self.handler()
         with patch.object(stream, '_streamer', source), \
                 patch.object(stream.time, 'monotonic', return_value=6):
@@ -116,6 +120,8 @@ class PreviewTests(unittest.TestCase):
         self.assertEqual(handler.wfile.getvalue(), b'latest-jpeg')
         self.assertIn(('X-Frame-Id', '12'), [call.args for call in handler.send_header.call_args_list])
         self.assertIn(('X-Capture-Age-Ms', '500'), [call.args for call in handler.send_header.call_args_list])
+        self.assertIn(('X-Frame-Max-Age-Ms', '1000.0'), [call.args for call in handler.send_header.call_args_list])
+        self.assertIn(('X-Preview-Max-Age-Ms', '3000.0'), [call.args for call in handler.send_header.call_args_list])
         self.assertIn(('X-Source-Width', '1280'), [call.args for call in handler.send_header.call_args_list])
         self.assertIn(('X-Source-Height', '720'), [call.args for call in handler.send_header.call_args_list])
 
@@ -153,6 +159,21 @@ class PreviewTests(unittest.TestCase):
         for options in ({'preview_fps':0}, {'preview_fps':float('nan')}, {'preview_width':0}):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 stream.FrameStreamer(self.camera, SimpleNamespace(qr_camera=self.camera), **options)
+
+    def test_display_budget_does_not_extend_capture_validity(self):
+        self.streamer._raw_sequence = self.streamer._jpeg_sequence = 1
+        self.streamer._raw_acquired_at = self.streamer._jpeg_acquired_at = 5.
+        self.streamer._latest_jpeg = b'jpeg'
+        self.assertEqual(self.streamer.preview_timeout, 3.)
+        with patch.object(stream.time, 'monotonic', return_value=6.):
+            self.assertFalse(self.streamer.get_state()['capture']['valid'])
+            self.assertIsNone(self.streamer.get_preview_frame()[0])
+
+    def test_invalid_display_budget_is_rejected_before_camera_open(self):
+        for value in (0, -1, float('nan'), float('inf'), True):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                stream.FrameStreamer(self.camera, SimpleNamespace(qr_camera=self.camera), preview_timeout=value)
+        self.camera.open.assert_not_called()
 
 
 if __name__ == '__main__':

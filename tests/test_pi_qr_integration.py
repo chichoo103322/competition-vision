@@ -68,11 +68,17 @@ class StreamConfirmationTests(unittest.TestCase):
         self.streamer = FrameStreamer(self.camera, self.pipeline,
                                       enable_materials=False, enable_rings=False)
         self.streamer._qr_session_started_at = 0
+        self.now = 0.
         self.addCleanup(self.streamer._executor.shutdown, wait=False)
         self.addCleanup(patch.stopall)
+        patch('pi_vision.stream.time.monotonic', side_effect=lambda: self.now).start()
         patch("builtins.print").start()
 
     def offer(self, code, sequence, timestamp, generation=None):
+        self.now = timestamp + .001
+        self.streamer._raw_sequence = sequence
+        self.streamer._raw_acquired_at = timestamp
+        self.streamer._raw_wall_time = 1000 + timestamp
         result = None if code is None else (code, POINTS)
         generation = self.streamer.get_qr_generation() if generation is None else generation
         self.streamer._accept_qr_observation(result, sequence, timestamp, generation)
@@ -113,6 +119,7 @@ class StreamConfirmationTests(unittest.TestCase):
 
     def test_new_session_rejects_frames_captured_before_command(self):
         old_acquired_at = time.monotonic()
+        self.now += .01
         self.streamer.set_scan_detection(SCAN_MODE_QR)
         self.offer(A, 1, old_acquired_at)
         self.assertIsNone(self.streamer.get_qr())

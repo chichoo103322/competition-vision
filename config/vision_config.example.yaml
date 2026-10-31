@@ -8,6 +8,9 @@ camera:
   width: 1280
   height: 720
   fps: 30
+  # Empty means preserve device controls. Check v4l2-ctl --list-ctrls before tuning.
+  # Manual exposure/white balance must be calibrated for the actual camera/site.
+  v4l2_controls: {}
   flip: 0
   undistort: false
 
