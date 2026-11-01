@@ -33,6 +33,7 @@ class NumberedRing(Ring):
     position_status: str = 'unreadable'
     point_kind: str = 'ring_candidate_center'
     digit_orientation_deg: int | None = None
+    center_method: str = 'legacy_ring_fit'
 
 
 class DigitReader:
@@ -125,7 +126,8 @@ class NumberedRingDetector:
             out.append(NumberedRing(ring.ring_no, ring.center_x, ring.center_y,
                 ring.confidence, ring.radius, number, score, margin,
                 'candidate' if number else 'unreadable',
-                'ring_candidate_center', orientation))
+                'ring_candidate_center', orientation,
+                getattr(ring, 'center_method', 'legacy_ring_fit')))
         ids = [r.position_id for r in out if r.position_id is not None]
         if len(ids) != len(set(ids)):
             from dataclasses import replace

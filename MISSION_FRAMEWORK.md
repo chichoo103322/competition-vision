@@ -221,3 +221,32 @@ python3 -m tools.vision_ros_smoke --material-backend hsv --operation locate_posi
 `180°/180°/0°`。tracker 位移、遮挡、超时、歧义由单测覆盖；本轮未在 Pi 对跟踪器执行
 ROS/动态样本检查。没有打开相机、串口或电机，也未改 Pi 正式源码。合成图不能证明比赛字体、
 磨损/反光或相机透视场景准确率。
+
+## 参考视频方法的可选实现（2026-11-01）
+
+保留现有 HSV 颜色阈值与默认框中心。新增 `--material-center centroid`，在相同颜色轮廓上
+用图像矩计算面积质心，目标 `point_kind=contour_area_centroid`；默认 `box` 仍输出
+`contour_bounding_box_center`。ROI 处理后恢复全图坐标。改变点定义须重新标定；旧框中心
+标定不能用于质心，局部对准层会检查点定义。不输出毫米坐标或抓取成功。
+
+圆环新增 `--ring-backend morphology --ring-roi X Y W H`，ROI 必须显式提供。流程为
+Otsu 反向二值化 → 3×3 核膨胀 4 次 → 3×3 均值滤波/重二值化 → 腐蚀 2 次 →
+外轮廓面积质心。最大工作宽度 640，次数与核大小是工作图像上的起始参数，不是本车标定值。
+额外检查凸包圆度、填充率、边界和原始边缘的多层径向支持，拒绝裁断目标及普通单环/实心圆。
+返回所有合格候选，保留多目标歧义，不无条件取全图最大黑块。位置身份仍通过
+`--position-digits --position-orientation 0` 等显式启用；逐个数字比较四种直角旋转。
+`center_method=morphology_external_contour_centroid`，`radius_px` 是原始径向支持层的
+代表半径，不是外缘半径、评分层数或毫米尺寸。方法面向接近平面正视的环，不承诺强透视适配。
+
+ROS 节点的相机/HSV 参数沿用前文；上述选项附加到既有 `pi_vision.vision_ros` 命令。
+当前改动没有部署或启动 Pi 服务，不应与已有唯一相机采集入口同时运行。
+
+Mac 终端或树莓派终端，离线比较已保存的原图（不访问相机/串口）：
+
+```bash
+python3 -m tools.vision_method_compare 原图.png --output output/method_compare --material-roi X Y W H --ring-roi X Y W H
+```
+
+输出目录必须尚不存在。报告包含框中心/面积质心和霍夫/形态学两种圆环结果；另外保存六色
+分割图、圆环 binary/dilated/blurred/eroded 阶段及叠加图。没有 ring ROI 时不运行形态学环路径。
+数字模板仍是 OpenCV 字体候选，视频截图不能替代本车拍摄的地面印刷数字验证。

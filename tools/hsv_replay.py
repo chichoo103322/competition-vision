@@ -27,16 +27,25 @@ def replay(directory, candidate=None):
         image = cv2.imread(str(path.parent / image_name))
         if image is None or [image.shape[1], image.shape[0]] != data['frame_size']:
             raise ValueError(f'{path.name}: missing or invalid full-resolution image')
+        kinds = {m.get('point_kind', 'contour_bounding_box_center') for m in data['materials']}
+        if not kinds <= {'contour_bounding_box_center', 'contour_area_centroid'} or len(kinds) > 1:
+            raise ValueError('unsupported or mixed coordinate point definitions')
+        method = 'centroid' if kinds == {'contour_area_centroid'} else 'box'
         def detect(profile):
-            detector = HSVMaterialDetector(profile=profile)
+            detector = HSVMaterialDetector(profile=profile, center_method=method)
             if data['roi'] is not None:
                 detector = MaterialRegionDetector(detector, data['roi'])
             return [asdict(m) for m in ordered_materials(detector.detect(image))]
         original = detect(baseline)
+        # Tracker IDs are live session metadata, not reproducible detector results.
+        def geometry(items):
+            return [{key: item.get(key, 'contour_bounding_box_center' if key == 'point_kind' else None)
+                     for key in ('index', 'color_id', 'shape_id', 'center_x', 'center_y',
+                                 'theta_deg', 'confidence', 'point_kind')} for item in items]
         result = detect(candidate) if candidate is not None else original
         report['samples'].append({
             'source_sequence': data['source_sequence'], 'image': image_name,
-            'baseline_matches_recorded': original == data['materials'],
+            'baseline_matches_recorded': geometry(original) == geometry(data['materials']),
             'profile_sha256': profile_hash(candidate if candidate is not None else baseline),
             'materials': result,
         })

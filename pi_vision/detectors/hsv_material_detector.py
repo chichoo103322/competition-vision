@@ -14,7 +14,10 @@ from ..hsv_profile import validate_profile
 
 
 class HSVMaterialDetector:
-    def __init__(self, min_area_ratio=.012, max_area_ratio=.4, profile=None):
+    def __init__(self, min_area_ratio=.012, max_area_ratio=.4, profile=None, center_method='box'):
+        if center_method not in ('box', 'centroid'):
+            raise ValueError('center_method must be box or centroid')
+        self.center_method = center_method
         self.profile = validate_profile(profile)
         if profile is not None:
             min_area_ratio = self.profile['shape']['min_area_ratio']
@@ -25,7 +28,9 @@ class HSVMaterialDetector:
         self.max_area_ratio = max_area_ratio
         self.profile['shape'].update(min_area_ratio=min_area_ratio, max_area_ratio=max_area_ratio)
 
-    def detect(self, frame):
+    def detect(self, frame, *, diagnostics=None):
+        if diagnostics is not None:
+            diagnostics.clear()
         if frame is None or frame.size == 0:
             return []
         hsv = cv2.cvtColor(cv2.GaussianBlur(frame, (5, 5), 0), cv2.COLOR_BGR2HSV)
@@ -46,6 +51,8 @@ class HSVMaterialDetector:
             if color_id != 3:
                 mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel)
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            if diagnostics is not None:
+                diagnostics[color_id] = mask.copy()
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             regions = (self._blue_regions(frame, hsv, mask, contours) if color_id == 3
                        else [(color_id, contour) for contour in contours])
@@ -67,8 +74,16 @@ class HSVMaterialDetector:
                     continue
                 # Purely a contour shape score, never a detection probability.
                 score = int(round(min(1., circularity)*100))
-                found.append(Material(0, output_color, 0, int(round(x+w/2)),
-                                      int(round(y+h/2)), 0., score))
+                cx, cy = x+w/2, y+h/2
+                point_kind = 'contour_bounding_box_center'
+                if self.center_method == 'centroid':
+                    moments = cv2.moments(contour)
+                    if moments['m00'] <= 0:
+                        continue
+                    cx, cy = moments['m10']/moments['m00'], moments['m01']/moments['m00']
+                    point_kind = 'contour_area_centroid'
+                found.append(Material(0, output_color, 0, int(round(cx)),
+                                      int(round(cy)), 0., score, point_kind=point_kind))
         found.sort(key=lambda item: (item.color_id, item.center_x, item.center_y))
         from dataclasses import replace
         return [replace(item, index=i+1) for i, item in enumerate(found)]

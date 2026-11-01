@@ -413,7 +413,7 @@ class FrameStreamer:
                     "confidence": item.confidence,
                     "track_id": item.track_id,
                     "tracking_status": item.tracking_status,
-                    "point_kind": "contour_bounding_box_center",
+                    "point_kind": item.point_kind,
                 }
                 for item in (self._latest_materials if material_observation['valid'] else [])
             ]
@@ -423,6 +423,7 @@ class FrameStreamer:
                     "center_x": item.center_x,
                     "center_y": item.center_y,
                     "radius": item.radius,
+                    "center_method": getattr(item, 'center_method', 'legacy_ring_fit'),
                     "position_id": getattr(item, 'position_id', None),
                     "position_status": getattr(item, 'position_status', 'not_enabled'),
                     "digit_score": getattr(item, 'digit_score', None),
@@ -667,7 +668,7 @@ class FrameStreamer:
                     'acquired_unix_s': wall_time,
                     'completed_monotonic_s': time.monotonic(),
                     'coordinate_frame': 'camera_image', 'units': 'pixels',
-                    'coordinate_meaning': 'contour_bounding_box_center_not_calibrated_grasp',
+                    'coordinate_meaning': 'see_material_point_kind_not_calibrated_grasp',
                     'frame_size': [frame.shape[1], frame.shape[0]], 'roi': roi,
                     'camera_requested': asdict(self._camera.config) if isinstance(getattr(self._camera, 'config', None), CameraConfig) else None,
                     'backend': type(base).__name__, 'profile': profile,

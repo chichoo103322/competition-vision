@@ -48,6 +48,7 @@ class Material:
     confidence: int
     track_id: int | None = None
     tracking_status: str = 'new'
+    point_kind: str = 'contour_bounding_box_center'
 
     def to_tuple(self):
         """转成串口协议要求的元组。"""

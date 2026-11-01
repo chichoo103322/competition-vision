@@ -36,6 +36,7 @@ class VisionPipeline:
         qr_camera: Optional[Camera] = None,
         material_backend: str = 'auto',
         hsv_profile=None,
+        material_center='box',
     ):
         self.config = config
         self.camera = camera
@@ -50,8 +51,8 @@ class VisionPipeline:
             raise ValueError('material_backend must be auto or hsv')
         if material_backend == 'hsv':
             from .detectors.hsv_material_detector import HSVMaterialDetector
-            self.material_detector = HSVMaterialDetector(profile=hsv_profile)
-            LOGGER.info('物料后端：实验性HSV颜色轮廓；坐标为轮廓框中心，尚需实机验收')
+            self.material_detector = HSVMaterialDetector(profile=hsv_profile, center_method=material_center)
+            LOGGER.info('物料后端：实验性HSV颜色轮廓；坐标点定义随 center_method 输出，尚需实机验收')
         elif Path(config.detection.yolo_model_path).exists():
             try:
                 self.yolo_detector.load()

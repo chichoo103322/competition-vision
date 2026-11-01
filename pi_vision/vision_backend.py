@@ -136,7 +136,7 @@ class VisionBackend:
                     continue
                 target = {'u': item['center_x'], 'v': item['center_y'], 'color_id': item['color_id'],
                           'confidence': item.get('confidence'),
-                          'point_kind': 'contour_bounding_box_center'}
+                          'point_kind': item.get('point_kind', 'contour_bounding_box_center')}
                 if type(item.get('track_id')) is int:
                     target.update(track_id=item['track_id'],
                                   tracking_status=item.get('tracking_status', 'updated'))
@@ -146,7 +146,9 @@ class VisionBackend:
                         width=state['preview']['source_width'], height=state['preview']['source_height'],
                         pixel_origin='top_left',
                         metric_coordinates_valid=False, calibration_required=True,
-                        coordinate_semantics='full_frame_contour_box_center_not_grasp_point',
+                        coordinate_semantics=('full_frame_contour_box_center_not_grasp_point'
+                            if all(t['point_kind'] == 'contour_bounding_box_center' for t in targets)
+                            else 'full_frame_see_target_point_kind_not_grasp_point'),
                         hsv_profile_sha256=state['hsv_profile_sha256'])
         return [self.reply(command, 'observation', data)]
 
@@ -176,5 +178,6 @@ class VisionBackend:
             return [], 'position_unconfirmed'
         return [dict(position_id=position_id, u=ring['center_x'], v=ring['center_y'],
                      radius_px=ring['radius'], digit_orientation_deg=ring['digit_orientation_deg'],
+                     center_method=ring.get('center_method', 'legacy_ring_fit'),
                      point_kind='ring_candidate_center', digit_score=ring['digit_score'],
                      digit_margin=ring['digit_margin'])], 'confirmed_new_frames'

@@ -58,12 +58,21 @@ def make_source(args):
         raise ValueError('此入口暂不应用相机控制；请使用空 v4l2_controls 配置')
     camera = Camera(config.camera)
     pipeline = VisionPipeline(config, camera=camera, material_backend=args.material_backend,
-                              hsv_profile=load_profile(args.hsv_profile) if args.hsv_profile else None)
+                              hsv_profile=load_profile(args.hsv_profile) if args.hsv_profile else None,
+                              material_center=getattr(args, 'material_center', 'box'))
     pipeline.set_material_roi(args.material_roi)
+    if getattr(args, 'ring_backend', 'hough') == 'morphology':
+        from .detectors.morphology_ring_detector import MorphologyRingDetector
+        pipeline.ring_detector = MorphologyRingDetector()
+    if getattr(args, 'ring_roi', None) is not None:
+        from .detectors.morphology_ring_detector import RingRegionDetector
+        pipeline.ring_detector = RingRegionDetector(pipeline.ring_detector, args.ring_roi)
     if getattr(args, 'position_digits', False):
         from .position_digits import NumberedRingDetector
         # Position coordinates must be this frame's candidates, not EMA history.
-        pipeline.ring_detector.smooth_alpha = 0.
+        base = getattr(pipeline.ring_detector, 'detector', pipeline.ring_detector)
+        if hasattr(base, 'smooth_alpha'):
+            base.smooth_alpha = 0.
         pipeline.ring_detector = NumberedRingDetector(pipeline.ring_detector, args.position_orientation)
     return FrameStreamer(camera, pipeline, enable_qr=False, enable_materials=False,
                          enable_rings=False, preview_enabled=False, draw_overlay=False,
@@ -77,6 +86,9 @@ def parse_args(argv=None):
     parser.add_argument('--camera', required=True)
     parser.add_argument('--material-backend', required=True, choices=['hsv'])
     parser.add_argument('--hsv-profile')
+    parser.add_argument('--material-center', choices=('box', 'centroid'), default='box')
+    parser.add_argument('--ring-backend', choices=('hough', 'morphology'), default='hough')
+    parser.add_argument('--ring-roi', nargs=4, type=int)
     parser.add_argument('--material-roi', nargs=4, type=int, default=None)
     parser.add_argument('--width', type=int, default=1280)
     parser.add_argument('--height', type=int, default=720)
@@ -87,6 +99,8 @@ def parse_args(argv=None):
     parser.add_argument('--position-orientation', type=int, choices=(0, 90, 180, 270),
                         help='将数字转正的顺时针角度，必须按观察姿态确认')
     args, ros_args = parser.parse_known_args(argv)
+    if args.ring_backend == 'morphology' and args.ring_roi is None:
+        parser.error('morphology ring backend requires explicit --ring-roi X Y W H')
     if min(args.width, args.height) < 1:
         parser.error('width/height must be positive')
     if args.position_digits != (args.position_orientation is not None):
