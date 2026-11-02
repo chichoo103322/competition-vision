@@ -49,13 +49,13 @@ g++ -std=c++11 -O2 \
 ```bash
 python3 lidar_view.py --capture ./lidar_sdk_capture \
   --device /dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0 \
-  --port 8766 --seconds 1800 \
+  --port 8766 --seconds 0 \
   --output /home/cuiguo/competition_vision/output/material_diagnostics/lidar_view_new_run \
   --field-map ./field_map_national_2027.json
 ```
 
-服务仅绑定 Pi 127.0.0.1；Ctrl+C 或 SIGTERM 有序停止子进程，最长 1800 秒后
-自动停止；可配置 1—3600 秒。启动 SDK 目标扫频 10 Hz、裁剪距离 0.05—12 m
+服务仅绑定 Pi 127.0.0.1；默认 `--seconds 0` 持续运行，不再到30分钟或1小时自动退出。
+Ctrl+C 或 SIGTERM 有序停止子进程；有界诊断时才显式传正数秒数。启动 SDK 目标扫频 10 Hz、裁剪距离 0.05—12 m
 只是诊断配置，不是量程/精度已验收。前 300 圈保存 `scans.jsonl`，后续只实时显示；
 SDK 日志不超过约 2 MB，退出写 `summary.json`。证据目录应保持 Git 忽略。
 

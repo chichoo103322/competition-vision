@@ -1,4 +1,4 @@
-"""Bounded, loopback-only T-mini live viewer. No motion, SLAM or ROS publisher."""
+"""Loopback-only T-mini live viewer. No motion, SLAM or ROS publisher."""
 from __future__ import annotations
 
 import argparse
@@ -120,14 +120,15 @@ def main():
     ap.add_argument("--capture", required=True, type=Path)
     ap.add_argument("--device", required=True, type=Path)
     ap.add_argument("--port", default=8766, type=int)
-    ap.add_argument("--seconds", type=float, default=1800)
+    ap.add_argument("--seconds", type=float, default=0,
+                    help="Run continuously by default (0); positive value limits runtime in seconds")
     ap.add_argument("--output", required=True, type=Path)
     ap.add_argument("--field-map", type=Path, required=True)
     ap.add_argument("--preview-settings", type=Path, help="Saved stationary preview calibration; no localization")
     ap.add_argument("--scan-frequency",type=float,default=10,choices=(6,8,10))
     args = ap.parse_args()
-    if not 1 <= args.seconds <= 3600:
-        ap.error("seconds must be 1..3600")
+    if not math.isfinite(args.seconds) or args.seconds < 0:
+        ap.error("seconds must be finite and >= 0 (0 means no time limit)")
     if not str(args.device).startswith("/dev/serial/by-id/") or not args.device.exists():
         ap.error("explicit existing by-id device required")
     config = json.loads(args.field_map.read_text())
@@ -230,11 +231,12 @@ def main():
     reader = threading.Thread(target=read, daemon=True)
     reader.start()
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    print(f"READY http://127.0.0.1:{args.port} / bounded {args.seconds}s", flush=True)
-    deadline = time.monotonic() + args.seconds
+    duration = "continuous (no time limit)" if args.seconds == 0 else f"bounded {args.seconds}s"
+    print(f"READY http://127.0.0.1:{args.port} / {duration}", flush=True)
+    deadline = None if args.seconds == 0 else time.monotonic() + args.seconds
     try:
         while not stop.wait(.25):
-            if child.poll() is not None or time.monotonic() >= deadline:
+            if child.poll() is not None or (deadline is not None and time.monotonic() >= deadline):
                 break
     finally:
         if child.poll() is None:

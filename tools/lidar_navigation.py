@@ -57,7 +57,7 @@ def occupied_cell_edges(nodes, edges, occupied):
         for x,y,w,h in rects)]
 
 
-def static_blocked_edges(config, nodes, edges, radius):
+def static_blocked_edges(config, nodes, edges, radius, *, check_boundary=True):
     """Conservative disc footprint against nominal exclusions and field limits."""
     rects=[tuple(v/1000 for v in z['rect_mm'])
            for z in config.get('floor_exclusions',[])+config.get('work_zones',[])]
@@ -67,7 +67,7 @@ def static_blocked_edges(config, nodes, edges, radius):
         return math.hypot(max(x-p[0],0,p[0]-x-w),max(y-p[1],0,p[1]-y-h))
     for e in edges:
         a,b=nodes[e['a']]['xy'],nodes[e['b']]['xy']
-        hit=any(min(p[0],p[1],2.4-p[0],2.4-p[1])<radius for p in (a,b))
+        hit=check_boundary and any(min(p[0],p[1],2.4-p[0],2.4-p[1])<radius for p in (a,b))
         for rect in rects:
             x,y,w,h=rect
             # All graph edges are axis aligned, so overlapping projections intersect.

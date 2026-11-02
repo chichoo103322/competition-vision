@@ -1,0 +1,30 @@
+{
+  "1": {
+    "initial_pose": {
+      "x_mm": null,
+      "y_mm": null,
+      "yaw_deg": 90
+    },
+    "heading_deg": 90,
+    "move_rpm": 20,
+    "turn_rpm": 15,
+    "approach_rpm": 8,
+    "approach_distance_mm": 120,
+    "coordinate_frame": "field_photo_ccw",
+    "stop_strategy": "controller_deceleration"
+  },
+  "2": {
+    "initial_pose": {
+      "x_mm": null,
+      "y_mm": null,
+      "yaw_deg": null
+    },
+    "heading_deg": null,
+    "move_rpm": 20,
+    "turn_rpm": 15,
+    "approach_rpm": 8,
+    "approach_distance_mm": 120,
+    "coordinate_frame": "field_photo_ccw",
+    "stop_strategy": "controller_deceleration"
+  }
+}

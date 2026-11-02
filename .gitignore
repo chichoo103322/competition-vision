@@ -3,6 +3,8 @@
 !/config/vision_config.example.yaml
 !/config/hsv_profile.example.yaml
 !/config/field_map_national_2027.json
+!/config/chassis_test_profile.example.json
+!/config/chassis_test_profiles.example.json
 /models/
 /datasets/
 /runs/

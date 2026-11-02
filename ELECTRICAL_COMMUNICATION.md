@@ -1,85 +1,143 @@
-# 树莓派与电控通讯交接
+# 树莓派与电控通讯对接
 
-更新：2026-11-02。此文记录现有实现与下一阶段约定事项，尚未定义正式导航字节协议，也未完成电控联通。开始新对话先读 `AGENTS.md`、`PROJECT_CONTEXT.md`，再读本文。
+更新：2026-11-02。先读AGENTS.md、PROJECT_CONTEXT.md。**当前以用户最新提供的 `/Users/jzxzhou/Downloads/car_code1 2/` 为基准**，已核对README_start_area.md、route.c、route_keys.c和route_client.py。旧拟议nonce/boot_id/revision区号协议已删除，不能再向新版电控发旧格式0x15/0x16。
 
-## 已确定的目标
+## 接线与按键
 
-用户希望树莓派在开局扫描后一次计算8段路线，整批交给主控板，主控按任务进度逐段执行。起始启停区1/2由外部控制端发信号提供，比赛时不依赖电脑手动选区。发送方设备、通信链路和消息格式尚未确定。
+用户已选USB转TTL，波特率115200、8N1、无流控、3.3V逻辑电平：USB-TTL TX→STM32 PC11(RX)，USB-TTL RX←STM32 PC10(TX)，GND共地。不接RS232电平，不用TTL电源脚给整车供电。STM32 UART5仍专供IMU。
 
-8段顺序：启停→扫码→原料→加工→暂存→原料→加工→暂存→启停。一次传完整计划不等于连续执行到底；扫码、抓放、加工等环节必须等相应任务完成。任务流程只能有一个所有者；旧视觉方案为STM32主导，仓库另有树莓派任务调度模拟层，最终接入前须选定主流程，不让两者同时推进动作。
+Pi现有CP2102 by-id、ttyUSB0为雷达，电控适配器须单独确认稳定by-id路径。不能因型号也是CP2102就拒绝所有适配器，也不能默认打开第一个ttyUSB。工具拒绝解析后等于已知雷达设备的端口；无该稳定路径时保守拒绝ttyUSB0。新适配器尚未出现前不猜端口。USB-TTL不需要改GPIO的ttyAMA0控制台。
 
-## 可复用的代码与现有限制
-
-| 文件 | 现有能力 | 接入边界 |
+| 按键 | 空闲/READY/完成后 | 行驶或WAIT_WORK中 |
 | --- | --- | --- |
-| `tools/lidar_navigation.py` | 25格占据、9节点12边、A*与转弯代价 | 已占据格整体封路，另保留回波点的车体余量判据；未观测区域未知 |
-| `tools/lidar_mission.py` | 一次请求计算8段，保留同一障碍快照 | `valid_for_motion=false`，功能区为名义接近点 |
-| `tools/lidar_view.py` | 本机HTTP观察接口与启停区配置 | 不发送电控命令，不是正式通信桥 |
-| `pi_vision/protocol.py` | 旧视觉协议编解码、拆包与校验 | 无启停区初始化、8段计划上传、车辆位姿回传命令 |
-| `pi_vision/serial_link.py` | 旧协议串口收发，代码默认115200 | 实际端口、波特率、主控固件支持情况待确认 |
-| `pi_vision/mission.py`、`mission_ros.py` | 调度流程、动作反馈和模拟 | 不等于已有电控/导航动作后端，详见 `MISSION_FRAMEWORK.md` |
+| KEY1（PA15） | 选择启停区1，新请求使旧路线作废 | 忽略 |
+| KEY0（PC5） | 选择启停区2，新请求使旧路线作废 | 立即取消路线；同次按住不触发新的扫描 |
 
-HTTP现有入口（仅回环监听，通过Mac隧道访问）：
+30ms消抖；长按一次请求；双键同时按不选区；上电按住须先松开。任意键按住均禁止START。树莓派遇匹配READY且START返回BAD_STATE时最多等10秒，期间允许松开键/IMU就绪；取消、错误路线号不重试。KEY0停车语义来自新版固件，树莓派未改按键。
 
-- `GET /state`：实时扫描、`navigation`与`mission_plan`。
-- `POST /configure`，JSON `{"start_zone":1}`或2：选用已保存的静止配置，并清除旧扫描证据和计划。
-- `POST /configure`，JSON `{"action":"plan_mission"}`：新鲜扫描下计算并保存8段。
-- `mission_plan`有`plan_id/session_id/source_seq`、各段`nodes/edges/length_m`、总长和障碍快照；节点编号必须结合`navigation.nodes[].xy`解释，不能把编号当毫米坐标。
-- 障碍新阻断旧计划时`evidence_status=new_obstacle_replan_required`；失效扫描为`scan_unavailable`。网页停止演示并要求重算，正式停止/撤销计划消息还未接电控。
+## 线路协议
 
-## 旧协议的真实格式
+帧：`A5 5A | version:u8=1 | type:u8 | sequence:u16 | payload_length:u16 | payload | CRC16:u16`。均小端。CRC16/CCITT-FALSE覆盖version至payload尾：poly1021、initFFFF、无反射、xorout0，`123456789→29B1`。最大payload1304、完整帧1314；普通路线内容最大1300；64航点。半包间隔超过500ms丢弃。
 
-以下来自现有源码，不能当作朋友主控固件已支持的证明：
-
-`AA LEN CMD 参数... CHK`，LEN是CMD和参数的总字节数，CHK为CMD与参数逐字节相加取低8位。多字节数值使用大端；拆帧器`MAX_FRAME=16`是整帧上限。
-
-上报命令：0x10任务码、0x11物料、0x12未识别到、0x13放置验证、0x14障碍方向/距离、0x15心跳、0x16圆环中心；控制命令：0x21开始扫描、0x22停止扫描、0x23设颜色、0x24重扫；0x81为控制帧ACK。停止扫描只作用于识别流程，不能充当整车停止。
-
-旧物料/圆环中心是图像像素；旧障碍距离单位cm、角度单位0.1°，它们与导航地图坐标不同。旧0x14只有方向/距离，不能传8段路线。旧ACK没有完整的运行/计划/序号语义，不能冒充路线整包确认、到达或动作完成。
-
-8段数据通常超出16字节，需要协商独立版本或分包扩展；不能只把大JSON塞进旧帧，或单方面扩大帧长、占用新命令码。协议命令号、包布局、字节序、校验、最大包长均应由双方确认后再实现。
-
-## 坐标、车头和传感器位置
-
-| 数据 | 当前定义 | 接口注意事项 |
+| type | 含义 | payload |
 | --- | --- | --- |
-| 静态地图配置 | 场地外框2400×2400，左下原点，X向右、Y向上，配置单位mm | 原点按原规则图，不随照片视图旋转 |
-| 路网节点 | 相同场地坐标，代码`xy`单位m | 发给电控前只转换一次，建议传mm；正式单位待双方确认 |
-| 雷达预览pose | 雷达旋转中心X/Y单位m、传感器朝向角单位度，坐标变换数学上逆时针为正 | 这是传感器位姿，不是已标定的车体中心/车头 |
-| 未来车体朝向 | 建议地图+X为0°、逆时针为正 | 还需与主控IMU正负方向、开局参考和安装轴约定对齐 |
-| 视觉位置 | 原图像素，图像左上原点 | 不能混入地图毫米或冒充抓取点 |
+| 0x10 | 原普通UPLOAD | 20字节头＋N×20；按键选择后固件拒绝，防绕过请求 |
+| 0x11 | START | route_id:u32 |
+| 0x12 | STOP，取消非暂停 | route_id:u32，0表示当前 |
+| 0x13 | WORK_DONE | route_id:u32, point_index:u16, success:u8, reserved:u8=0 |
+| 0x14 | STATUS | 空 |
+| **0x15** | **AREA_ACK** | **request_id:u32, area:u8, reserved:3字节=0** |
+| **0x16** | **UPLOAD_FOR_AREA** | **request_id:u32＋原UPLOAD完整payload** |
+| 0x30 | VISION | 20字节，见下 |
+| 0x80 | ACK | 36字节，sequence与request_type共同匹配 |
+| 0x81 | EVENT | 同样36字节，独立事件计数 |
+| **0x82** | **START_AREA** | **request_id:u32, tick:u32, area:u8, key:u8, reserved:u16=0，共12字节** |
 
-当前8段只包含路网几何，**没有逐路点车体yaw、速度或加减速约束**。动画箭头沿路线切线转动，仅为展示；麦克纳姆轮可以横移，切线角不等于车头朝向，不能直接照搬到电控。
+START_AREA由STM32主动发送。未确认时每500ms重发相同request_id、tick、area；树莓派去重、只启动一次规划。KEY1对应area1/key1，KEY0对应area2/key0。AREA_ACK得到普通ACK OK后才调用规划。规划期间继续接收状态/按键；新请求使旧结果丢弃，以最新区号重新规划。带旧request_id的0x16即使迟到也会被固件拒绝。
 
-两区保存的是这次固定摆放的静止雷达估计；区号信号不能解决区内任意偏放、转向或运动中的定位。必须约定开局摆放基准/初始朝向，或增加真实定位。还需测量雷达相对车体参考点的安装偏移与角度，才能在车体位姿和雷达位姿之间转换；不要把预览中的约-91°当成电控车头指令。
+request_id由STM32按键生成，route_id由Pi递增生成，两者不能混用。固件换区时route_status.route_id清0，但内部highest_id仍保留；所以不能按STATUS的0自动把新route_id重置为1。每轮手工提高--route-id，或由正式业务持久管理单调递增编号。MCU重启request_id不掉电保持；本版无boot_id，发现请求倒退/同号身份变化会要求重建Client。不声称可以检测所有快速掉电重启；重启后停止旧流程、重启Pi接收程序并重新按键。
 
-主控若回传编码器/IMU融合位姿，须说明是场地坐标还是开局局部坐标、参考点在哪、单位及时间语义；树莓派据此更新雷达投影。单有陀螺仪开机归零不能确定地图中的绝对朝向。当前移动位姿更新接口与融合算法均未接入。
+旧 `pi_vision/protocol.py` 的AA帧仍保留给历史视觉基线，不能与A5 5A混发。相同数字命令号不是相同协议。一个UART只有一个Client持有，预览/视觉/任务请求交给该所有者，不再开第二个程序抢读。
 
-## 建议的联调顺序（待双方确认的方案）
+## 路线与八段
 
-1. 确认主控型号、已有协议/固件、USB或UART链路、唯一任务流程所有者、可用内存及单包上限。UART另核对电平和接线。端口必须明确区分雷达，禁止默认选择第一个ttyUSB设备。
-2. 先实现无动作链路测试：握手、协议版本、会话、心跳、拆包/粘包/坏包和超时。收到包不等于执行成功。
-3. 主控发送有效区号和初始化状态；双方建立开局坐标/朝向基准。确认数据新鲜后树莓派扫描、一次算完8段。
-4. 用计划ID、版本、段号1—8、路点序号和总量分包上传；主控仅在整包齐全且校验一致后确认可用。缺段、重复、乱序、旧会话和半包重启必须处理，不能执行半份计划。
-5. 通过显式开始/逐段执行机制运行；`accepted`、`running`、`arrived且停稳`、`failed`与`stopped`区分。扫码/抓放完成反馈由对应任务端提供。
-6. 持续回传车辆位姿、当前段号、执行状态和故障；新障碍或通信失效的停止、计划撤销、确认与重算交接须有明确责任。更换计划后不得误执行旧包；重传去重，重连不能自动恢复旧动作。
+### 双方统一的坐标与车头（2026-11-02）
 
-收发时间由各设备自己的时钟判超时；不能直接相减两台设备的单调时钟。启动第一阶段只做模拟或无动作收发验证，明确连接身份后再安排实机动作。
+**已与用户确认电控统一采用照片同向坐标 `field_photo_ccw`：场地照片同向视图的左下角为原点，+X向右、+Y向上，毫米；车头朝+X为0°、逆时针为正。** 0/90/180/−90°对应+X/+Y/−X/−Y。两个启停区共用原点和坐标轴。区1在左下，区2在左上，二维码区在左侧中段。
 
-## 新对话应先收集的信息
+区1车头沿通道朝二维码区为 `initial_pose.yaw_deg=90`、测试 `heading_deg=90`，已写入双区示例；区2实际摆车方向未确认，yaw/heading留null。两区实际车体参考点X/Y留空，不使用启停区名义中心或雷达中心冒充测量。
 
-- 主控型号和朋友目前的收发协议/代码；是否已经有串口收包与ACK。
-- 接口是USB、GPIO UART还是其他链路，实际串口标识、波特率；UART时的电平/接线。
-- 主控是否有编码器、IMU和车辆位姿估计，当前坐标/角度约定。
-- 车头在两启停区的比赛出发朝向，雷达与车体参考点的安装关系。
-- 谁负责扫码/抓放任务推进，整批路线如何存储，以及开始、到达、停止和重规划的责任。
+内部雷达/路网仍使用已校准的原地图 `field_nominal`，不重写扫描校准：
 
-不必重新人工验收全部视觉功能才能开始通信软件开发。先保留现有视觉颜色/中央目标逻辑，以假路线或已保存规划JSON做收发协议模拟，随后对接真实规划输出。不要将`valid_for_motion=false`简单改成true来绕过未完成的定位、停车点和运动后端。
+```text
+电控X_mm = 2400 − 原地图X_mm
+电控Y_mm = 2400 − 原地图Y_mm
+电控yaw_deg = wrap(原地图yaw_deg + 180°)
+```
 
-## 当前验证证据
+`electrical_coordinates`提供整个位姿的正反变换。配置输入已经是照片同向的车体X/Y/yaw；编译器只转换原路网节点（米→毫米并旋转180°），不会再旋转配置中的+90°。生成路线标记`coordinate_frame=field_photo_ccw`、`source_coordinate_frame=field_nominal`。初始与目标航向均直接使用新坐标配置中的度数，禁止只改yaw而保留旧X/Y。通用编译器、底盘测试配置和串口编码器强制显式frame；旧配置/无frame路线拒绝编码/上传，不能只给旧数据补标签。网页是否勾选180°显示不会更改协议坐标。
 
-35项雷达导航/服务/批次软件测试和display JS通过；24占据却穿格的错误已用真实扫描复现并修复，24封边6/10，第5段改走中间通道。实页已验证新阻断时停止动画；这不是整车停止验收。
+底盘测试将新坐标路线反变换后，在原规划地图核对起点、禁区及障碍；状态回传和到点对比均保持照片同向坐标。`pose_snapshot.frame_id=field_photo_ccw`，不自动将离散回传用于移动雷达定位。区1朝+90°，往二维码接近点时Y增大、对应前进；有绕障或起点连接时仍可能先横移。
 
-两区已作人工角点静止试校准和若干格号验证，角点拟合差异约3—6cm，包含手工放置、圆柱模型与测距影响，不能称为已测绝对定位精度。现场配置保存在Pi独立部署目录和Mac忽略证据目录，扫描/照片/设备配置不提交Git。
+上传必须提供车体实际初始航向；IMU上电0°不是地图0°。START时电控将当前IMU原始角锚定至上传的地图初始航向，`imu_yaw_sign=-1`由电控维护，Pi不再取反yaw。每个目标先转到目标yaw，再将地图位移换为前后/左右，较大分量先执行。测试所有目标yaw与初始yaw一致时，车头保持原方向，路径转弯通过麦轮横移/倒退完成；不会随路线箭头转头。
 
-运行命令与在线快照见`PROJECT_CONTEXT.md`；服务有总时限，不能把旧PID、IP、HTTP可达或软件测试结果当作当前设备正常。真实电控通信、底盘执行、移动定位及机械停车点均尚未验收。
+| 车头yaw | 地图+X位移 | 地图+Y位移 |
+| --- | --- | --- |
+| 0° | 前进 | 左移 |
+| 90° | 右移 | 前进 |
+| 180°/−180° | 后退 | 右移 |
+| −90° | 左移 | 后退 |
+
+`electrical_coordinates.direction_review`直接解码实际UPLOAD二进制，记录初值、每点目标、地图位移、前进/左移分量及先转后走顺序。通用Client在上传时保留`last_upload_review`；底盘测试在START前打印并保存`direction_review`。它是理想到点的方向核对，不改变发送内容，不代替反馈；电控有限转向误差可能引起少量额外修正。`(0,0,0)→(500,0,90)`显示“逆时针90°→右移500mm”；若要先前进后转，需增加`(500,0,0)`中间点。
+
+当前路线编译器从原地图路网米坐标乘1000一次，再计算2400−X/2400−Y；Python输入航向已是照片同向的度数，串口编码乘100为0.01°。不接收ROS位姿作为自动起点，也不直接复制雷达pose；未来接入必须指定源地图坐标变换、弧度转度以及雷达相对车体的平移和偏航外参，得到车体参考点位姿后才上传。仅减安装偏角不足以修正雷达中心与车体中心的位置差。
+
+离线验证入口（Mac终端，不开硬件）：
+
+```bash
+python3 -m tools.electrical_direction_check '/Users/jzxzhou/Downloads/car_code1 2' --output output/electrical_direction_20261102/check.json
+```
+
+已用真实route/heading/motion/IMU源码和模拟UART/CAN/轮子核验4个朝向下的±X/±Y共16种位移及两种先转/后转例子，18项通过；保持IMU符号−1，并检查模拟轮子产生的前后/左右位移及动作顺序。此为软件方向验证，真实电机接线、轮序和IMU安装仍须实车短距核对。
+
+UPLOAD头 `<IHHiii`：route_id:u32非0、count:u16(1…64)、reserved:u16=0、实际车体initial_x_mm/initial_y_mm/initial_yaw_cdeg:i32。
+
+每点 `<iiiHHHH`：x_mm、y_mm、yaw_cdeg:i32，move_rpm、turn_rpm、work_id、flags:u16。X/Y为照片同向绝对场地毫米±100000；yaw单位0.01°，−18000…18000；轮转速1…120rpm。flags=0/work_id=0为通行点，flags=1/work_id非0为工作点。Python输入yaw_deg，编码时乘100；路网米坐标转换成mm一次。最大64点超出即拒绝，不截断、不自动分成多个任务。
+
+8段：启停→扫码→原料→加工→暂存→原料→加工→暂存→启停。末点标签101…108为本项目阶段约定，不是颜色或位置编号；本地保存段号与点索引映射，固件仅回传零起始point_index。第二批暂存仍按同颜色第一批物料码垛，正式业务不会用第四组码当第二批暂存位置。
+
+STM32是底盘/航点推进唯一所有者。Pi批次规划与工作接口不同时启动完整mission_ros模拟层去调度同一底盘。ARRIVED在固件进入WAIT_WORK/写work_id之前发送，不能靠ARRIVED推进作业；用匹配WAIT_WORK，ACK只是收包处理。
+
+注意：flags=0的“通行点”只是**不等待作业**，不是不停站通过；当前固件仍会闭环停稳。测试编译器默认合并同速同航向的顺向直线中间点，不再插入额外接近点；八个工作点及必要拐点保留。默认作业点的move_rpm是距离闭环的速度上限，不是到点速度。旧分段接近方式仅由stop_strategy=split_approach显式启用。
+
+新测试模式见[CHASSIS_ROUTE_TEST.md](CHASSIS_ROUTE_TEST.md)：固定车头沿地图轴移动，末端低速接近，电控编码器/IMU闭环停稳，然后2秒模拟作业等待，8站后回实际起点。不读相机、不发VISION、不调用真实夹爪。通用正式接口没有定时完成，必须提供真实反馈。
+
+原固件控制策略是先转到点目标yaw，再前/左分量先大后小执行；不是任意点间直线跟踪。电控已有剩余距离比例降速与RPM斜坡、编码器和IMU闭环；四轮反馈约±1rpm、指令近零、距离/角度在容差，持续250ms后动作DONE。当前每个航点均停稳，不是连续曲线巡航。
+
+## 通用与测试入口
+
+`pi_vision/electrical_link.py`提供：
+
+- `wait_start_area(timeout)`：等待物理按键、ACK、返回request_id/tick/area/key；重复不返回。
+- `plan_after_key(planner)`：先ACK再调用`planner(signal, check_current)`；planner在扫描/计算间隙调用check_current。换区抛AreaSuperseded，自动丢旧结果重入新区域；无上传/运动副作用。
+- `upload(route, start_request_id=...)`：使用0x16并校验route.start_zone与已确认信号一致。正式路线需valid_for_motion=true；这不是物理验收的替代。当前预览不能手改true解锁。
+- `run_after_key(planner, on_work=...)`：正式业务入口，按键→规划→绑定上传→等待键释放START→STATUS→真实工作反馈。`on_work(client,status)`必须快速返回：None=尚未完成、True=实际完成、False=失败；内部以路线号/点索引管理只启动一次实际任务。缺callback保持等待，到执行超时取消；绝不自动模拟成功。
+- `tools/electrical_route_test.py --wait-key`：纯底盘测试入口；同一Client接收区号、选配置、规划和运行。只有本测试明确允许停留后模拟WORK_DONE。
+
+正式业务接口已具备按键联动，但完整机械动作/视觉毫米标定仍没有完成，不能宣称整车业务已接通。`Route_OnWork`在提供固件里为空；将来加入机械动作后，底盘测试需禁用该钩子的机构动作。
+
+## 状态与位姿
+
+ACK/EVENT36字节 `<BBBBIHHHBBIIiihH`：request_type/code/state/phase:u8；route_id:u32；point_index/count/work_id:u16；chassis_fault/fault_address:u8；tick_ms/route_fault:u32；estimated_map_x/y:i32(mm)；yaw:i16(0.01°)；reserved:u16=0。
+
+state：0EMPTY、1READY、2RUNNING、3WAIT_WORK、4DONE、5STOPPED、6FAULT。phase：0规划、1转向、2前后、3左右、4等待。
+ACK结果：0OK、1BAD_TYPE、2BAD_LENGTH、3BAD_CRC保留、4BAD_VALUE、5BUSY、6BAD_ID、7BAD_STATE、8CONFLICT。
+事件：1READY、2STARTED、3ARRIVED、4WORK_REQUIRED、5DONE、6STOPPED、7FAULT、8POINT_DONE。
+路线故障：0无、1底盘、2启动/配置失败、3工作失败、4工作等待超时、5外部停止、6IMU掉线。
+
+STATUS可补漏EVENT；单次匹配STATUS回包记录Pi本地单调接收时间，默认0.5秒过期清坐标。X/Y只在底盘子动作完成后累计，RUNNING中yaw跟随IMU；回包新鲜不等于XY测量新鲜。READY是上传初值，急停中途未完成位移可能未累计。输出continuous=false、valid_for_motion=false；不能用它给移动雷达做连续投影。回传采用照片同向场地图，+X为0°、逆时针为正；雷达外参和车体参考点仍待确认。
+
+VISION `<IHH iihH`：route_id/point_index/work_id/dx_mm/dy_mm/dyaw_cdeg/confidence。偏移前方+X、左方+Y、逆时针正；confidence0…1000，0表示不可靠。只接受匹配WAIT_WORK；像素不能直接填mm。V1无颜色、任务码、测量期限字段，完整抓放协议仍需补齐。
+
+## 停止与重连
+
+同号同内容UPLOAD幂等、同号不同内容CONFLICT；活动中拒绝新路线。START活动态重试不重复启动；DONE/STOPPED/FAULT不能同号重跑。WORK_DONE仅最近一次支持重复确认。
+
+异常/超时不能假装DONE或停稳。底盘测试异常尝试STOP再STATUS，记录确认或未确认；正式接口异常尽力STOP并抛原失败。MCU原固件**通信断开不自动停车**，STOP断线可能无法送达；KEY0本地取消仍有效。无链路看门狗、无动态障碍避停；当前流程仅用开局静止障碍快照，运动后不把旧静止位姿投影当新障碍。
+
+## 无动作联调（部署后）
+
+**树莓派终端**，先确认USB-TTL稳定路径，再用同一程序观察两键：
+
+```bash
+cd /home/cuiguo/competition_vision
+python3 -m tools.electrical_comm --port /dev/serial/by-id/实际电控适配器 watch-areas --seconds 120
+```
+
+先运行再短按松开。预期KEY1输出area1、KEY0输出area2及递增request_id。该入口只确认信号，不规划、不上传、不START；输出本身不能算真实运动验收。一次只开一个串口程序。`status`仅查状态，`wait-area`只接一条新选区。
+
+## 验证
+
+当前Python覆盖新旧帧分流、两区映射、重发去重、换区中断规划、绑定上传、1314字节上限、重启拒绝、正式无反馈不放行。新版C主机测试20项通过，含route_keys消抖/双键/长按/活动KEY0停车和64点带请求上传。完整真实route/heading/motion/IMU加模拟UART/CAN/轮子，按键请求路径两区均完成8站回程；未接真实UART或电机。最终部署和测试数见PROJECT_CONTEXT.md。
+
+部署已完成：26文件已同步Pi `/home/cuiguo/competition_vision`并校验SHA256；Pi345 passed/1 skipped、Mac346 passed/172 subtests，备份`backups/electrical_keys_20261102_28vEA6`。未启动运动或改系统UART。
