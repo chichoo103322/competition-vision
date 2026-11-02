@@ -40,6 +40,9 @@ function polarToMap(angle, range, pose, angleSign = 1) {
 }
 
 /* A screen-only replay of the saved route geometry, with no hardware output. */
+function canPlayMission(plan, live) {
+  return !!(live && plan?.status==='ready' && plan.evidence_status==='snapshot_preview');
+}
 class RoutePlayback {
   constructor() { this.reset(); }
   reset() { this.stages=[]; this.planId=null; this.elapsed=0; this.running=false; this.last=null; this.rate=1; }
@@ -56,7 +59,9 @@ class RoutePlayback {
   play(now) { if(!this.stages.length)return; if(this.position().done)this.elapsed=0; this.running=true; this.last=now; }
   pause(now) { this.tick(now); this.running=false; this.last=null; }
   restart(now) { this.elapsed=0; this.running=true; this.last=now; }
-  tick(now) {
+  tick(now, allowed = true) {
+    // Freeze before advancing when live evidence invalidates the saved route.
+    if(!allowed){this.running=false;this.last=null;return this.position();}
     if(this.running&&this.last!==null) this.elapsed+=Math.max(0,now-this.last)/1000*this.rate;
     this.last=now;
     const result=this.position(); if(result?.done)this.running=false;
@@ -82,4 +87,4 @@ class RoutePlayback {
     }
   }
 }
-if (typeof module !== 'undefined') module.exports = {ScanDisplayBuffer, mapToCanvas, canvasToMap, polarToMap, RoutePlayback};
+if (typeof module !== 'undefined') module.exports = {ScanDisplayBuffer, mapToCanvas, canvasToMap, polarToMap, RoutePlayback, canPlayMission};

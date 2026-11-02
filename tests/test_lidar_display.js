@@ -53,3 +53,17 @@ assert.equal(replay.position().segment,1);
 assert.equal(replay.elapsed,0);
 assert.throws(()=>replay.load({...plan,status:'no_path'},[]));
 assert.equal(replay.planId,'eight');
+
+const {canPlayMission}=require('../tools/lidar_display.js');
+const validPlan={...plan,evidence_status:'snapshot_preview'};
+assert.equal(canPlayMission(validPlan,true),true);
+for(const [p,live] of [[validPlan,false],[{...validPlan,status:'no_path'},true],
+ [{...validPlan,evidence_status:'new_obstacle_replan_required'},true],
+ [{...validPlan,evidence_status:'scan_unavailable'},true],[null,true]]){
+ assert.equal(canPlayMission(p,live),false);
+ replay.load(validPlan,[{xy:[0,0]},{xy:[1,0]}]);replay.play(0);replay.tick(100);
+ const before=replay.elapsed;
+ replay.tick(500,canPlayMission(p,live));
+ assert.equal(replay.elapsed,before);assert.equal(replay.running,false);
+ replay.tick(1000,true);assert.equal(replay.elapsed,before); // recovery doesn't auto-resume
+}

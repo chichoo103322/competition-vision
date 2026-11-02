@@ -42,6 +42,21 @@ def lane_graph():
     return nodes, edges
 
 
+def occupied_cell_edges(nodes, edges, occupied):
+    """Axis-aligned lane edges touching an occupied cell are unavailable.
+
+    Whole-cell exclusion matches the displayed 25-cell obstacle model; the
+    independent point-clearance test still protects nearby roads outside it.
+    """
+    rects=[g['rect'] for g in grid_rects() if g['id'] in occupied]
+    return [e['id'] for e in edges if any(
+        max(min(nodes[e['a']]['xy'][0],nodes[e['b']]['xy'][0]),x)
+            <=min(max(nodes[e['a']]['xy'][0],nodes[e['b']]['xy'][0]),x+w)
+        and max(min(nodes[e['a']]['xy'][1],nodes[e['b']]['xy'][1]),y)
+            <=min(max(nodes[e['a']]['xy'][1],nodes[e['b']]['xy'][1]),y+h)
+        for x,y,w,h in rects)]
+
+
 def static_blocked_edges(config, nodes, edges, radius):
     """Conservative disc footprint against nominal exclusions and field limits."""
     rects=[tuple(v/1000 for v in z['rect_mm'])
@@ -258,7 +273,9 @@ class NavigationPreview:
                              (i in h[8] and now-h[0]<far_ttl) for h in recent)
                         for i in occupied}
         boundary_only=[i for i in occupied if interior_votes[i]<3]
-        blocked=[i for i,n in edge_votes.items() if n>=3]
+        point_blocked=[i for i,n in edge_votes.items() if n>=3]
+        cell_blocked=occupied_cell_edges(self.nodes,self.edges,occupied)
+        blocked=sorted(set(point_blocked+cell_blocked))
         static_blocked=static_blocked_edges(self.config,self.nodes,self.edges,self.settings['clearance_m'])
         route=astar(self.nodes,self.edges,self.settings['start'],self.settings['goal'],set(blocked+static_blocked),
                     self.settings['turn_penalty_m'])
@@ -269,6 +286,7 @@ class NavigationPreview:
         route.update(scope=scope,valid_for_motion=False,live_obstacle_evidence=bool(recent))
         return dict(settings=self.settings,grid_rects=grid_rects(),nodes=self.nodes,edges=self.edges,
                     grid_votes=cells,edge_votes=edge_votes,occupied_cells=occupied,blocked_edges=blocked,
+                    point_blocked_edges=point_blocked,cell_blocked_edges=cell_blocked,
                     boundary_only_cells=boundary_only,
                     interior_evidence_cells=[i for i in occupied if i not in boundary_only],
                     display_boundary_band_m=DISPLAY_BOUNDARY_BAND_M,

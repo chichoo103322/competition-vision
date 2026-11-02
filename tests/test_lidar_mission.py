@@ -106,3 +106,34 @@ def test_http_state_batch_action_freezes_and_configuration_clears():
     assert state.snapshot()['mission_plan']['plan_id']==plan_id
     state.configure(dict(clearance_m=.19))
     assert state.snapshot()['mission_plan'] is None
+
+
+@pytest.mark.parametrize('zone',[1,2])
+@pytest.mark.parametrize('xy,cell,edges', [([.1,2.3],24,{6,10}),([.1,.1],20,{0,1})])
+def test_occupied_corner_blocks_roads_even_outside_point_clearance(zone,xy,cell,edges):
+    nav=configured(zone)
+    for seq in range(1,4):
+        nav.ingest(dict(seq=seq,points=[point(nav.settings['pose'],xy)]),seq*.1)
+    evidence=nav.snapshot(.31,True)
+    assert evidence['occupied_cells']==[cell]
+    assert evidence['point_blocked_edges']==[]  # Reproduces the old missing-block case.
+    assert set(evidence['cell_blocked_edges'])==edges
+    plan=build_mission_plan(nav,evidence,3,'session')
+    assert plan['status']=='ready'
+    assert all(not edges.intersection(s['edges']) for s in plan['segments'])
+    assert nav.snapshot(5,True)['cell_blocked_edges']==[]
+    assert nav.snapshot(.31,False)['blocked_edges']==[]
+
+
+def test_new_corner_obstacle_invalidates_old_batch_and_replanned_batch_avoids_it():
+    nav=configured(2)
+    for seq in range(1,4):nav.ingest(dict(seq=seq,points=[]),seq*.1)
+    plan=build_mission_plan(nav,nav.snapshot(.31,True),3,'s')
+    assert any(6 in s['nodes'] for s in plan['segments'])
+    for seq in range(4,7):
+        nav.ingest(dict(seq=seq,points=[point(nav.settings['pose'],[.1,2.3])]),seq*.1)
+    evidence=nav.snapshot(.61,True)
+    assert mission_status(plan,evidence,True)['evidence_status']=='new_obstacle_replan_required'
+    updated=build_mission_plan(nav,evidence,6,'s')
+    assert all(6 not in s['nodes'] for s in updated['segments'])
+    assert updated['segments'][4]['nodes']==[3,4,7]
