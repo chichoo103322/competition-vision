@@ -1,0 +1,96 @@
+{
+  "schema": 1,
+  "map_id": "national_2027_preliminary_nominal",
+  "source": {
+    "document": "02-2027年第十届 智能+工程创新赛道竞赛命题与运行(3).pdf",
+    "pages": [3, 4],
+    "figure": "图1 初赛赛场示意图、表2",
+    "scope": "全国命题初赛名义平面图；决赛布局未覆盖",
+    "field_measurement_verified": false
+  },
+  "coordinates": {
+    "frame": "field_nominal",
+    "unit": "mm",
+    "origin": "场地外框左下角",
+    "x_axis": "向右",
+    "y_axis": "向上"
+  },
+  "boundary_mm": [0, 0, 2400, 2400],
+  "cross_lane": {
+    "width_mm": 400,
+    "vertical_rect_mm": [1000, 0, 400, 2400],
+    "horizontal_rect_mm": [0, 1000, 2400, 400],
+    "note": "仅为中间十字通道，不代表全部灰色车道"
+  },
+  "floor_exclusions": [
+    {"id": "yellow_lower_left", "rect_mm": [550, 550, 450, 450]},
+    {"id": "yellow_lower_right", "rect_mm": [1400, 550, 450, 450]},
+    {"id": "yellow_upper_left", "rect_mm": [550, 1400, 450, 450]},
+    {"id": "yellow_upper_right", "rect_mm": [1400, 1400, 450, 450]}
+  ],
+  "start_zones": [
+    {"id": "start_1", "rect_mm": [2100, 2100, 300, 300]},
+    {"id": "start_2", "rect_mm": [2100, 0, 300, 300]}
+  ],
+  "work_zones": [
+    {
+      "id": "temporary_storage",
+      "label": "暂存区",
+      "rect_mm": [0, 910, 150, 580],
+      "position_status": "依图1居中放置的名义位置，现场允许偏差",
+      "placement_reference_points_mm": [[75, 1050], [75, 1200], [75, 1350]],
+      "point_identity_status": "位置数字1/2/3不在此图中推断"
+    },
+    {
+      "id": "rough_processing",
+      "label": "粗加工区",
+      "rect_mm": [910, 0, 580, 150],
+      "position_status": "依图1居中放置的名义位置，现场允许偏差",
+      "placement_reference_points_mm": [[1050, 75], [1200, 75], [1350, 75]],
+      "point_identity_status": "位置数字1/2/3不在此图中推断"
+    }
+  ],
+  "variable_references": [
+    {
+      "id": "raw_material",
+      "label": "原料区",
+      "x_reference_from_right_mm": [1100, 1300],
+      "x_reference_range_mm": [1100, 1300],
+      "top_inset_reference_mm": [75, 85],
+      "reference_line_y_range_mm": [2315, 2325],
+      "disk_diameter_mm": 300,
+      "height_mm": [80, 100],
+      "pose": null,
+      "note": "图上尺寸参考线不直接解释为转盘圆心；装置实际中心与朝向待现场确认"
+    },
+    {
+      "id": "qr_board",
+      "label": "二维码板",
+      "side": "right",
+      "y_reference_from_top_mm": [1100, 1300],
+      "y_reference_range_mm": [1100, 1300],
+      "pose": null,
+      "note": "只记录图示参考范围，不作为已测二维码板位姿"
+    }
+  ],
+  "dynamic_obstacle_spec": {
+    "shape": "cylinder",
+    "color": "black",
+    "diameter_mm": 50,
+    "height_mm": 100,
+    "count": null,
+    "positions_mm": null,
+    "status": "现场随机抽签放置，静态地图不填假坐标"
+  },
+  "localization": {
+    "lidar_pose": null,
+    "robot_pose": null,
+    "robot_footprint": null,
+    "automatic_localization_available": false
+  },
+  "navigation": {
+    "ready_for_motion": false,
+    "obstacle_inflation_applied": false,
+    "note": "地面颜色区域不是雷达墙体。未加入车体占据、定位误差与安全余量，不能直接用点路径驱动车辆"
+  }
+}

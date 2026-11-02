@@ -2,6 +2,7 @@
 /config/*
 !/config/vision_config.example.yaml
 !/config/hsv_profile.example.yaml
+!/config/field_map_national_2027.json
 /models/
 /datasets/
 /runs/
