@@ -137,6 +137,10 @@ class VisionBackend:
                 target = {'u': item['center_x'], 'v': item['center_y'], 'color_id': item['color_id'],
                           'confidence': item.get('confidence'),
                           'point_kind': item.get('point_kind', 'contour_bounding_box_center')}
+                if target['point_kind'] == 'top_face_ellipse_center':
+                    target.update(top_face_axes=item.get('top_face_axes'),
+                                  top_face_angle_deg=item.get('top_face_angle_deg'),
+                                  top_face_residual=item.get('top_face_residual'))
                 if type(item.get('track_id')) is int:
                     target.update(track_id=item['track_id'],
                                   tracking_status=item.get('tracking_status', 'updated'))
@@ -150,6 +154,17 @@ class VisionBackend:
                             if all(t['point_kind'] == 'contour_bounding_box_center' for t in targets)
                             else 'full_frame_see_target_point_kind_not_grasp_point'),
                         hsv_profile_sha256=state['hsv_profile_sha256'])
+        ready = self.clock()
+        acquired_mono = obs.get('acquired_monotonic_s')
+        completed_mono = obs.get('completed_monotonic_s')
+        if (finite(acquired_mono) and finite(completed_mono)
+                and 0 <= acquired_mono <= completed_mono <= ready):
+            data['timing'] = dict(clock='source_host_monotonic',
+                acquired_monotonic_s=acquired_mono, completed_monotonic_s=completed_mono,
+                ready_monotonic_s=ready,
+                source_to_detection_ms=(completed_mono-acquired_mono)*1000,
+                detection_to_ready_ms=(ready-completed_mono)*1000,
+                source_to_ready_ms=(ready-acquired_mono)*1000)
         return [self.reply(command, 'observation', data)]
 
     def _position_targets(self, state, acquired):

@@ -186,3 +186,21 @@ def test_headless_capture_produces_raw_frames_without_encoding():
         camera.release.assert_called_once()
     finally:
         source.stop()
+
+
+def test_timing_uses_same_host_monotonic_stamps_not_wall_time(setup_backend):
+    backend,source,now,state=setup_backend
+    state['material_observation'].update(acquired_monotonic_s=9.8,completed_monotonic_s=9.9)
+    backend.command(command())
+    timing=backend.poll()[0]['data']['timing']
+    assert timing['source_to_detection_ms']==pytest.approx(100.)
+    assert timing['detection_to_ready_ms']==pytest.approx(100.)
+    assert timing['source_to_ready_ms']==pytest.approx(200.)
+    assert timing['clock']=='source_host_monotonic'
+
+
+def test_foreign_or_inverted_clock_stamps_are_not_reported_as_latency(setup_backend):
+    backend,source,now,state=setup_backend
+    state['material_observation'].update(acquired_monotonic_s=1000.,completed_monotonic_s=1001.)
+    backend.command(command())
+    assert 'timing' not in backend.poll()[0]['data']

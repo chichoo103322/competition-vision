@@ -29,7 +29,7 @@ from .rotation_gate import RotationGate
 from .material_tracking import MaterialStability, MaterialTracker
 from .task_confirmation import TaskCodeConfirmation, parse_competition_task
 from .preview_page import FRAME_CLIENT_JS
-from .material_region import MaterialRegionDetector, ordered_materials
+from .material_region import MaterialRegionDetector, ordered_materials, center_material
 from .protocol import (
     COLOR,
     CMD_RESCAN,
@@ -91,10 +91,12 @@ class FrameStreamer:
         qr_timeout: float = 10.0,
         preview_timeout: float = 3.0,
         preview_enabled: bool = True,
+        material_target_window=None,
     ) -> None:
         for name, value in (('capture_timeout', capture_timeout), ('result_timeout', result_timeout), ('qr_timeout', qr_timeout), ('preview_timeout', preview_timeout)):
             if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f'{name} must be a finite positive number')
+        self.material_target_window = tuple(material_target_window) if material_target_window is not None else None
         self.capture_timeout = capture_timeout
         self.result_timeout = result_timeout
         self.qr_timeout = qr_timeout
@@ -146,6 +148,7 @@ class FrameStreamer:
         self._independent_qr_sequence = 0
         self._latest_materials = []
         self._material_tracker = MaterialTracker()
+        self._material_localization_status = 'waiting'
         self._material_sequence = 0
         self._material_source_sequence = 0
         self._material_acquired_at = 0.0
@@ -414,6 +417,9 @@ class FrameStreamer:
                     "track_id": item.track_id,
                     "tracking_status": item.tracking_status,
                     "point_kind": item.point_kind,
+                    "top_face_axes": item.top_face_axes,
+                    "top_face_angle_deg": item.top_face_angle_deg,
+                    "top_face_residual": item.top_face_residual,
                 }
                 for item in (self._latest_materials if material_observation['valid'] else [])
             ]
@@ -464,6 +470,9 @@ class FrameStreamer:
                     "source_width": self._latest_raw.shape[1] if self._latest_raw is not None else 0,
                     "source_height": self._latest_raw.shape[0] if self._latest_raw is not None else 0,
                 },
+                "material_target_window": self.material_target_window,
+                "material_localization_status": self._material_localization_status if material_observation['valid'] else 'unavailable',
+                "material_selection": "nearest_window_center" if self.material_target_window else "all_candidates",
                 "materials": materials,
                 "material_observation": material_observation,
                 "material_roi": list(self._pipeline.material_detector.roi)
@@ -670,8 +679,10 @@ class FrameStreamer:
                     'coordinate_frame': 'camera_image', 'units': 'pixels',
                     'coordinate_meaning': 'see_material_point_kind_not_calibrated_grasp',
                     'frame_size': [frame.shape[1], frame.shape[0]], 'roi': roi,
+                    'material_target_window': self.material_target_window,
                     'camera_requested': asdict(self._camera.config) if isinstance(getattr(self._camera, 'config', None), CameraConfig) else None,
                     'backend': type(base).__name__, 'profile': profile,
+                    'material_center_method': getattr(base, 'center_method', 'box'),
                     'profile_sha256': profile_hash(profile) if profile else None,
                     'valid': material_published and material_error is None and time.monotonic()-acquired_at < self.result_timeout,
                     'error': material_error if material_published else 'source_invalidated',
@@ -697,6 +708,17 @@ class FrameStreamer:
             if error and (observation.errors == 1 or observation.errors % 30 == 0):
                 LOGGER.error('%s detection failed: %s', kind, error)
             if kind == 'materials':
+                if self.material_target_window is not None and not error:
+                    try:
+                        effective = center_material(effective, self.material_target_window,
+                                                    (self._latest_raw.shape[1], self._latest_raw.shape[0]))
+                    except ValueError:
+                        effective = []
+                        observation.error = 'invalid_material_target_window'
+                        observation.errors += 1
+                self._material_localization_status = (effective[0].localization_status if len(effective)==1
+                                                      else 'no_target' if not effective else 'multiple_targets')
+                effective = [m for m in effective if m.localization_valid]
                 self._latest_materials = self._material_tracker.update(
                     ordered_materials(effective), acquired)
                 self._material_sequence = observation.sequence
@@ -1149,6 +1171,8 @@ def main() -> None:
                         help="限定物料识别区域；输出坐标仍相对于完整画面")
     parser.add_argument("--material-backend", choices=['auto', 'hsv'], default='auto',
                         help="物料后端：auto沿用YOLO；hsv为实验性六色轮廓检测")
+    parser.add_argument('--material-center', choices=('box', 'centroid', 'top_face'), default='box')
+    parser.add_argument('--material-target-window', type=int, nargs=4, metavar=('X','Y','W','H'))
     parser.add_argument('--hsv-profile', help='HSV YAML 参数文件；省略时保留原有基线')
     parser.add_argument('--diagnostics-dir', help='新建诊断目录，限量保存同帧原图和识别结果')
     parser.add_argument('--diagnostics-samples', type=int, default=30)
@@ -1211,7 +1235,8 @@ def main() -> None:
         )
         qr_camera = Camera(qr_config)
     pipeline = VisionPipeline(config, camera=camera, qr_camera=qr_camera,
-                              material_backend=args.material_backend, hsv_profile=hsv_profile)
+                              material_backend=args.material_backend, hsv_profile=hsv_profile,
+                              material_center=args.material_center)
     if args.material_roi:
         pipeline.set_material_roi(args.material_roi)
     if args.fast:
@@ -1240,6 +1265,7 @@ def main() -> None:
     _streamer = FrameStreamer(
         camera,
         pipeline,
+        material_target_window=args.material_target_window,
         rotation_gate=rotation_gate,
         enable_qr=enable_qr,
         enable_materials=enable_materials,

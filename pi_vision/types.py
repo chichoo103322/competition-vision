@@ -49,6 +49,13 @@ class Material:
     track_id: int | None = None
     tracking_status: str = 'new'
     point_kind: str = 'contour_bounding_box_center'
+    localization_valid: bool = True
+    localization_status: str = 'ok'
+    selection_center_x: float | None = None
+    selection_center_y: float | None = None
+    top_face_axes: tuple | None = None
+    top_face_angle_deg: float | None = None
+    top_face_residual: float | None = None
 
     def to_tuple(self):
         """转成串口协议要求的元组。"""

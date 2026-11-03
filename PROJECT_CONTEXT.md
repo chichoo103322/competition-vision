@@ -1,6 +1,84 @@
 # 项目交接上下文
 
-更新：2026-11-02。供全新聊天接续；先读 `AGENTS.md`。本文只记录最终决策、可复用命令与完成边界，不含凭据。
+更新：2026-11-03。供全新聊天接续；先读 `AGENTS.md`。本文只记录最终决策、可复用命令与完成边界，不含凭据。
+
+## 移除所有按键启动锁（2026-11-03，最新）
+
+用户明确要求调试与正式入口都不做持久化自锁；每次按键前默认车辆已放在对应启停区，KEY1/KEY0选择区后从头进行新扫描、规划和运行。实现删除RoundLatch与`--reset-round`；每次完成/失败后都回待机，服务重启不重放旧按键；控制器未空闲或有故障只留在WAIT_CONTROLLER，恢复后自动READY。两种systemd服务均设为on-failure自动重启。比赛每轮允许几次仍需遵守对应赛规/裁判要求。
+
+部署此改动前发生一次干扰用户调试的错误：上一轮测试服务已READY，用户新KEY1启动了route_id1793704491区1的16点路线。助手为了更新代码停止了运行中的服务，SIGTERM令runner取消并发送0x12 STOP；STM32回报STOPPED、fault0/chassis_fault0，停止时已到work_id101首站，估计位姿约(1188,1200)mm/+90°。这是助手导致的中断，不是电控自行停车。
+
+无锁版本、两种systemd unit及说明已部署；改前代码、unit、round_latch、status、result和wire日志备份于 `backups/remove_locks_20261103/`。旧Pi `round_latch.json` 已移除。Mac 92项按键/通讯/路线测试通过，Pi语法、systemd verify和文件SHA256一致。
+
+用户随后要求加快两区测试速度。Pi本机测试配置均改为move_rpm=120（schema上限）、approach_rpm=30、turn_rpm=15，配置校验通过、备份于 `backups/speed_adjust_20261103/chassis_button.local.json`，服务已重启加载。当前服务active但状态`WAIT_CONTROLLER`，没有收到STM32 STATUS回复；无round_latch文件，未发生新路线上传/START。正式比赛本机配置不存在，正式后端也未接通，不能声称比赛流程已可执行或已调速。用户要求不要监听后续按键；下一步仅按其明确请求响应。
+
+## 按键测试待机常驻修复（2026-11-03，最新）
+
+用户反馈独自测试按键时无反应。树莓派只读核对确认根因：上一轮区2成功后，测试服务按旧逻辑正常退出（systemd `Restart=no`），持久化 `round_latch.json` 仍存在；按键监听进程实际为inactive。此前每次聊天测试由助手手动复位本轮锁并重启服务，所以看起来只有对话时按键才有效。不是雷达、路径规划或电控未收到已发路线的问题。
+
+修改测试入口：一轮成功后释放本轮锁，继续复用UART并回到READY，等待下一次READY后的新实体键；失败仍保留锁，不自动重跑。测试systemd对未处理进程故障按3秒间隔重启，若本轮已锁则不会重新发车。正式比赛入口的一次启动锁未变。新增成功测试可重入/正式和失败保持锁的测试；Mac相关60项通过。
+
+修改脚本、unit和操作说明已SHA256核对部署到Pi，原脚本及unit备份于 `backups/button_repeatable_20261103/`。归档上轮DONE状态与日志、复位旧锁并启动服务后，现场状态为active/READY，STM32 STATUS通信正常。READY前一个旧KEY0请求（tick 40551，早于基线 tick 506900）已被正确ACK并忽略；新进程日志当前只有STATUS与AREA_ACK帧，没有路线上传或START，车辆未因本次部署启动。现在需要READY之后再短按并松开一次KEY0。服务重启及连续测试已部署验证；整机断电后自动启动仍未做断电实测。
+
+## KEY0区2实车全程成功（2026-11-03，最新）
+
+用户要求现在按KEY0测试。按新轮测试授权归档复位并恢复待机；READY前的KEY0 request1/tick18723被正确忽略，用户获通知后重新短按，收到新KEY0 request2/tick53636。两区既有本机配置无修改，区2初始(150,2250)mm/+90°，用户本轮按先前区2摆放约定测试。重新扫描得到16点，route_id1793703261绑定上传，START获接受。当前电控继续回phase5，Pi解析正常。
+
+8站101..108依次WAIT_WORK/phase4、2秒测试驻留/模拟WORK_DONE，最终DONE/index16/count16、fault0/chassis_fault0。实际START ACK到首次DONE约122.91秒（约2分3秒，含测试驻留，不含真实扫码/抓放），最终电控估计(153,2250)mm/yaw89.86°，未做外部精度测量。STOP发送0条，全程无超时；区1和区2实体按键路径均有phase5修复后的成功实机记录。路线不同，不能把区1/区2时间直接当相同路径性能对比。
+
+Mac忽略目录output/chassis_zone2_phase5_success_20261103保存本轮全部TX/RX_RAW、prepared_live/result/status/summary及区2_KEY0_完整日志.zip，Pi原日志仍在output/chassis_button。服务完成正常退出，一次锁保留，没有自动重跑；实时journal监看SSH已结束，独立雷达仍运行。下一次测试仍需显式重新准备与新键；比赛轮内不自动解除一次锁。此轮未改代码/速度、未Git提交。
+
+## phase5修复后区1实车全程成功（2026-11-03，最新）
+
+用户要求现在测试并实时看记录。只发STATUS确认MCU已重启EMPTY/无故障，旧服务inactive；按新一轮测试授权归档并复位本轮锁、启动服务。READY前积压的KEY1 request1/tick24142被正确忽略。待机期间随后观察到一次无回复/MCU重启，服务自动重建READY基线（tick1102）；接收此后真正新KEY1 request1/tick3371，ACK并采集新扫描。准备19点，route_id1793702946，上传、START均获接受。
+
+本轮8站101..108按序WAIT_WORK/phase4、2秒测试驻留、模拟WORK_DONE、最终DONE/index19/count19，fault0/chassis_fault0。真实START确认到首次DONE约136.96秒（约2分17秒，含每站2秒驻留，不含真实扫码抓放）。最终电控估计(153,150)mm/yaw89.20°，未外部测量精度。运行阶段phase5数据连续解析正常，STOP发送0条，未发生超时；这轮验证了phase5兼容修复实机有效，不能把不同路线/不同电控固件的用时差全部归因于Pi优化，也不据此认定连续转弯功能已完成验收。
+
+用户整个测试期间收到实时进度反馈；完成后服务正常退出且持久化本轮锁继续有效，未自动重跑。Mac忽略目录output/chassis_phase5_success_20261103/完整保留wire/prepared_live/result/status/summary和日志zip。实时journal监看SSH已退出；独立雷达继续运行。下一轮需摆回对应起点，再显式复位/准备，新键启动。源码未改，本轮未Git提交。
+
+## 启动后假超时根因与phase5兼容修复（2026-11-03，最新，纠正前述推断）
+
+用户反馈之前能跑、现在启动后停并连续超时。读取output/chassis_button/wire.jsonl原始RX并重新逐帧解码，确认最新19点任务route_id1793702522在18:42:07上传/START接受后，STATUS三个回复均约50ms返回、CRC正确且sequence/request匹配，但phase=5。Pi旧status_payload检查phase>4非法，_exchange吞掉ValueError继续重试，约3秒后误报超时并发STOP；电控已执行STOP并回ACK/state5/phase5，但同一旧解析器继续丢弃，错误报告“停止未确认”。实际收到的X从150→223→298→339，停止在第0点。此前将本次启动后故障描述为“STM32不回复”不准确，原始报文证实是Pi解析兼容问题；18:36待机真正无回复与本次假超时不能混为同一原因。
+
+修复electrical_protocol.status_payload：phase按u8执行阶段原样保留，不把诊断阶段编号当route state范围限制；36字节/CRC/序号/请求类型/state0..6/reserved0/点索引检查继续保留，WAIT_WORK推进仍要求state3+phase4及真实作业条件。没有给phase5猜测控制含义，也未修改坐标或运动参数。electrical_link超时错误补充“收到但被解析拒绝的匹配ACK数量/原因”，避免再把协议拒绝混报为线路无回复。
+
+真实抓包477状态/事件帧全部解析（470个phase0、7个phase5），新增实际RUNNING/STOPPED payload回归和非法state/reserved/index拒绝。Mac/Pi相关121项各自通过；3文件已部署，备份backups/phase5_20261103_5wirp7n9。修复后实机只发STATUS立即收到stateSTOPPED、phase5、route1793702522、point0/count19、估计(339,150)/90.31°、chassis_fault0，确认控制器已停；未上传、START、复位本轮或重跑。底盘服务inactive且本轮锁已消耗，车不在区1原始中心，下一次跑需重新摆放并显式准备。
+
+证据Mac output/serial_diagnosis_20261103含wire/result/prepared_live/decoded/phase5_replay；Pi同名目录另有状态探测。独立原始探测旧解析器也复现同一ValueError，证明不是后台服务线程特有。系统另见持续欠压告警（包括18:42:07），应后续核查供电，但不能用该告警替代这次已证实的解析拒绝根因。最新电控C源码原下载路径已缺失，phase5完整业务语义待对方当前源码确认；兼容解码不表示已验证新版固件连续转弯能力。源码修改尚未Git提交。
+
+## 待机STATUS超时恢复修复（2026-11-03，最新）
+
+用户反馈按KEY1没有反应。确认旧PID4208在18:36:23 STATUS连续无回复后退出、无人监听，非雷达扫描延迟。修复共享wait_ready_key：只有尚未按键消耗本轮时，STATUS超时/MCU重启/传感器失效回到WAIT_CONTROLLER、重新建立新基线及Client；积压旧按键ACK后忽略，恢复READY后需要新按键。按键后的扫描/上传/运动失败仍不自动重试，持久化一次锁保持；同样用于正式入口。USB串口拔掉引发OS错误尚不在本次自动恢复范围。
+
+Mac/Pi相关116测试各自通过，新增READY后掉线→恢复→忽略离线旧键→只接新键、启动时STM32无回复持续等待/可取消的回归。2文件已同步，备份backups/standby_reconnect_20261103_wpbgeu86。确认round_latch不存在，恢复底盘服务PID6377，检查为active/WAIT_CONTROLLER；CH340与CP2102均枚举、雷达运行，但STM32仍不回复STATUS，当前不能说READY。未发路线/START、未自动执行用户刚才的旧按键。已向用户询问主板上电与是否改过接线/烧录，等待实际确认。
+
+## 正式流程也接入一键启动（2026-11-03，最新）
+
+用户明确要求正式比赛流程同样按实体键自动启动。新增tools/competition_button_service.py、deploy/competition-button.service；复用chassis_button_service的预热/READY/新键过滤/一次锁，正式入口只允许显式真实后端，不回退底盘2秒模拟驻留。ElectricalClient新增run_selected_route：已选区后直接绑定上传/启动，不等待第二次按键；run_after_key复用该正式执行器。正式执行拒绝test_mode路线，仍以真实on_work反馈推进，等待未完成反馈/超时STOP行为保留。
+
+正式本机配置需competition_backend=module:factory，工厂返回simulation=False及ready/plan/on_work。后端未配置或未就绪不会正式READY；plan须返回valid_for_motion=True且匹配route_id/start_zone的已标定路线，上传前完整几何检查，START前复核扫描。当前扫码/抓放/显示/统计实体后端未完成，所以正式入口部署但disabled，未伪装成可参赛流程；与底盘测试unit互斥，避免同UART双调度。现有mission_ros是外部后端框架，不擅自同时启动它抢占STM32底盘所有权。
+
+Mac/Pi相关114项测试各自通过，新增两区正式已选按键直接启动、拒绝测试路线/模拟后端、启动前计划失效不START等测试；原正式无反馈不放行保留。7文件SHA256部署，备份backups/competition_button_20261103_0gd8vowp/before.tar。正式unit仅安装、不enable，不重启现场底盘。代码/说明尚未Git提交。
+
+设备检查另发现：此前PID4208底盘待机服务18:36:23因STATUS连续超时退出，status.json=FAILED/No matching reply，尚无新按键运动记录。当前不能说仍READY；未因这个错误自动重启、发车或复位本轮。电控供电/连接现状未确认，需重新取得STATUS后再显式重启待机。本轮新增正式入口未发送任何运动命令。
+
+## 实体按键一键启动封装（2026-11-03，最新）
+
+用户要求提前启动雷达和按键监听，只按实体键就自动跑。新增tools/chassis_button_service.py和deploy/chassis-button.service、CHASSIS_BUTTON_START.md。服务独占电控UART、复用现有雷达HTTP；未运行时按本机显式配置启动seconds0/6Hz采集。USB设备/STM32未上电时等待，确认新鲜雷达+STATUS后READY。READY前旧按键请求ACK后忽略；READY后KEY1区1/KEY0区2确认一次，即持久化本轮锁→选区后新扫描窗口（仍4秒）→新八段规划→几何校验→请求绑定上传→START→8站闭环→回家。没有电脑二次放行，无旧路线预缓存启动。保留100rpm巡航上限/20rpm短连接、两区中心及+90°约定。READY后请求失效/MCU重启不自动重试。
+
+本轮锁output/chassis_button/round_latch.json在完成、失败、进程重启后继续生效，不自动二次发车。下一轮测试显式停止服务、--reset-round、重新启动（命令见CHASSIS_BUTTON_START.md）；复位前日志/结果会归档history，route_id高水位保留。UART原始日志10MB×4轮转，所有状态转换持久化status.json。正式比赛流程仍未补全：此服务强制--test-only-route，各站2秒模拟作业；扫码/抓放/任务显示和计数不能冒充已完成。正式run_after_key仍要求真实作业反馈。
+
+原始全国命题tasks_national_2027.pdf第7页核对：裁判统一发令后，明确标识的一键式启动、一次启动机会；第1页要求完全自主运行。封装遵循该启动结构，4秒是工程采样策略不是比赛规则；本场启动窗口仍按正式通知/裁判。未据此宣称整车比赛合规验收已完成。
+
+5文件SHA256部署备份backups/button_service_20261103_mhlpj2v_/before.tar；实际私有配置config/chassis_button.local.json保持Git忽略，Mac副本output/button_service_deploy_20261103。Mac/Pi相关107测试各自通过（包含旧键过滤、无键不启动、过期扫描拒绝、MCU重启拒绝、持久化一次锁）。user unit已enable，loginctl enable-linger cuiguo成功（Linger=yes，直接本人操作无需sudo）；主进程PID4208，已实测READY、STATUS通信正常，检查待机仅0x14/没有路线上传或START；现复用独立雷达PID1310。没有断电重启实测，不将enable/linger等同完整冷启动验收。本轮未发车，按新实体键可直接运行；此时服务已处于有运动能力的待机状态。新增封装尚未Git提交/推送，前次fd430ae仍在origin/main。
+
+## 优化路线区1实车全程完成（2026-11-03，最新）
+
+用户要求启动并按KEY1直接跑完全程，按已确认区1中央(150,150)mm/+90°执行。Pi刚重启，电控CH340→ttyUSB0、雷达CP2102→ttyUSB1均重新枚举、无人占用；优化源码SHA256与Mac一致。雷达以6Hz/seconds0恢复，PID1310，runtime_zone1_20261103_rvk42nrz，静止校准未改，恢复Mac8766隧道。收到真实KEY1 request1/tick3377，AREA_ACK OK后重新扫描规划，16航点、8作业站，100rpm巡航上限、20rpm首尾短连接、turn15，使用controller_deceleration新默认。
+
+上传route_id1793701103（0x16共354字节）及START获确认。八站101..108依次WAIT_WORK、2秒测试驻留、模拟WORK_DONE，最终DONE/index16/count16、fault0/chassis_fault0。START首次RUNNING到首次DONE实际约173.22秒（约2分53秒，含16秒测试驻留；不含夹爪及视觉），最终电控估计(153,153)mm/yaw88.89°；无外部绝对定位精度测量。路线不同于上一轮区2，不能把275→本轮时长全部归因于压点。实车完成基本跑图目标，不代表含机构作业的180秒目标已达到。
+
+日志已回收Mac/Pi output/chassis_zone1_optimized_20261103/：全部TX/RX_RAW、prepared_live/result/profile/summary、日志zip；脚本已退出释放UART，未自动重跑。独立雷达继续静止预览，无移动定位。此轮新增实际运行记录尚未Git提交。GitHub前次代码提交fd430ae已在origin/main；其他视觉未提交改动保留。
 
 ## 减少直线多余停车（2026-11-02，最新）
 

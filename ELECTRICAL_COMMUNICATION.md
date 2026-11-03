@@ -141,3 +141,7 @@ python3 -m tools.electrical_comm --port /dev/serial/by-id/实际电控适配器 
 当前Python覆盖新旧帧分流、两区映射、重发去重、换区中断规划、绑定上传、1314字节上限、重启拒绝、正式无反馈不放行。新版C主机测试20项通过，含route_keys消抖/双键/长按/活动KEY0停车和64点带请求上传。完整真实route/heading/motion/IMU加模拟UART/CAN/轮子，按键请求路径两区均完成8站回程；未接真实UART或电机。最终部署和测试数见PROJECT_CONTEXT.md。
 
 部署已完成：26文件已同步Pi `/home/cuiguo/competition_vision`并校验SHA256；Pi345 passed/1 skipped、Mac346 passed/172 subtests，备份`backups/electrical_keys_20261102_28vEA6`。未启动运动或改系统UART。
+
+## 2026-11-03 当前固件执行阶段扩展
+
+实机CRC有效、匹配序号的36字节ACK已出现phase=5（RUNNING与STOPPED）。phase作为诊断执行阶段u8原样保留，不能再按旧0..4范围丢弃，否则会误报超时并触发STOP。route state、保留位、点数索引及CRC检查仍严格；WAIT_WORK作业释放仍检查state3/phase4，未知阶段不作为作业成功。此兼容修改没有定义phase5的控制语义，完整含义待最新版固件源码确认。

@@ -15,8 +15,8 @@ from ..hsv_profile import validate_profile
 
 class HSVMaterialDetector:
     def __init__(self, min_area_ratio=.012, max_area_ratio=.4, profile=None, center_method='box'):
-        if center_method not in ('box', 'centroid'):
-            raise ValueError('center_method must be box or centroid')
+        if center_method not in ('box', 'centroid', 'top_face'):
+            raise ValueError('center_method must be box, centroid or top_face')
         self.center_method = center_method
         self.profile = validate_profile(profile)
         if profile is not None:
@@ -76,14 +76,25 @@ class HSVMaterialDetector:
                 score = int(round(min(1., circularity)*100))
                 cx, cy = x+w/2, y+h/2
                 point_kind = 'contour_bounding_box_center'
-                if self.center_method == 'centroid':
+                if self.center_method in ('centroid', 'top_face'):
                     moments = cv2.moments(contour)
                     if moments['m00'] <= 0:
                         continue
                     cx, cy = moments['m10']/moments['m00'], moments['m01']/moments['m00']
                     point_kind = 'contour_area_centroid'
+                extra = {}
+                if self.center_method == 'top_face':
+                    from ..top_face import locate_top_face
+                    face, reason = locate_top_face(frame, contour)
+                    extra = dict(selection_center_x=cx, selection_center_y=cy,
+                                 localization_valid=face is not None, localization_status=reason)
+                    point_kind = 'top_face_ellipse_center'
+                    if face is not None:
+                        cx, cy = face.center_x, face.center_y
+                        extra.update(top_face_axes=(face.axis_a, face.axis_b),
+                                     top_face_angle_deg=face.angle_deg, top_face_residual=face.residual)
                 found.append(Material(0, output_color, 0, int(round(cx)),
-                                      int(round(cy)), 0., score, point_kind=point_kind))
+                                      int(round(cy)), 0., score, point_kind=point_kind, **extra))
         found.sort(key=lambda item: (item.color_id, item.center_x, item.center_y))
         from dataclasses import replace
         return [replace(item, index=i+1) for i, item in enumerate(found)]

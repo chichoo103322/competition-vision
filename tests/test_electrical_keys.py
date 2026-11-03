@@ -220,3 +220,42 @@ def test_production_without_real_feedback_waits_then_stops_on_timeout():
                              run_timeout=1, sleep=clock.sleep)
     assert not any(x[3] == p.WORK_DONE for x in device.writes)
     assert device.state == 5
+
+
+@pytest.mark.parametrize('area', [1, 2])
+def test_prewarmed_production_uses_selected_key_without_waiting_for_second_key(area):
+    client, device, clock = setup()
+    device.select(area)
+    selected = client.wait_start_area()
+    client.wait_start_area = lambda *a, **k: pytest.fail('must not wait for a second key')
+    polls = []
+    def on_work(c, status):
+        polls.append(status['work_id'])
+        return True if len(polls) == 3 else None
+    status = client.run_selected_route(selected, route(area), on_work, sleep=clock.sleep)
+    assert status['state'] == 4 and polls == [101, 101, 101]
+    assert sum(x[3] == p.START for x in device.writes) == 1
+    assert sum(x[3] == p.WORK_DONE for x in device.writes) == 1
+
+
+def test_prewarmed_production_rejects_test_route_before_upload():
+    client, device, clock = setup()
+    device.select(1)
+    selected = client.wait_start_area()
+    with pytest.raises(ValueError, match='test route'):
+        client.run_selected_route(selected, dict(route(1), test_mode='chassis_route_dry_work'),
+                                  lambda *_: True, sleep=clock.sleep)
+    assert not any(x[3] in (p.UPLOAD_FOR_AREA, p.START) for x in device.writes)
+
+
+def test_prewarmed_production_rechecks_before_start_and_stops_on_invalidation():
+    client, device, clock = setup()
+    device.select(1)
+    selected = client.wait_start_area()
+    def invalidated():
+        raise ValueError('plan invalidated')
+    with pytest.raises(ValueError, match='invalidated'):
+        client.run_selected_route(selected, route(1), lambda *_: True,
+                                  before_start=invalidated, sleep=clock.sleep)
+    assert not any(x[3] == p.START for x in device.writes)
+    assert device.state == 5

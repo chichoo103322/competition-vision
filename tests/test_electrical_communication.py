@@ -50,6 +50,32 @@ def test_crc_and_wire_golden_status_frame():
     assert p.frame(p.STATUS, 0x1234).hex() == 'a55a011434120000f70d'
 
 
+@pytest.mark.parametrize('hex_payload,state,x', [
+    ('140002057abae96a0000130000000000df23000000000000df000000960000002b230000', 2, 223),
+    ('120005057abae96a0000130000000000b52b000005000000530100009600000047230000', 5, 339),
+])
+def test_live_phase5_status_and_stop_ack_are_accepted(hex_payload, state, x):
+    # Real 2026-11-03 payloads: firmware replied promptly, old Pi phase<=4
+    # validation discarded them and falsely timed out, then sent STOP.
+    payload = bytes.fromhex(hex_payload)
+    def handler(packet):
+        kind, seq, _ = p.Decoder().feed(packet)[0]
+        assert kind == payload[0]
+        return p.frame(p.ACK, seq, payload)
+    c, transport, _ = client(handler)
+    reply = c.status() if state == 2 else c.stop(1793702522)
+    assert reply['phase'] == 5 and reply['state'] == state and reply['x_mm'] == x
+    assert len(transport.writes) == 1  # matching reply, no retry/timeout
+
+
+@pytest.mark.parametrize('offset,value', [(2, 7), (34, 1), (8, 20)])
+def test_extended_phase_does_not_relax_state_reserved_or_index_checks(offset, value):
+    body = bytearray.fromhex('140002057abae96a0000130000000000df23000000000000df000000960000002b230000')
+    body[offset] = value
+    with pytest.raises(ValueError):
+        p.status_payload(body)
+
+
 def test_decoder_noise_corrupt_fragmented_and_back_to_back():
     good = p.frame(p.STATUS, 5)
     corrupt = bytearray(good)

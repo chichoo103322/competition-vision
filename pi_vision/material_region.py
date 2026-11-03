@@ -31,7 +31,33 @@ class MaterialRegionDetector:
         found = self.detector.detect(crop)
         # 边界外中心不能成为可执行定位结果。
         return ordered_materials([
-            replace(item, center_x=item.center_x + x, center_y=item.center_y + y)
+            replace(item, center_x=item.center_x + x, center_y=item.center_y + y,
+                    selection_center_x=item.selection_center_x+x if item.selection_center_x is not None else None,
+                    selection_center_y=item.selection_center_y+y if item.selection_center_y is not None else None)
             for item in found
             if 0 <= item.center_x < width and 0 <= item.center_y < height
         ])
+
+
+def center_material(materials, window, frame_size, ambiguity_px=12.):
+    """Choose by distance within a fixed observation window; never use outside targets."""
+    import math
+    if len(window) != 4 or any(type(v) is not int for v in window):
+        raise ValueError('target window must be four integers')
+    x, y, w, h = window
+    width, height = frame_size
+    if min(x, y) < 0 or min(w, h) <= 0 or x+w > width or y+h > height:
+        raise ValueError('target window exceeds frame')
+    if not math.isfinite(ambiguity_px) or ambiguity_px < 0:
+        raise ValueError('invalid ambiguity margin')
+    candidates = []
+    for m in materials:
+        # Select the object before considering top-face success. Never switch to a side object.
+        mx = m.selection_center_x if m.selection_center_x is not None else m.center_x
+        my = m.selection_center_y if m.selection_center_y is not None else m.center_y
+        if x <= mx < x+w and y <= my < y+h:
+            candidates.append((math.hypot(mx-(x+w/2), my-(y+h/2)), m))
+    candidates.sort(key=lambda pair: pair[0])
+    if not candidates or len(candidates) > 1 and candidates[1][0]-candidates[0][0] <= ambiguity_px:
+        return []
+    return ordered_materials([candidates[0][1]])

@@ -9,7 +9,7 @@ import cv2
 
 from pi_vision.detectors.hsv_material_detector import HSVMaterialDetector
 from pi_vision.hsv_profile import load_profile, profile_hash, validate_profile
-from pi_vision.material_region import MaterialRegionDetector, ordered_materials
+from pi_vision.material_region import MaterialRegionDetector, ordered_materials, center_material
 
 
 def replay(directory, candidate=None):
@@ -28,14 +28,19 @@ def replay(directory, candidate=None):
         if image is None or [image.shape[1], image.shape[0]] != data['frame_size']:
             raise ValueError(f'{path.name}: missing or invalid full-resolution image')
         kinds = {m.get('point_kind', 'contour_bounding_box_center') for m in data['materials']}
-        if not kinds <= {'contour_bounding_box_center', 'contour_area_centroid'} or len(kinds) > 1:
+        if not kinds <= {'contour_bounding_box_center', 'contour_area_centroid', 'top_face_ellipse_center'} or len(kinds) > 1:
             raise ValueError('unsupported or mixed coordinate point definitions')
-        method = 'centroid' if kinds == {'contour_area_centroid'} else 'box'
+        method = ('top_face' if kinds == {'top_face_ellipse_center'} else
+                  'centroid' if kinds == {'contour_area_centroid'} else 'box')
+        method = data.get('material_center_method', method)
         def detect(profile):
             detector = HSVMaterialDetector(profile=profile, center_method=method)
             if data['roi'] is not None:
                 detector = MaterialRegionDetector(detector, data['roi'])
-            return [asdict(m) for m in ordered_materials(detector.detect(image))]
+            found = ordered_materials(detector.detect(image))
+            if data.get('material_target_window') is not None:
+                found = center_material(found, data['material_target_window'], data['frame_size'])
+            return [asdict(m) for m in found if m.localization_valid]
         original = detect(baseline)
         # Tracker IDs are live session metadata, not reproducible detector results.
         def geometry(items):

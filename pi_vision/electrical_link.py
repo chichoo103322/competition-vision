@@ -53,6 +53,8 @@ class ElectricalClient:
         p.integer(retries, 1, 10, 'retries')
         self.sequence = (self.sequence + 1) & 0xffff
         packet = p.frame(kind, self.sequence, payload)
+        rejected_acks = 0
+        last_decode_error = None
         try:
             for _ in range(retries):
                 if self.transport.write(packet) != len(packet):
@@ -69,7 +71,10 @@ class ElectricalClient:
                     if typ in (p.ACK, p.EVENT):
                         try:
                             status = p.status_payload(body)
-                        except ValueError:
+                        except ValueError as exc:
+                            if typ == p.ACK and seq == self.sequence and body[:1] == bytes([kind]):
+                                rejected_acks += 1
+                                last_decode_error = str(exc)
                             continue
                         if typ == p.EVENT:
                             self.events.append(dict(status, sequence=seq,
@@ -81,7 +86,9 @@ class ElectricalClient:
                             raise Rejected(status)
                         if reply_kind == p.ACK:
                             return status
-            raise TimeoutError('No matching reply; command outcome unknown. Query STATUS.')
+            detail = (f' Received {rejected_acks} matching ACK(s) rejected by decoding: {last_decode_error}.'
+                      if rejected_acks else '')
+            raise TimeoutError('No matching reply; command outcome unknown. Query STATUS.' + detail)
         except (OSError, TimeoutError):
             self._status = self._received_at = None
             self.latest_area = self.selected_area = None
@@ -209,11 +216,25 @@ class ElectricalClient:
         if not math.isfinite(run_timeout) or run_timeout <= 0:
             raise ValueError('run_timeout must be finite and positive')
         signal, route = self.plan_after_key(planner, timeout=key_timeout, cancelled=cancelled)
+        return self.run_selected_route(signal, route, on_work, run_timeout=run_timeout,
+                                       sleep=sleep, cancelled=cancelled)
+
+    def run_selected_route(self, signal, route, on_work=None, *, run_timeout=600,
+                           sleep=time.sleep, cancelled=lambda: False, before_start=lambda: None):
+        """Production execution after the shared prewarmed button gate.
+
+        Does not wait for a second key. No timed/mock work success is generated.
+        """
+        if not math.isfinite(run_timeout) or run_timeout <= 0:
+            raise ValueError('run_timeout must be finite and positive')
+        if route.get('test_mode'):
+            raise ValueError('test route is forbidden in production execution')
         touched = False
         try:
             self.check_start_area(signal)
             touched = True
             self.upload(route, start_request_id=signal['request_id'])
+            before_start()
             self.start_when_ready(route['route_id'], sleep=sleep, cancelled=cancelled)
             deadline = self.clock() + run_timeout
             released = set()

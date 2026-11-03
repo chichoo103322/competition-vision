@@ -7,7 +7,7 @@ import signal
 from .vision_backend import VisionBackend
 
 
-def create_node(source, camera_id):
+def create_node(source, camera_id, *, timing_sink=None):
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
     from std_msgs.msg import String
@@ -27,6 +27,13 @@ def create_node(source, camera_id):
                 msg = String()
                 msg.data = json.dumps(reply, ensure_ascii=False, allow_nan=False)
                 self.publisher.publish(msg)
+                if timing_sink is not None and reply['status'] == 'observation' and reply['data'].get('targets'):
+                    import time
+                    timing_sink(dict(event='ros_publish_returned', command_id=reply['command_id'],
+                        source_sequence=reply['data']['source_sequence'],
+                        at_monotonic_s=time.monotonic(), timing=reply['data'].get('timing'),
+                        targets=reply['data']['targets'],
+                        semantics='publisher_call_return_not_hardware_or_subscriber_ack'))
 
         def command(self, msg):
             try:
@@ -76,6 +83,7 @@ def make_source(args):
         pipeline.ring_detector = NumberedRingDetector(pipeline.ring_detector, args.position_orientation)
     return FrameStreamer(camera, pipeline, enable_qr=False, enable_materials=False,
                          enable_rings=False, preview_enabled=False, draw_overlay=False,
+                         material_target_window=getattr(args, 'material_target_window', None),
                          capture_timeout=args.capture_timeout, result_timeout=args.result_timeout,
                          qr_timeout=args.qr_timeout)
 
@@ -86,7 +94,8 @@ def parse_args(argv=None):
     parser.add_argument('--camera', required=True)
     parser.add_argument('--material-backend', required=True, choices=['hsv'])
     parser.add_argument('--hsv-profile')
-    parser.add_argument('--material-center', choices=('box', 'centroid'), default='box')
+    parser.add_argument('--material-target-window', nargs=4, type=int)
+    parser.add_argument('--material-center', choices=('box', 'centroid', 'top_face'), default='box')
     parser.add_argument('--ring-backend', choices=('hough', 'morphology'), default='hough')
     parser.add_argument('--ring-roi', nargs=4, type=int)
     parser.add_argument('--material-roi', nargs=4, type=int, default=None)

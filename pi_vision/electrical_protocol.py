@@ -113,7 +113,11 @@ def status_payload(payload):
              'point_count', 'work_id', 'chassis_fault', 'fault_address', 'tick',
              'fault', 'x_mm', 'y_mm', 'yaw_cdeg', 'reserved')
     result = dict(zip(names, fields))
-    if result['state'] > 6 or result['phase'] > 4 or result['reserved'] != 0:
+    # Phase is diagnostic execution detail, not the route-state enum. Newer
+    # firmware reports phase=5 while moving and after STOP. Do not discard a
+    # CRC-verified matching ACK because its internal phase is unfamiliar.
+    # Work release still requires WAIT_WORK + phase=4 in the execution layer.
+    if result['state'] > 6 or result['reserved'] != 0:
         raise ValueError('invalid V1 status fields')
     if result['point_count'] > 64 or result['point_index'] > result['point_count']:
         raise ValueError('invalid V1 point index/count')

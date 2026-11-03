@@ -1,0 +1,14 @@
+[Unit]
+Description=One-button eight-stage chassis test standby
+
+[Service]
+Type=simple
+WorkingDirectory=%h/competition_vision
+ExecStart=/usr/bin/python3 -u -m tools.chassis_button_service --config %h/competition_vision/config/chassis_button.local.json --test-only-route
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=12
+KillMode=mixed
+
+[Install]
+WantedBy=default.target

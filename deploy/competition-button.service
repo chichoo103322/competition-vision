@@ -1,0 +1,15 @@
+[Unit]
+Description=One-button competition standby with real work backend
+Conflicts=chassis-button.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/competition_vision
+ExecStart=/usr/bin/python3 -u -m tools.competition_button_service --config %h/competition_vision/config/competition_button.local.json
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=12
+KillMode=mixed
+
+[Install]
+WantedBy=default.target

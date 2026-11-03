@@ -250,3 +250,63 @@ python3 -m tools.vision_method_compare 原图.png --output output/method_compare
 输出目录必须尚不存在。报告包含框中心/面积质心和霍夫/形态学两种圆环结果；另外保存六色
 分割图、圆环 binary/dilated/blurred/eroded 阶段及叠加图。没有 ring ROI 时不运行形态学环路径。
 数字模板仍是 OpenCV 字体候选，视频截图不能替代本车拍摄的地面印刷数字验证。
+
+
+## 中央视觉目标（2026-11-01）
+
+用户明确物料只看中央一件，其余颜色可能偶然入镜。stream/vision_ros 新增
+`--material-target-window X Y W H`，先保持原 HSV/ROI 检测，再从原图坐标落在窗口内的候选中
+选距离窗口中心最近的一件。最近两件距离差不超过 12 px 则无目标；中心为空不回退到边缘。
+目标选择先于颜色请求过滤，不能为满足请求颜色从旁边挑物料。诊断记录保存窗口，回放同样
+执行选择；默认不加选项时保留多候选基线。当前 1280×720 使用 (480,240,320,240)，
+中心(640,360)，它是观察窗口而非机械抓取标定。连续新帧/过期语义不变。
+
+
+## 圆形顶面独立定位（2026-11-01 已部署）
+
+stream 与 vision_ros 新增 `--material-center top_face`。本车拟从物料上方观察，因此在
+保持现有 HSV 识色后，单独对圆形顶面找边界、拟合椭圆中心。HSV 阈值、业务色号不变；
+box/centroid 保留对照。选中央目标使用整块颜色区域的锚点，选中后才决定顶面是否有效，
+防止中央顶面失败时换成旁边的物料。失败候选仅在检测器内部携带 localization_valid=false，
+FrameStreamer 在选择之后剔除，不发布旧质心替代顶面；状态可查 material_localization_status。
+
+定位器检查颜色区域是否裁断、候选面积、椭圆轴比/拟合残差、周向覆盖、原始多通道边缘支持、
+颜色区域重合度及不同中心的歧义，并用顶面/侧面亮度对比抑制较大的侧面外轮廓。
+面向完整可见的圆形顶面，不声称支持任意异形顶面、强透视、遮挡或大反光。
+point_kind=top_face_ellipse_center，附 top_face_axes（像素轴长）、top_face_angle_deg、
+top_face_residual；这些是图像拟合量，不是抓取角度、概率、毫米位置或已验证物理圆心投影。
+旧框中心/面积质心标定须重新测量，局部对准按 point_kind 拒绝混用。
+
+同帧核对命令（Mac 终端或树莓派终端，源码目录中）：
+
+```bash
+python3 -m tools.top_face_review 原图.png --metadata 同名诊断.json --output output/top_face_review
+```
+
+诊断原图与记录必须同源；工具恢复 profile/ROI/中央窗口并检查复算几何与实时记录是否一致。
+图中青线表示拟合顶面，红十字为顶面中心，不再用大绿框冒充物料边界。
+实时 JSON 继续保留采集时间、会话/来源帧、原图像素和有效性，metric_coordinates_valid=false。
+当前没有接电控或执行抓放。用户给出的结构图仅确定相机安装意图，不提供有效本车标定。
+
+## 圆环坐标发布计时
+
+`tools.ring_camera_timing` 是单相机有界测试：同一个 FrameStreamer 提供圆环检测及8090预览，
+ROS 2 使用 domain74、LOCALHOST 的真实消息契约，配本机测试订阅者；不运行任务主控、串口或动作。
+测试仅接受目标位置号、真实新鲜图像和后端连续确认，不用截图识别结果冒充相机检测。
+
+树莓派终端（先核对并停止旧相机采集实例，不能同时占用设备）：
+
+```bash
+source /opt/ros/jazzy/setup.bash
+export ROS_DOMAIN_ID=74
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+python3 -m tools.ring_camera_timing --camera /dev/v4l/by-id/usb-Generic_USB_Camera_200901010001-video-index0 --roi 160 0 960 720 --position-id 2 --seconds 300 --output output/material_diagnostics/ring_timing_new
+```
+
+输出目录必须尚不存在；5—300秒到期或SIGTERM后写summary.json、final_state.json并释放相机。
+运行中events.jsonl即时保存发布返回与接收事件，带来源帧、位置、单调时钟时间和三个阶段耗时。
+`source_to_detection_ms` 从主机读帧完成到结果登记，包括线程排队/检测/等待；不是曝光或纯推理时间。
+`detection_to_publish_return` 到ROS发布调用返回，不保证数据已到单片机；
+`detection_to_received` 到同机ROS测试订阅者回调，包含日志/本机调度开销。
+`first_coordinate_after_request_ms` 包含连续至少3张新帧且跨度0.2秒的确认等待，与每帧处理不同。
+本测试不测USB传感器内部延迟、串口线路/单片机收包或机械动作时间，不跨主机相减单调时钟。
