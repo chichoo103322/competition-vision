@@ -23,6 +23,7 @@ def main():
     for name in ('snapshot', 'profile', 'output'):
         preview.add_argument(name, type=Path)
     commands.add_parser('status')
+    commands.add_parser('arm-status', help='query chassis and arm feedback without moving')
     commands.add_parser('wait-area')
     watch = commands.add_parser('watch-areas')
     watch.add_argument('--seconds', type=float, default=120)
@@ -38,7 +39,8 @@ def main():
         route = compile_preview(state['mission_plan'], state['navigation']['nodes'], **profile)
         # The frame is a review/test artifact. No UART is opened here.
         route['upload_frame_hex_for_review'] = frame(UPLOAD, 1, upload_payload(route)).hex()
-        route['direction_review'] = direction_review(upload_payload(route))
+        route['direction_review'] = direction_review(upload_payload(route),
+            work_heading_mode_enabled=route.get('work_heading_mode_enabled', False))
         args.output.write_text(json.dumps(route, ensure_ascii=False, indent=2) + '\n')
         print(json.dumps(dict(output=str(args.output.resolve()), points=len(route['points']),
                               valid_for_motion=False), ensure_ascii=False))
@@ -52,6 +54,8 @@ def main():
         client = ElectricalClient(port)
         if args.command == 'status':
             result = dict(status=client.status(), pose=client.pose_snapshot())
+        elif args.command == 'arm-status':
+            result = dict(status=client.status(), arm=client.arm_status())
         elif args.command == 'wait-area':
             result = client.wait_start_area(args.timeout)
         else:

@@ -5,6 +5,10 @@
 !/config/field_map_national_2027.json
 !/config/chassis_test_profile.example.json
 !/config/chassis_test_profiles.example.json
+!/config/arm_alignment.example.json
+!/config/arm_ring_floor.example.json
+!/config/material_vision.example.yaml
+!/config/turntable_work.example.json
 /models/
 /datasets/
 /runs/
@@ -15,7 +19,11 @@
 /tmp/
 /rea-*/
 /vision_recovery/
-/docs/
+/archive/
+/.playwright-cli/
+/docs/*
+!/docs/guides/
+!/docs/design/
 /*_update/
 /*.zip
 /tools/run_vision_recovery.py

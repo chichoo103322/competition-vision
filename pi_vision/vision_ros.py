@@ -68,19 +68,10 @@ def make_source(args):
                               hsv_profile=load_profile(args.hsv_profile) if args.hsv_profile else None,
                               material_center=getattr(args, 'material_center', 'box'))
     pipeline.set_material_roi(args.material_roi)
-    if getattr(args, 'ring_backend', 'hough') == 'morphology':
-        from .detectors.morphology_ring_detector import MorphologyRingDetector
-        pipeline.ring_detector = MorphologyRingDetector()
-    if getattr(args, 'ring_roi', None) is not None:
-        from .detectors.morphology_ring_detector import RingRegionDetector
-        pipeline.ring_detector = RingRegionDetector(pipeline.ring_detector, args.ring_roi)
-    if getattr(args, 'position_digits', False):
-        from .position_digits import NumberedRingDetector
-        # Position coordinates must be this frame's candidates, not EMA history.
-        base = getattr(pipeline.ring_detector, 'detector', pipeline.ring_detector)
-        if hasattr(base, 'smooth_alpha'):
-            base.smooth_alpha = 0.
-        pipeline.ring_detector = NumberedRingDetector(pipeline.ring_detector, args.position_orientation)
+    from .pipeline import configure_ring_pipeline
+    configure_ring_pipeline(pipeline, getattr(args, 'ring_backend', 'hough'),
+        getattr(args, 'ring_roi', None),
+        args.position_orientation if getattr(args, 'position_digits', False) else None)
     return FrameStreamer(camera, pipeline, enable_qr=False, enable_materials=False,
                          enable_rings=False, preview_enabled=False, draw_overlay=False,
                          material_target_window=getattr(args, 'material_target_window', None),

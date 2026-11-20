@@ -11,6 +11,9 @@
     "approach_rpm": 8,
     "approach_distance_mm": 120,
     "coordinate_frame": "field_photo_ccw",
+    "work_heading_mode_enabled": true,
+    "test_turn_sweep_ignored_cells": [],
+    "test_ignore_turn_obstacles": false,
     "stop_strategy": "controller_deceleration"
   },
   "2": {
@@ -25,6 +28,9 @@
     "approach_rpm": 8,
     "approach_distance_mm": 120,
     "coordinate_frame": "field_photo_ccw",
+    "work_heading_mode_enabled": true,
+    "test_turn_sweep_ignored_cells": [],
+    "test_ignore_turn_obstacles": false,
     "stop_strategy": "controller_deceleration"
   }
 }

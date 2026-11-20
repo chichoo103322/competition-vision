@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="zh-CN">
+  <meta charset="utf-8" /><meta
+    name="viewport"
+    content="width=device-width,initial-scale=1"
+  />
+  <title>相机与物料对齐</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
+      color: #edf2f4;
+      background: #111619;
+    }
+    * {
+      box-sizing: border-box;
+    }
+    body {
+      margin: 0;
+      padding: 22px;
+    }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      background: #111619;
+      padding-block: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+    h1 {
+      font-size: 21px;
+      margin: 0;
+    }
+    nav {
+      display: flex;
+      gap: 8px;
+    }
+    button {
+      font: inherit;
+      background: #1a2227;
+      color: #b7c4cc;
+      border: 1px solid #61737e;
+      border-radius: 5px;
+      padding: 9px 15px;
+      cursor: pointer;
+    }
+    button[aria-pressed="true"] {
+      color: #60e8bc;
+      border-color: #60e8bc;
+      background: #25353e;
+    }
+    button:focus-visible {
+      outline: 2px solid #60e8bc;
+      outline-offset: 3px;
+    }
+    main {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 250px;
+      gap: 22px;
+    }
+    .preview {
+      position: relative;
+      background: #080d10;
+      aspect-ratio: 16/9;
+      overflow: hidden;
+      border: 1px solid #47565e;
+      max-height: calc(100vh - 170px);
+    }
+    .preview img,
+    .preview svg {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+    svg {
+      pointer-events: none;
+    }
+    #empty {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      padding: 28px;
+      color: #b7c4cc;
+      line-height: 1.7;
+    }
+    #status {
+      margin: 12px 0;
+      color: #60e8bc;
+    }
+    .muted {
+      color: #b7c4cc;
+      font-size: 13px;
+      line-height: 1.7;
+    }
+    h2 {
+      font-size: 15px;
+      font-weight: 500;
+      margin: 0 0 16px;
+    }
+    #target {
+      font-size: 36px;
+      font-weight: 600;
+      margin: 8px 0;
+    }
+    #order {
+      display: flex;
+      gap: 8px;
+      padding: 0;
+      list-style: none;
+    }
+    #order li {
+      padding: 8px 10px;
+      border-bottom: 2px solid #47565e;
+      color: #b7c4cc;
+    }
+    #order li.current {
+      color: #60e8bc;
+      border-color: #60e8bc;
+    }
+    #order li.done {
+      color: #b7c4cc;
+      border-color: #b7c4cc;
+    }
+    #phase {
+      line-height: 1.7;
+    }
+    dl {
+      font-size: 13px;
+      line-height: 1.7;
+      margin-top: 22px;
+    }
+    dt {
+      color: #b7c4cc;
+    }
+    dd {
+      margin: 3px 0 15px;
+    }
+    aside {
+      padding: 4px 0;
+    }
+    .note {
+      border-top: 1px solid #47565e;
+      padding-top: 16px;
+      margin-top: 18px;
+    }
+    @media (max-width: 850px) {
+      body {
+        padding: 16px;
+      }
+      header {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+      main {
+        grid-template-columns: 1fr;
+      }
+      aside {
+        border-top: 1px solid #47565e;
+        padding-top: 18px;
+      }
+      #target {
+        font-size: 28px;
+      }
+      #order {
+        margin-top: 10px;
+      }
+    }
+  </style>
+  <header>
+    <h1>相机与物料对齐</h1>
+    <nav aria-label="选择相机">
+      <button data-camera="material" aria-pressed="true">物料相机</button
+      ><button data-camera="qr" aria-pressed="false">扫码相机</button>
+    </nav>
+  </header>
+  <main>
+    <section>
+      <div class="preview">
+        <img id="frame" alt="相机实时画面" hidden /><svg
+          id="overlay"
+          viewBox="0 0 1280 720"
+        ></svg>
+        <div id="empty">正在读取相机状态…</div>
+      </div>
+      <p id="status" role="status">等待相机</p>
+      <p id="source" class="muted"></p>
+    </section>
+    <aside>
+      <h2>当前目标</h2>
+      <div id="target">等待任务</div>
+      <ol id="order" aria-label="物料顺序"></ol>
+      <p id="phase">到原料区停稳后，按任务码顺序等待目标进入接近窗口。</p>
+      <dl>
+        <dt>夹爪参考点 · 当前姿态</dt>
+        <dd id="reference">—</dd>
+        <dt>顶面位置</dt>
+        <dd id="point">—</dd>
+        <dt>定位状态</dt>
+        <dd id="localization">—</dd>
+      </dl>
+      <p class="muted note" id="note">
+        框线表示接近窗口，圆点表示物料顶面中心。夹爪与料盘舵机后续接入。
+      </p>
+    </aside>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id),
+      colors = { 1: "红", 2: "黄", 3: "蓝", 4: "绿", 5: "黑", 6: "浅蓝" };
+    const phases = {
+      waiting_target: "等待目标随转盘进入接近窗口",
+      aligning: "云台微调，停稳后复核",
+      calibration_required: "目标已靠近，等待完成运动标定",
+      parking: "本次对齐测试完成，云台收回中",
+      done: "三个颜色的对齐测试已完成",
+      stopped: "本轮已停止",
+    };
+    let camera = "material",
+      epoch = 0,
+      objectUrl = null,
+      lastLease = 0;
+    function clearImage(message) {
+      $("frame").hidden = true;
+      $("frame").removeAttribute("src");
+      $("overlay").replaceChildren();
+      $("empty").textContent = message;
+      $("empty").style.display = "flex";
+      if (objectUrl) {
+        URL.revokeObjectURL(objectUrl);
+        objectUrl = null;
+      }
+    }
+    function resetTask() {
+      for (const id of ["point", "localization", "reference"])
+        $(id).textContent = "—";
+      $("order").replaceChildren();
+      $("target").textContent = "等待任务";
+      $("phase").textContent =
+        "到原料区停稳后，按任务码顺序等待目标进入接近窗口。";
+    }
+    document.querySelectorAll("[data-camera]").forEach(
+      (button) =>
+        (button.onclick = () => {
+          if (camera === button.dataset.camera) return;
+          camera = button.dataset.camera;
+          epoch++;
+          lastLease = 0;
+          if (camera === "material") control("/qr/release").catch(() => {});
+          document
+            .querySelectorAll("[data-camera]")
+            .forEach((b) =>
+              b.setAttribute("aria-pressed", String(b === button)),
+            );
+          clearImage("正在切换相机…");
+          resetTask();
+        }),
+    );
+    async function request(url, body = "json") {
+      const control = new AbortController(),
+        timer = setTimeout(() => control.abort(), 3000);
+      try {
+        const r = await fetch(url, {
+          cache: "no-store",
+          signal: control.signal,
+        });
+        if (!r.ok) throw Error("相机暂无新画面");
+        return await r[body]();
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    async function control(path) {
+      const c = new AbortController(),
+        timer = setTimeout(() => c.abort(), 4000);
+      try {
+        const r = await fetch(path, {
+          method: "POST",
+          body: "{}",
+          headers: { "Content-Type": "application/json" },
+          signal: c.signal,
+        });
+        if (!r.ok) throw Error("扫码相机预览等待中");
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    function showTask(s) {
+      $("reference").textContent = s.reference_pixel
+        ? s.reference_pixel.join("，") + " px"
+        : "待记录";
+      const v = s.vision || {},
+        task = s.task,
+        m = v.materials?.[0];
+      $("target").textContent = task
+        ? colors[task.color_id] + "色"
+        : v.material_search_color
+          ? colors[v.material_search_color] + "色 · 观察中"
+          : "等待任务";
+      $("phase").textContent = task
+        ? phases[task.phase] || "等待任务状态"
+        : "到原料区停稳后，按任务码顺序等待目标进入接近窗口。";
+      $("order").replaceChildren();
+      if (task)
+        task.order.forEach((color, i) => {
+          const item = document.createElement("li");
+          item.textContent = colors[color];
+          item.className =
+            i < task.aligned_colors.length
+              ? "done"
+              : i === task.aligned_colors.length
+                ? "current"
+                : "";
+          $("order").append(item);
+        });
+      $("point").textContent = m ? m.center_x + "，" + m.center_y + " px" : "—";
+      const status = v.material_localization_status;
+      $("localization").textContent = m
+        ? "顶面中心可用"
+        : status === "color_region_clipped_or_small"
+          ? "目标边缘截断，继续观察"
+          : status === "no_target"
+            ? "接近窗口内暂无指定目标"
+            : "等待完整顶面";
+      const w = v.preview?.source_width || 1280,
+        h = v.preview?.source_height || 720;
+      $("overlay").setAttribute("viewBox", "0 0 " + w + " " + h);
+      $("overlay").replaceChildren();
+      const ns = "http://www.w3.org/2000/svg";
+      function shape(tag, values) {
+        const el = document.createElementNS(ns, tag);
+        Object.entries(values).forEach(([k, x]) => el.setAttribute(k, x));
+        $("overlay").append(el);
+      }
+      const box = v.material_target_window;
+      if (box)
+        shape("rect", {
+          x: box[0],
+          y: box[1],
+          width: box[2],
+          height: box[3],
+          fill: "none",
+          stroke: "#ffbe70",
+          "stroke-width": 3,
+          "stroke-dasharray": "12 8",
+        });
+      if (s.reference_pixel)
+        shape("path", {
+          d:
+            "M " +
+            (s.reference_pixel[0] - 16) +
+            " " +
+            s.reference_pixel[1] +
+            " h 32 M " +
+            s.reference_pixel[0] +
+            " " +
+            (s.reference_pixel[1] - 16) +
+            " v 32",
+          stroke: "#edf2f4",
+          "stroke-width": 3,
+        });
+      if (m && v.material_observation?.valid)
+        shape("circle", {
+          cx: m.center_x,
+          cy: m.center_y,
+          r: 10,
+          fill: "none",
+          stroke: "#60e8bc",
+          "stroke-width": 4,
+        });
+    }
+    async function poll() {
+      const version = epoch,
+        selected = camera,
+        start = performance.now();
+      if (document.hidden) {
+        setTimeout(poll, 500);
+        return;
+      }
+      try {
+        if (selected === "qr" && performance.now() - lastLease > 2000) {
+          await control("/qr/preview");
+          lastLease = performance.now();
+        }
+        const s = await request("/api/state?camera=" + selected);
+        if (version !== epoch) return;
+        if (selected === "material") {
+          showTask(s);
+          $("note").textContent =
+            "框线表示接近窗口，圆点表示物料顶面中心。夹爪与料盘舵机后续接入。";
+          $("source").textContent = "物料相机 · 共用识别服务的实时画面";
+        } else {
+          $("target").textContent = "二维码";
+          $("phase").textContent =
+            "待机时可手动预览，发车后共用预热与扫码画面。";
+          $("note").textContent =
+            "切换到物料相机后结束手动预览，扫码确认后自动关闭扫码采集。";
+          $("source").textContent = "扫码相机 · 共用扫码进程的实时画面";
+        }
+        if (!s.valid) {
+          clearImage(
+            selected === "qr" ? "扫码相机正在等待新画面" : "等待相机新画面",
+          );
+          $("status").textContent =
+            selected === "qr" ? "扫码相机 · 待机" : "相机数据暂不可用";
+          return;
+        }
+        const blob = await request("/frame.jpg?camera=" + selected, "blob");
+        if (version !== epoch) return;
+        if (performance.now() - start >= 1000) {
+          clearImage("画面传输有延迟，等待新帧");
+          return;
+        }
+        if (objectUrl) URL.revokeObjectURL(objectUrl);
+        objectUrl = URL.createObjectURL(blob);
+        $("frame").src = objectUrl;
+        $("frame").hidden = false;
+        $("empty").style.display = "none";
+        $("status").textContent =
+          selected === "material"
+            ? "物料相机 · 实时采集"
+            : "扫码相机 · 正在预热或扫码";
+      } catch (e) {
+        if (version === epoch) {
+          clearImage("相机暂时不可用，正在重新连接…");
+          $("status").textContent = "等待连接恢复";
+        }
+      } finally {
+        setTimeout(poll, 250);
+      }
+    }
+    document.addEventListener("visibilitychange", () => {
+      epoch++;
+      if (document.hidden) {
+        clearImage("页面已暂停预览");
+        control("/qr/release").catch(() => {});
+      }
+    });
+    window.addEventListener("pagehide", () =>
+      navigator.sendBeacon("/qr/release", "{}"),
+    );
+    poll();
+  </script>
+</html>

@@ -1,0 +1,15 @@
+[Unit]
+Description=Material and ring camera recognition
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/competition_vision
+ExecStart=/usr/bin/python3 -u -m pi_vision.stream --config %h/competition_vision/config/material_vision.local.yaml --port 8090 --material-backend hsv --material-center top_face --material-target-window 480 240 320 240 --materials --rings --no-qr --no-rotation-gate --no-undistort
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=12
+KillMode=mixed
+
+[Install]
+WantedBy=default.target

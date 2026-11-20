@@ -1,6 +1,6 @@
 /* Human viewing only. Old scans never become fresh by being polled again. */
 class ScanDisplayBuffer {
-  constructor() { this.clear(); }
+  constructor(previewMaxAgeMs = 5000) { this.previewMaxAgeMs = previewMaxAgeMs; this.clear(); }
   clear() { this.cached = null; this.deadline = 0; this.origin = 0; this.latestValid = false; this.session = null; this.seq = null; }
   accept(snapshot, now, rtt) {
     if (snapshot.session_id !== this.session) {
@@ -12,11 +12,11 @@ class ScanDisplayBuffer {
     const origin = now - age;
     if (snapshot.frame.seq !== this.seq) {
       this.seq = snapshot.frame.seq; this.origin = origin;
-      this.cached = snapshot; this.deadline = origin + 5000;
+      this.cached = snapshot; this.deadline = origin + this.previewMaxAgeMs;
     } else {
       // A repeated/queued response may only shorten a source's remaining lifetime.
       this.origin = Math.min(this.origin, origin);
-      this.deadline = Math.min(this.deadline, this.origin + 5000);
+      this.deadline = Math.min(this.deadline, this.origin + this.previewMaxAgeMs);
     }
     this.latestValid = true;
   }

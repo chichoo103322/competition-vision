@@ -1,0 +1,198 @@
+{
+  "enabled": false,
+  "mode": "alignment_only",
+  "firmware_and_clearances_verified": false,
+  "vision_state_url": "http://127.0.0.1:8090/state",
+  "station_timeout_s": 60,
+  "motion_timeout_s": 30,
+  "observation_timeout_s": 1,
+  "settle_s": 0.1,
+  "tolerance_px": null,
+  "confirm_frames": 3,
+  "confirm_span_s": 0.2,
+  "max_frame_gap_s": 0.7,
+  "max_step_mm": null,
+  "max_yaw_step_deg": null,
+  "max_total_mm": null,
+  "max_adjustments": 8,
+  "calibrations": {
+    "material_top": {
+      "measured": false,
+      "calibration_id": null,
+      "plane_id": null,
+      "camera_source": null,
+      "hsv_profile_sha256": null,
+      "origin_radius_mm": null,
+      "motor_signs": {
+        "z": null,
+        "yaw": null,
+        "reach": null
+      },
+      "resolution": [
+        1280,
+        720
+      ],
+      "reference_pixel": [
+        null,
+        null
+      ],
+      "correction_radial_tangent_mm_per_pixel": [
+        [
+          null,
+          null
+        ],
+        [
+          null,
+          null
+        ]
+      ],
+      "measured_pose_ranges": {
+        "z": [
+          null,
+          null
+        ],
+        "yaw": [
+          null,
+          null
+        ],
+        "reach": [
+          null,
+          null
+        ]
+      },
+      "motor_limits_deg": {
+        "z": [
+          null,
+          null
+        ],
+        "yaw": [
+          null,
+          null
+        ],
+        "reach": [
+          null,
+          null
+        ]
+      }
+    },
+    "ring_ground": {
+      "measured": false,
+      "calibration_id": null,
+      "plane_id": null,
+      "camera_source": null,
+      "hsv_profile_sha256": null,
+      "origin_radius_mm": null,
+      "motor_signs": {
+        "z": null,
+        "yaw": null,
+        "reach": null
+      },
+      "resolution": [
+        1280,
+        720
+      ],
+      "reference_pixel": [
+        null,
+        null
+      ],
+      "correction_radial_tangent_mm_per_pixel": [
+        [
+          null,
+          null
+        ],
+        [
+          null,
+          null
+        ]
+      ],
+      "measured_pose_ranges": {
+        "z": [
+          null,
+          null
+        ],
+        "yaw": [
+          null,
+          null
+        ],
+        "reach": [
+          null,
+          null
+        ]
+      },
+      "motor_limits_deg": {
+        "z": [
+          null,
+          null
+        ],
+        "yaw": [
+          null,
+          null
+        ],
+        "reach": [
+          null,
+          null
+        ]
+      }
+    }
+  },
+  "stations": {
+    "102": {
+      "layer": 0,
+      "plane_id": null,
+      "calibration_id": "material_top",
+      "target": {
+        "kind": "material",
+        "color_id": null
+      },
+      "search_poses": [],
+      "search_wait_s": 1.0
+    },
+    "103": {
+      "layer": 0,
+      "plane_id": null,
+      "calibration_id": "ring_ground",
+      "target": {
+        "kind": "ring",
+        "position_id": null
+      }
+    },
+    "104": {
+      "layer": 0,
+      "plane_id": null,
+      "calibration_id": "ring_ground",
+      "target": {
+        "kind": "ring",
+        "position_id": null
+      }
+    },
+    "105": {
+      "layer": 0,
+      "plane_id": null,
+      "calibration_id": "material_top",
+      "target": {
+        "kind": "material",
+        "color_id": null
+      },
+      "search_poses": [],
+      "search_wait_s": 1.0
+    },
+    "106": {
+      "layer": 0,
+      "plane_id": null,
+      "calibration_id": "ring_ground",
+      "target": {
+        "kind": "ring",
+        "position_id": null
+      }
+    },
+    "107": {
+      "layer": 0,
+      "plane_id": null,
+      "calibration_id": "ring_ground",
+      "target": {
+        "kind": "ring",
+        "position_id": null
+      }
+    }
+  }
+}

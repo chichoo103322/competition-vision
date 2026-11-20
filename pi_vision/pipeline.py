@@ -193,3 +193,23 @@ class VisionPipeline:
                 2,
             )
         return canvas
+
+
+def configure_ring_pipeline(pipeline, backend='hough', roi=None, orientation=None):
+    """显式接入已有环/数字算法；不改变默认检测或颜色阈值。"""
+    if backend not in ('hough', 'morphology'):
+        raise ValueError('unknown ring backend')
+    if backend == 'morphology':
+        if roi is None:
+            raise ValueError('morphology requires explicit original-image ring ROI')
+        from .detectors.morphology_ring_detector import MorphologyRingDetector
+        pipeline.ring_detector = MorphologyRingDetector()
+    if roi is not None:
+        from .detectors.morphology_ring_detector import RingRegionDetector
+        pipeline.ring_detector = RingRegionDetector(pipeline.ring_detector, roi)
+    if orientation is not None:
+        from .position_digits import NumberedRingDetector
+        base = getattr(pipeline.ring_detector, 'detector', pipeline.ring_detector)
+        if hasattr(base, 'smooth_alpha'):
+            base.smooth_alpha = 0.
+        pipeline.ring_detector = NumberedRingDetector(pipeline.ring_detector, orientation)

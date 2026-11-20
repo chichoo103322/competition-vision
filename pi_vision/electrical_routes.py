@@ -12,10 +12,71 @@ from .electrical_coordinates import (ELECTRICAL_FRAME, NOMINAL_FRAME,
 
 STATIONS = ('home', 'qr', 'material', 'processing', 'storage',
             'material', 'processing', 'storage', 'home')
+WORK_HEADING_OFFSETS_DEG = {101: 90, 102: -90, 103: 90, 104: 0,
+                            105: -90, 106: 90, 107: 0, 108: 0}
+
+
+def wrap_deg(angle):
+    return (angle + 180) % 360 - 180
+
+
+def configure_work_heading_mode(route, enabled):
+    """Attach local-only controller work-heading semantics; wire V1 is unchanged."""
+    if type(enabled) is not bool:
+        raise ValueError('work_heading_mode_enabled must be boolean')
+    initial_yaw = route['initial_pose']['yaw_deg']
+    active = enabled and any(WORK_HEADING_OFFSETS_DEG.get(p.get('work_id')) is not None
+                             for p in route['points'])
+    route['work_heading_mode_enabled'] = enabled
+    route['work_heading_mode_active'] = active
+    current_travel_yaw = initial_yaw
+    for point in route['points']:
+        point.pop('travel_yaw_deg', None)
+        point.pop('expected_work_yaw_deg', None)
+        if not active:
+            point['travel_yaw_deg'] = point['yaw_deg']
+            continue
+        point['travel_yaw_deg'] = current_travel_yaw
+        work_id = point.get('work_id', 0)
+        if work_id:
+            offset = WORK_HEADING_OFFSETS_DEG.get(work_id)
+            expected = (wrap_deg(initial_yaw + offset) if offset is not None
+                        else wrap_deg(point['yaw_deg']))
+            point['expected_work_yaw_deg'] = expected
+            current_travel_yaw = expected
+    return route
+
+
+def expected_work_yaw(route, point):
+    active = route.get('work_heading_mode_enabled', False) and any(
+        p.get('work_id') in WORK_HEADING_OFFSETS_DEG for p in route['points'])
+    if active and point.get('work_id'):
+        offset = WORK_HEADING_OFFSETS_DEG.get(point['work_id'])
+        return wrap_deg(route['initial_pose']['yaw_deg'] + offset) if offset is not None else wrap_deg(point['yaw_deg'])
+    return point['yaw_deg']
+
+
+def work_pose_error(status, route, point_index, *, position_tolerance_mm=8,
+                    yaw_tolerance_deg=2):
+    if not 0 <= point_index < len(route['points']):
+        return 'work point index outside route'
+    point = route['points'][point_index]
+    values = [status[k] for k in ('x_mm', 'y_mm', 'yaw_deg')]
+    if any(type(v) not in (int, float) or not math.isfinite(v) for v in values):
+        return 'invalid reported work pose'
+    if not point.get('work_id') or status.get('work_id') != point['work_id']:
+        return 'work point identity mismatch'
+    if math.hypot(status['x_mm'] - point['x_mm'], status['y_mm'] - point['y_mm']) > position_tolerance_mm:
+        return 'WAIT_WORK position outside arrival tolerance'
+    yaw_error = wrap_deg(status['yaw_deg'] - expected_work_yaw(route, point))
+    if abs(yaw_error) > yaw_tolerance_deg:
+        return 'WAIT_WORK work-heading outside arrival tolerance'
+    return None
 
 
 def compile_preview(plan, nodes, *, route_id, initial_pose, segment_yaws_deg,
-                    move_rpm, turn_rpm, coordinate_frame, stage_limit=8):
+                    move_rpm, turn_rpm, coordinate_frame, stage_limit=8,
+                    work_heading_mode_enabled=True):
     # Profiles already use electrical/photo coordinates. Only nominal planner
     # nodes are transformed; never rotate the profile or a compiled route twice.
     require_electrical_frame(coordinate_frame)
@@ -84,6 +145,7 @@ def compile_preview(plan, nodes, *, route_id, initial_pose, segment_yaws_deg,
                                    'communication_loss_stop'],
                   coordinate_frame=ELECTRICAL_FRAME, source_coordinate_frame=NOMINAL_FRAME,
                   distance_unit='mm', angle_unit='degree')
+    configure_work_heading_mode(result, work_heading_mode_enabled)
     upload_payload(result)  # Validate full payload, including the 64-point cap.
     return result
 
@@ -105,11 +167,13 @@ def segment_for_status(route, status):
 
 def compile_chassis_test(plan, nodes, *, route_id, initial_pose, heading_deg,
                          move_rpm, turn_rpm, approach_rpm, approach_distance_mm, coordinate_frame,
-                         footprint=None, stage_limit=8, stop_strategy='controller_deceleration'):
-    """Fixed-heading test; firmware decelerates directly into each work stop.
+                         footprint=None, stage_limit=8, stop_strategy='controller_deceleration',
+                         work_heading_mode_enabled=True, test_turn_sweep_ignored_cells=(),
+                         test_ignore_turn_obstacles=False):
+    """Axis-path test; firmware decelerates and turns into each work stop.
 
-    Grid edges must be axis-aligned. Fixed heading lets the STM32 perform one
-    body-axis move per edge instead of its usual two-axis diagonal sweep.
+    Grid edges must be axis-aligned. With work-heading mode the STM32 holds
+    the previous work heading in transit and turns only after station arrival.
     split_approach retains the historical stop/restart profile for comparison.
     approach_rpm caps the short start/home connectors in the default strategy;
     it is NOT an independent terminal-speed field in the V1 wire protocol.
@@ -127,7 +191,7 @@ def compile_chassis_test(plan, nodes, *, route_id, initial_pose, heading_deg,
     route = compile_preview(plan, nodes, route_id=route_id, initial_pose=initial_pose,
                             segment_yaws_deg=[heading_deg] * 8,
                             move_rpm=move_rpm, turn_rpm=turn_rpm, coordinate_frame=coordinate_frame,
-                            stage_limit=stage_limit)
+                            stage_limit=stage_limit, work_heading_mode_enabled=work_heading_mode_enabled)
     coordinates = {node['id']: tuple(round(v * 1000) for v in node['xy']) for node in nodes}
     previous = None
     for segment in plan['segments'][:stage_limit]:
@@ -179,6 +243,13 @@ def compile_chassis_test(plan, nodes, *, route_id, initial_pose, heading_deg,
     route['points'] = new_points
     route['segments'] = new_segments
     route['test_mode'] = 'chassis_route_dry_work'
+    if type(test_ignore_turn_obstacles) is not bool:
+        raise ValueError('test_ignore_turn_obstacles must be boolean')
+    route['test_ignore_turn_obstacles'] = test_ignore_turn_obstacles
+    if (not isinstance(test_turn_sweep_ignored_cells, (list, tuple)) or
+            any(type(cell) is not int or not 0 <= cell < 25 for cell in test_turn_sweep_ignored_cells)):
+        raise ValueError('test_turn_sweep_ignored_cells must be grid IDs in [0,24]')
+    route['test_turn_sweep_ignored_cells'] = list(dict.fromkeys(test_turn_sweep_ignored_cells))
     if stage_limit == 1:
         route['execution_scope'] = 'first_segment_only'
     route['approach_rpm'] = approach_rpm
@@ -186,6 +257,7 @@ def compile_chassis_test(plan, nodes, *, route_id, initial_pose, heading_deg,
     route['stop_strategy'] = stop_strategy
     if stop_strategy == 'controller_deceleration':
         route = compact_straight_points(route)
+    configure_work_heading_mode(route, work_heading_mode_enabled)
     if footprint is not None:
         from .chassis_geometry import validate_footprint
         validate_footprint(footprint)

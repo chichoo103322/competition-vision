@@ -39,8 +39,7 @@ class MaterialRegionDetector:
         ])
 
 
-def center_material(materials, window, frame_size, ambiguity_px=12.):
-    """Choose by distance within a fixed observation window; never use outside targets."""
+def _window_candidates(materials, window, frame_size):
     import math
     if len(window) != 4 or any(type(v) is not int for v in window):
         raise ValueError('target window must be four integers')
@@ -48,8 +47,6 @@ def center_material(materials, window, frame_size, ambiguity_px=12.):
     width, height = frame_size
     if min(x, y) < 0 or min(w, h) <= 0 or x+w > width or y+h > height:
         raise ValueError('target window exceeds frame')
-    if not math.isfinite(ambiguity_px) or ambiguity_px < 0:
-        raise ValueError('invalid ambiguity margin')
     candidates = []
     for m in materials:
         # Select the object before considering top-face success. Never switch to a side object.
@@ -57,7 +54,28 @@ def center_material(materials, window, frame_size, ambiguity_px=12.):
         my = m.selection_center_y if m.selection_center_y is not None else m.center_y
         if x <= mx < x+w and y <= my < y+h:
             candidates.append((math.hypot(mx-(x+w/2), my-(y+h/2)), m))
-    candidates.sort(key=lambda pair: pair[0])
+    return candidates
+
+
+def center_material(materials, window, frame_size, ambiguity_px=12.):
+    """Choose by distance within a fixed observation window; never use outside targets."""
+    import math
+    if not math.isfinite(ambiguity_px) or ambiguity_px < 0:
+        raise ValueError('invalid ambiguity margin')
+    candidates = sorted(_window_candidates(materials, window, frame_size), key=lambda pair: pair[0])
     if not candidates or len(candidates) > 1 and candidates[1][0]-candidates[0][0] <= ambiguity_px:
         return []
     return ordered_materials([candidates[0][1]])
+
+
+def search_material(materials, window, frame_size, color_id):
+    """Raw-station search: one requested-color object anywhere in the configured window.
+
+    Select before top-face validation. Two same-color objects are ambiguous,
+    including one whose top face failed, so neither can replace the other.
+    """
+    if type(color_id) is not int or not 1 <= color_id <= 6:
+        raise ValueError('business color must be 1..6')
+    candidates = [m for _, m in _window_candidates(materials, window, frame_size)
+                  if m.color_id == color_id]
+    return ordered_materials(candidates) if len(candidates) == 1 else []

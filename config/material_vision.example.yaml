@@ -1,0 +1,23 @@
+# Copy to material_vision.local.yaml and set the verified material-camera by-id.
+# The service uses a central 320x240 window in the original 1280x720 image.
+camera:
+  source: /dev/v4l/by-id/REPLACE_WITH_MATERIAL_CAMERA-video-index0
+  qr_source: ""
+  backend: v4l2
+  width: 1280
+  height: 720
+  fps: 30
+  flip: 0
+  undistort: false
+  v4l2_controls: {}
+
+detection:
+  qr: false
+  materials: true
+  rings: true
+  rotation_gate: false
+  algorithms_default_on: false
+
+debug:
+  save_dir: output/material_vision/debug_frames
+  show: false

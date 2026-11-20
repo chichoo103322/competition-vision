@@ -38,7 +38,8 @@ def synthetic_plan(zone=2, occupied24=True):
                  navigation=evidence, mission_plan=mission_status(plan, evidence, True))
     x, y = nominal_xy_to_electrical_mm(*pose[:2])
     profile = dict(coordinate_frame=ELECTRICAL_FRAME, initial_pose=dict(x_mm=x, y_mm=y, yaw_deg=0),
-                   heading_deg=0, move_rpm=40, turn_rpm=20, approach_rpm=12, approach_distance_mm=120)
+                   heading_deg=0, move_rpm=40, turn_rpm=20, approach_rpm=12, approach_distance_mm=120,
+                   work_heading_mode_enabled=True)
     return state, profile, config
 
 
@@ -139,9 +140,12 @@ def main():
     parser.add_argument('--heading', type=int, choices=(-180, -90, 0, 90, 180), default=0)
     parser.add_argument('--fault', choices=('none', 'imu', 'stall', 'stop'), default='none')
     parser.add_argument('--key-mode', action='store_true', help='exercise new START_AREA/ACK/token upload path')
+    parser.add_argument('--legacy-point-yaw', action='store_true',
+                        help='disable work-area heading mode only for legacy firmware simulation')
     args = parser.parse_args()
     state, profile, config = synthetic_plan(args.zone)
     profile['initial_pose']['yaw_deg'] = profile['heading_deg'] = args.heading
+    profile['work_heading_mode_enabled'] = not args.legacy_point_yaw
     route = compile_chassis_test(state['mission_plan'], state['navigation']['nodes'], route_id=1, **profile)
     validate_geometry(state, route, config)
     with tempfile.TemporaryDirectory(prefix='chassis-route-sim-') as folder:

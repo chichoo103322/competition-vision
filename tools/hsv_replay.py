@@ -9,7 +9,7 @@ import cv2
 
 from pi_vision.detectors.hsv_material_detector import HSVMaterialDetector
 from pi_vision.hsv_profile import load_profile, profile_hash, validate_profile
-from pi_vision.material_region import MaterialRegionDetector, ordered_materials, center_material
+from pi_vision.material_region import MaterialRegionDetector, ordered_materials, center_material, search_material
 
 
 def replay(directory, candidate=None):
@@ -39,7 +39,11 @@ def replay(directory, candidate=None):
                 detector = MaterialRegionDetector(detector, data['roi'])
             found = ordered_materials(detector.detect(image))
             if data.get('material_target_window') is not None:
-                found = center_material(found, data['material_target_window'], data['frame_size'])
+                if data.get('material_search_color') is not None:
+                    found = search_material(found, data['material_target_window'], data['frame_size'],
+                                            data['material_search_color'])
+                else:
+                    found = center_material(found, data['material_target_window'], data['frame_size'])
             return [asdict(m) for m in found if m.localization_valid]
         original = detect(baseline)
         # Tracker IDs are live session metadata, not reproducible detector results.

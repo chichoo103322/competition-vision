@@ -1,4 +1,4 @@
-"""Prewarmed, repeatable one-button chassis service (no vision/gripper).
+"""Prewarmed, repeatable one-button chassis service (optional real QR/arm alignment, no gripper).
 
 Run before the start command. Every NEW key after READY starts a fresh route.
 """
@@ -17,8 +17,8 @@ import time
 
 from pi_vision import electrical_protocol as protocol
 from pi_vision.electrical_link import ElectricalClient
-from pi_vision.electrical_coordinates import direction_review
-from pi_vision.electrical_routes import compile_chassis_test
+from pi_vision.electrical_coordinates import direction_review, direction_review_html
+from pi_vision.electrical_routes import compile_chassis_test, configure_work_heading_mode
 from tools.electrical_route_test import (acquire_plan, checked_port, endpoints, http_json,
     run_closed_loop, validate_geometry, validate_profile, verify_before_start)
 
@@ -191,7 +191,63 @@ def load_competition_backend(spec, config):
     return backend
 
 
+def test_turn_override_enabled(config, zone):
+    return config['profiles'][str(zone)].get('test_ignore_turn_obstacles') is True
+
+
+def make_test_station_work(client, config, emit, backend=None):
+    from tools.route_station_dwell import TimedStationWork, timed_station_test
+    if not timed_station_test(config):
+        return None
+    if backend is not None:
+        raise ValueError('timed station work is test-only, not a competition backend')
+    return TimedStationWork(client,config['test_station_work'],emit)
+
+
 def run_attempt(client, config, selected, emit, cancelled, backend=None):
+    from tools.qr_station_work import QRStationWork
+    qr_settings = dict(config.get('qr_station', {}))
+    if config.get('output_root'):
+        qr_settings['preview_dir'] = str(Path(config['output_root'])/'qr_camera')
+    qr_work = (QRStationWork(qr_settings)
+               if backend is None and 'qr_station' in config else None)
+    try:
+        if qr_work is not None:
+            qr_work.prewarm()
+            emit(event='QR_CAMERA_PREWARMING')
+        return _run_attempt(client, config, selected, emit, cancelled, backend, qr_work)
+    finally:
+        if qr_work is not None:
+            qr_work.close()
+            emit(event='QR_CAMERA_CLOSED')
+
+
+def _run_attempt(client, config, selected, emit, cancelled, backend=None, qr_work=None):
+    arm_work = make_test_station_work(client,config,emit,backend)
+    arm_config = config.get('arm_alignment') or {}
+    if backend is not None and arm_config.get('enabled'):
+        raise ValueError('alignment-only test cannot be used as competition grasp feedback')
+    if arm_work is None and arm_config.get('enabled') is True:
+        from tools.arm_alignment_work import ArmAlignmentWork
+        arm_work = ArmAlignmentWork(client, arm_config,
+            lambda: http_json(arm_config['vision_state_url']))
+    turntable = config.get('turntable_work') or {}
+    if getattr(arm_work,'mode',None)!='timed_dwell' and turntable.get('enabled') is True:
+        if backend is not None or arm_work is not None:
+            raise ValueError('choose one explicitly configured station-work backend')
+        from tools.turntable_work import TurntableWork
+        previous_phase = [None]
+        def publish(value):
+            atomic_json(Path(config['output_root'])/'material_work.json', value)
+            signature = (value['phase'], value['color_id'], value['step'])
+            if signature != previous_phase[0]:
+                emit(event='MATERIAL_WORK', **value)
+                previous_phase[0] = signature
+        url = turntable['vision_state_url']
+        if url != 'http://127.0.0.1:8090/state':
+            raise ValueError('turntable uses the dedicated local material camera service')
+        arm_work = TurntableWork(client, turntable, lambda: http_json(url),
+            lambda color: http_json('http://127.0.0.1:8090/material-target', 'POST', {'color_id': color}), publish)
     root = Path(config['output_root'])
     old_id = int((root/'route_id').read_text()) if (root/'route_id').exists() else 0
     status = client.check_start_area(selected)
@@ -207,22 +263,34 @@ def run_attempt(client, config, selected, emit, cancelled, backend=None):
                          start_zone=selected['area'], check_current=check)
     field_map = http_json(endpoints(config['state_url'])[2])
     if backend is None:
+        profile = config['profiles'][str(selected['area'])]
         route = compile_chassis_test(state['mission_plan'], state['navigation']['nodes'],
-                                    route_id=route_id, **config['profiles'][str(selected['area'])])
+                                    route_id=route_id, **profile)
+        if test_turn_override_enabled(config, selected['area']):
+            emit(event='TEST_TURN_OBSTACLES_IGNORED', area=selected['area'], route_id=route_id)
     else:
         route = backend.plan(state=state, selection=dict(selected), route_id=route_id,
                              check_current=check)
         if (route.get('test_mode') or route.get('valid_for_motion') is not True or
                 route.get('route_id') != route_id or route.get('start_zone') != selected['area']):
             raise ValueError('competition backend must return a commissioned, key-bound real route')
+        configure_work_heading_mode(
+            route, config['profiles'][str(selected['area'])]['work_heading_mode_enabled'])
     validate_geometry(state, route, field_map)
-    prepared = dict(route=route, state=state, selection=selected,
-                    direction_review=direction_review(protocol.upload_payload(route)))
+    review = direction_review(protocol.upload_payload(route), work_heading_mode_enabled=route[
+        'work_heading_mode_enabled'])
+    prepared = dict(route=route, state=state, selection=selected, direction_review=review)
     atomic_json(root/'prepared_live.json', prepared)
-    emit(event='PREPARED', route_id=route_id, points=len(route['points']))
+    (root/'direction_review.html').write_text(direction_review_html(review), encoding='utf-8')
+    emit(event='PREPARED', route_id=route_id, points=len(route['points']),
+         test_ignore_turn_obstacles=route.get('test_ignore_turn_obstacles', False))
 
     def before_start():
         check()
+        if arm_work is not None:
+            arm_work.preflight()
+        if qr_work is not None and not qr_work.ready():
+            raise RuntimeError('QR camera prewarm failed or frames stale; do not START')
         if cancelled():
             raise InterruptedError('service stopping')
         current = verify_before_start(config['state_url'], state)
@@ -230,10 +298,11 @@ def run_attempt(client, config, selected, emit, cancelled, backend=None):
 
     if backend is not None:
         final_status = client.run_selected_route(selected, route, backend.on_work,
+            poll_work=getattr(backend, 'poll_work', None),
             before_start=before_start, cancelled=cancelled)
         return dict(result='done', status=final_status, mode='competition',
                     simulated_work=False)
-    return run_closed_loop(client, route, station_dwell_s=2, poll_s=.2,
+    return run_closed_loop(client, route, qr_work=qr_work, arm_work=arm_work, station_dwell_s=2, poll_s=.2,
         timeout_s=600, log=RunnerLog(emit), before_start=before_start,
         cancelled=cancelled, start_request_id=selected['request_id'])
 
@@ -278,8 +347,24 @@ def main(argv=None):
 
         owned = None
         try:
+            from tools.route_station_dwell import timed_station_test
+            timed_work = timed_station_test(config)
+            if timed_work and backend is not None:
+                raise ValueError('timed station work is test-only')
+            if not timed_work and (config.get('arm_alignment') or {}).get('enabled') is True:
+                from tools.arm_alignment_work import validate_config
+                validate_config(config['arm_alignment'])
+                if config.get('qr_station', {}).get('camera') in {
+                        c['camera_source'] for c in config['arm_alignment']['calibrations'].values()}:
+                    raise ValueError('QR and material cameras must be distinct devices')
+                if backend is not None:
+                    raise ValueError('alignment-only configuration is test-only')
             for zone in ('1', '2'):
                 validate_profile(config['profiles'][zone])
+            from tools.qr_station_work import QRStationWork
+            qr_config = (QRStationWork(config['qr_station'])
+                         if backend is None and 'qr_station' in config else None)
+            qr_ready = lambda: qr_config is None or Path(qr_config.camera).exists()
             # Open UART before lidar startup. No ACK/route/START is sent yet.
             import serial
             state('WAIT_DEVICES')
@@ -293,7 +378,7 @@ def main(argv=None):
             state('WARMING_UP')
             owned = ensure_lidar(config, emit, lambda: cancel[0])
             client, selection = wait_ready_key(client,
-                lambda: lidar_fresh(config['state_url']) and (backend is None or backend.ready() is True),
+                lambda: qr_ready() and lidar_fresh(config['state_url']) and (backend is None or backend.ready() is True),
                 state, emit, cancelled=lambda: cancel[0])
             while not cancel[0]:
                 state('SCANNING', selection=selection)
@@ -314,7 +399,7 @@ def main(argv=None):
                 # No persistent attempt lock: a fresh post-READY key starts
                 # another complete scan/plan from whichever zone it selects.
                 client, selection = wait_ready_key(client,
-                    lambda: (lidar_fresh(config['state_url']) and
+                    lambda: (qr_ready() and lidar_fresh(config['state_url']) and
                              (backend is None or backend.ready() is True)), state, emit,
                     cancelled=lambda: cancel[0])
         except (Exception, KeyboardInterrupt) as exc:

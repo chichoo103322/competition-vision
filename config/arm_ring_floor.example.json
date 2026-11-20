@@ -1,0 +1,13 @@
+{
+  "camera_source": "/dev/v4l/by-id/usb-Generic_USB_Camera_200901010001-video-index0",
+  "resolution": [1280, 720],
+  "camera_flip": 0,
+  "camera_undistort": false,
+  "photo_z_cdeg": 0,
+  "origin_radius_mm": 230,
+  "max_abs_yaw_deg": null,
+  "max_retraction_mm": null,
+  "clear_downstroke_mm": null,
+  "fit_points": [],
+  "check_points": []
+}

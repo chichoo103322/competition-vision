@@ -1,6 +1,179 @@
 # 项目交接上下文
 
-更新：2026-11-03。供全新聊天接续；先读 `AGENTS.md`。本文只记录最终决策、可复用命令与完成边界，不含凭据。
+更新：2026-11-20。供全新聊天接续；先读 `AGENTS.md`。本文只记录最终决策、可复用命令与完成边界，不含凭据。
+
+上传约定：用户正在调车，上传不得打断运行。更新先放独立待部署目录，不覆盖运行源码/配置/依赖，不停止或重启服务、不占用控制串口、不发控制指令或切换模式；状态不明按运行中处理。用户明确确认停车并同意生效后再部署切换。本次只记录约定，未操作树莓派。
+
+## 用户保留的两种测试模式与切换约定
+
+用户明确要求两份测试均长期保留，未启用也不能作为“无用代码”删除；以后由用户说“切云台三次抓取”或“切底盘全程”再切换，不自行更改KEY用途。当前选中**底盘跑完全程**，此约定确认时未切换、未重启、未发车。
+
+- **云台三次抓取测试**：`tools/arm_three_color_trial.py`＋`pi_vision/arm_visual_servo.py`，等待人工原点/KEY后按指定三色识别、对齐、下降、模拟夹爪/托盘、抬升/回基准。当前示例231，只有用户确认的新顺序才替换；夹爪/托盘未实现。入口要求独立测试固件`standalone_test_mode=true`，独占UART并暂停底盘按键服务；不得与整车入口同时运行。
+- **底盘跑完全程测试**：`tools/chassis_button_service.py`＋`tools/electrical_route_test.py`＋`tools/route_station_dwell.py`，由chassis-button.service开机待机，KEY选启停区、真实扫码、其余站点驻留/确认允许离站后走完8段。配置`test_station_work.mode=timed_dwell`，三色视觉抓取不接入；要求整车固件`standalone_test_mode=false`。
+
+两入口和当前配置在Mac/Pi均保留；关键源码快照Mac `output/saved_test_modes_20261120/manifest.json`，Pi `backups/saved_test_modes_20261120_*/manifest.json`及同目录本机配置。快照不是独立可运行项目，依赖仍用原工程。切换前检查实际固件模式、原点、当前任务/相机/UART占用，不假设树莓派能自行切换固件宏；仅在用户指定模式后调整对应服务/配置。
+
+## 放置区数字圆环独立测试
+
+Pi 已部署 `tools/arm_ring_trial.py`，原来的底盘和三色测试入口保留。支持 `--vision-only`、`--positions 231` 或 `--task-code CCC+PPP+CCC+PPP --station batch1|batch2-processing`。独立固件中启动后等待新 KEY 对应的 ZEROING/READY，确认唯一编号 1/2/3 和三处可达，再按顺序粗到位、新帧精调、回原点。显式 `--simulate-release` 才执行固件固定下降 100 mm、模拟松爪后抬升；停在原点 ALIGNED，下一轮按固件要求复位并重新记录原点。独立运动试验需停车并释放底盘服务和相机服务占用。
+
+运动依赖地面标定 `config/arm_ring_floor.local.json`，样例为 `config/arm_ring_floor.example.json`。以原点夹爪中心的垂直投影为地面零点，至少录入四个包围三个环和零点、非共线的拟合点及一个独立检查点。每点格式为 [原图x, 原图y, 向前径向毫米, 正旋转方向切向毫米]，在标定拍照高度 Z=0 测量。填实测旋转、回缩范围，开启下降前单独确认三处各有 100 mm 净空。独立地面检查及对齐残差门槛为 1 mm，不能用物料顶面矩阵替代。
+
+本次 Pi 静止现场原图连续 4 帧确认 1/2/3，窗长 0.89 s，各环最大单轴像素跨度 0.85/0.82/0.44。仅为本场景图像稳定性，地面标定、KEY 和真实云台运动待现场验证。Mac 615 项与 172 子项通过。Pi 备份 `backups/ring_placement_20261120_uj3Vlx/`，证据 `output/ring_vision_check_20261120_200755/`。底盘服务未重启，物料预览已恢复。
+
+新增 `--auto-calibrate` 用编码器实际水平姿态和三环新帧拟合地面投影，独立姿态验算通过后才保存 `arm_ring_floor.local.json`，且仅在三处都可达时接着测水平对齐。采样目标限于原点高度、±5.4°、回缩 30 mm，固件可能走 60 mm 避让。软件 617 项与 172 子项通过。实机日志 `output/ring_auto_calibration_20261120_201910/events.jsonl`：串口独占成功，用户上电并按键后仍无 STM32 回包，未进入采样、未发运动、未生成地面标定。已结束等待并恢复原底盘及物料服务，通信恢复后再试。
+
+通信恢复后修正了阴影下漏掉圆环候选，以及标定途中字号读弱和盘外反光误检的问题。标定只跟踪原点确认过的三个环，要求局部唯一匹配，正式对齐仍重读编号。最新试验 `output/ring_auto_calibration_20261120_203323/events.jsonl` 完成 7 个拟合与 3 个验算姿态。拟合最大误差 1.85 mm、独立验算 2.71 mm，超过 1 mm 门槛。回原点反馈仅差 0.02°、0.075 mm，但三环图像都偏约 5 px，需复查相机固定、线缆拉扯、机械回位或底盘/靶纸位移，原因尚未确认。未保存标定、未进入三环对齐，底盘和物料服务已恢复。
+
+用户确认固定件无松动，要求重标并允许放宽供实物对照。Pi `output/ring_auto_calibration_20261120_204250/`：7 个拟合、3 个独立姿态，最大拟合/验算误差 2.01/2.61 mm，按显式 3 mm 水平试验门槛保存 `config/arm_ring_floor.local.json` 并通过文件自检。2 号环新帧换算残差 0.60 mm，保持 Z=0、ALIGNED 供用户观察，未下降。1/3 号环分别估计需超原点前伸约 32/31 mm 且旋转约 -35°/+37°，被当前行程拦截。该配置只供水平试验；底盘和物料服务恢复。Mac 619 项与 172 子项通过。
+
+用户移动车位并要求去掉 Pi 的 ±6° 试验限制。自动标定用已提供固件的 ±90° 目标边界，已实机验证到 +43.23°，其余角度未实测。Pi `output/ring_three_auto_20261120_205622/` 新车位采样与旧采样联合标定，独立误差 2.74 mm。主控水平到达 3 号后原识别因数字斜转超时，触发 STOP；俯视画面停留在 3 号。补斜角 OCR 后在同一位置连续四帧独立复核为 3 号，换算残差 0.79 mm（`output/ring_three_verify_205934/`）。默认 `config/arm_ring_floor.local.json` 已更新并自检通过，仍只供水平试验。旧配置备份 `backups/ring_floor_default_20261120_zdsf3b/`。未下降、未重跑完整序列，底盘和物料服务均恢复。Mac 620 项与 172 子项通过。
+
+随后按 KEY 实跑完整水平对齐 2→3→1（Pi `output/ring_full_231_20261120_212115/`）。2 号实际目标回缩约 72.3 mm，Pi 的回缩上限已从 60 mm 避让点改为已提供固件的 120 mm 行程，60 mm 避让仍由电控执行。三个环均新帧确认并回原点，视觉残差分别 2.98/2.23/1.78 mm，1 号微调一次。从第一条前往圆环指令到最后回位约 42 s，结束 ALIGNED、fault0、原点有效。未下降或模拟松爪。新增 `--take-devices` 可在独立试验期间接管串口和相机并在结束恢复服务，本次两服务已恢复。
+
+用户确认三处 100 mm 下降净空并授权模拟夹取。完整实机试验 Pi `output/ring_full_grip_231_20261120_214759/` 按 2→3→1 全部完成对齐、实际下降约 100.04 mm、模拟 GRIP_DONE、实际抬升和回原点，约 96 s。视觉残差依次 2.26/2.33/0.93 mm，末态 ALIGNED/fault0/原点有效，两服务恢复。夹爪舵机仍待电控实现，真实抓放标志为 false。原始证据已取回 Mac `output/ring_full_grip_20261120/completed_214759/`。
+
+此次修复固件以零目标代替微小正 Z 反馈时的下降参考核对、粗到位标定边界的误差余量、到位后的固定局部环心关联，以及端点附近只执行合法旋转/伸缩的微调。下降前始终重读编号、新帧残差≤3 mm、实际 MCU 到位，回缩/旋转/硬件故障限制保留。仅显式 `--simulate-grip --confirmed-downstroke-mm 100` 才启用这轮已确认的下降试验；常用入口等待新 KEY，`--reuse-ready-origin` 仅供未运动预检重试。Mac 623 项与 172 子项通过，部署双源码哈希一致。
+
+## 当前启停区KEY入口恢复路线驻留测试（2026-11-20）
+
+用户明确暂不接入三色取料，恢复到站短暂停留后继续八段路线。已部署`tools/route_station_dwell.py`并接入chassis_button_service/electrical_route_test；Pi `config/chassis_button.local.json`设`test_station_work={mode:timed_dwell,dwell_s:2,motion_timeout_s:45}`、`turntable_work.enabled=false`（其余视觉配置保留），二维码预热/真实新帧扫码及行驶配置不变。102..107不识别、不ALIGN/PICK/GRIP_DONE、不等待物料标定，仅在当前站WAIT_VISION后发送FINISH，等实际READY_LEAVE且至少驻留2秒，再测试WORK_DONE继续；主控收回可能额外耗时，不能绕过离站检查。101真实QR、108普通2秒驻留。结果明确timed_dwell/模拟作业/未对齐未抓放，不伪装视觉成功；正式competition backend拒绝此测试模式。独立三色测试命令及其优化未改。
+
+Mac610 passed/172 subtests、Pi85相关项通过，覆盖两启停区完整8段+QR确认+6站真实收回协议门；部署3源码哈希一致。Pi原源码/配置备份`backups/route_dwell_20261120_WQqL6p/`，Mac取回旧源码在忽略目录`output/route_dwell_restore_20261120/`。核对原服务WAIT_CONTROLLER、上一轮已停止后持desktop启动锁重启；PID4694、active，配置实际选中timed_dwell/2s、QR启用、视觉站点禁用。只读重启前控制器STOPPED/fault5、云台STOPPED/fault4、原点无效，未清故障/自动ZERO/发车。结束服务仍WAIT_CONTROLLER，需用户把车放回启停区、复位主控并记录原点，在就绪后按新KEY。仅软件和部署验证，未执行本轮实车整条路线；未改雷达模块、桌面软件或运动参数。
+
+## 三色模拟夹取连测（2026-11-20，尚未三件完成）
+
+最新恢复式视觉闭环已部署（本次未启动运动）：用户要求单次误差变大后继续追踪、提高效率。`arm_three_color_trial.py`不再因单次误差增长/两次无进展/暂时丢失而全局STOP，改为保持同一颜色、清除旧运动观测对、重取不同来源新帧并降低下一步增益；恢复进展后逐步恢复步长。32次/90mm/首次有效目标后的180s主动纠偏预算耗尽时保持观察高度等待真实目标进入容差，不继续无限追赶、不跳色或伪造抓取成功。捕获/识别短暂不可用可等待恢复；MCU故障/通信失联/身份或相机session改变/实际反馈越界仍退出并请求STOP，人工原点规则不变。
+
+新增`pi_vision/arm_visual_servo.py`：按当前伸出半径及实际编码器位移在局部径向/切向计算修正；仅用短动作≤2s、同track且两端稳定、残差可信的观测做受限在线割线Jacobian更新（仅本颜色运行时，不写回实测标定文件）。完整60mm避让、长动作、目标运动/身份跳变/离群样本不学习。原图新帧中运动连续可信时允许最大4px短时预测，下降前仍须真实新帧进入±8px；没有把预测冒充抓取测量。日志记录full_avoidance、visual_reacquire、mapping_update和holding_for_target。软件599 passed/172 subtests、Pi52相关项通过，4个部署文件SHA256一致；Pi备份`backups/servo_recovery_20261120_cJ7neT/`。原运行命令继续可用，新增可选`--alignment-budget-s`；实机恢复/效率和动态转盘抓取尚未验证。
+
+本次修改依据用户自跑test_id1795172040的真实日志`output/arm_three_color_20261120_185339/events.jsonl`：黄色整套完成；蓝色误差(75,78)→(63,67)→(73,70)px，旧程序因92→101px增长而主动STOP/fault4；前两次ALIGN分别8.266s/7.412s，均实际退约60.2mm。此为主要效率瓶颈，Pi优化不能取消固件完整避让，仍需电控修微调入口与到位容差。Mac已取回同名忽略目录，软件回放摘要`output/servo_recovery_20261120/replay.json`；回放后续恢复帧为测试模拟，不能宣称现场恢复成功。用户该次报文STOPPED/origins=false/Z约0是结束快照，后续动作前重新核对。
+
+用户确认独立试验顺序231=黄→蓝→红：真实识别/水平对齐/下降100mm，模拟未实现的夹爪和料盘；仅在真实WAIT_GRIP且引用匹配时发送显式模拟GRIP_DONE，实际抬升到PICKED后回[0,0,0]再下一色，三件后保持ALIGNED基准位。必须显式`--simulate-servos --order 231`，订单来源记录为用户本轮确认，不冒充新二维码扫描或真实抓放成功。入口`tools/arm_three_color_trial.py`已部署，共用唯一UART/desktop启动锁与HSV相机。颜色切换验证generation/epoch/原始新帧/独立顶面；整车turntable alignment仍未启用，未部署Mac桌面软件或改雷达。
+
+用户按现场夹爪情况要求降低精度、加快对齐并放宽25mm人为限幅。当前`TrialTuning`默认每轴±8原图像素、3个不同新帧/跨度≥0.2s/抖动≤3px、停稳后0.1s取新帧、单步≤3.5mm/0.8°、reach[-60,0]mm（可配置，60为固件微调安全前段，并未开放全120mm）；yaw±6°、累计纠偏90mm/最多32次。仍检查目标身份/过期/歧义/反馈/收敛/行程并失败STOP。没有修改升降电机转速。CLI参数与结果tuning明确记录；历史红色(1,4)px回归可直接接受而无多余运动。软件Mac579 passed/172 subtests、Pi32 passed、哈希一致；旧版Pi备份`backups/grasp_fast_20261120_6TSKUa/`。真实夹爪未实现，新精度/速度及三件整轮尚未验收，不以图片推断毫米容差。
+
+最新run6 test_id1795169240：用户按键后自动运行快参，黄色纠偏约11s后command8在前后轴动作中由主控报FAULT/fault1=ARM_WORK_MOTOR/active_axis2。目标yaw1563cdeg/机构5.21°、reach-2323cdeg/-7.298mm，实际reach-2176cdeg/-6.836mm，最后视觉误差(36,10)px；目标未触及Pi行程限幅。STOP后FAULT保持、origins=false、Z=0，没有PICK/下降、无完成颜色，试验进程已退出；不自动重试/重设原点。52字节ARM报告不含底层电机诊断，需电控查看`arm_motor_status[2].fault`、`arm_can_diag[2]`，暂不能区分驱动回复/CAN超时/电机状态原因。证据Mac `output/arm_three_color_20261120/arm_three_color_231_20261120_run6/`，Pi output同名目录（含result.json/events.jsonl）。
+
+保留两处对照证据：run4 test_id1795164193完成黄色，蓝色对齐误差(0,2)px并下降后，模拟GRIP_DONE时因抬升目标Z=+1cdeg超上限0报FAULT2/axis0；与所提供源码PICK保存带正偏差的实际反馈aligned_z、GRIP_DONE回该值而驱动严格拒绝正Z目标一致，最新版烧录源码未提供。run5 test_id1795164941黄/蓝完整通过（两次PICK前Z均0，未复现不等于修复），红色剩(1,4)px、下一目标reach=-25.266mm超旧25mm试验限幅而Pi主动STOP，未下降；此例促成本次快参调整。两轮证据均在上述Mac目录的对应run4/run5子目录和Pi output同名目录。早期run1完成黄色后等待蓝色期间主控重启/通信中断，不从旧会话自动续跑。
+
+## 最新静止对齐及下降通过（2026-11-20）
+
+用户称电控重新修改后要求重测，未提供这版新源码；不据此确认所有固件分支已修复。独立test_id1795162495：TEST_BEGIN约0.051s到WAIT_VISION，本轮未出现固定60mm后退；复用HSV/独立顶面/相机身份/每次7个稳定新帧，11次小步ALIGN从(590,450)收敛至参考(648,359)，约32.22s（含连续帧采样）。最终command12 ALIGNED/fault0/原点有效，机构yaw约-3.943°、reach约-21.499mm，Z=0。最后7帧x647—648/y359；保持约40秒后另7帧均(648,359)、主控仍ALIGNED。此为本次固定黄色物料的图像闭环对齐，不代表机械抓取毫米精度、动态转盘或多轮可靠性。证据Mac `output/arm_listen_20261120/arm_full_alignment_extended_1795162492/`，Pi output同名目录。试验总范围仍reach[-25,0]mm/yaw±6°、单步≤2.5mm/0.6°与收敛保护；整车turntable alignment配置未启用。
+
+用户接着明确要求测试下降。复查同一上下文/command12及7个新帧(648,359)后，仅发送PICK command13/reference12；固件目标-90000cdeg，约15.336s到WAIT_GRIP，实际Z=-90054cdeg，编码器换算下降100.06mm。旋转/前后反馈均保持原值，4次新状态确认无故障、原点有效；未发GRIP_DONE/FINISH/舵机指令、未抬升。结束时保持WAIT_GRIP低位供用户检查；真实高度是否合适及夹取成功均未确认。后续操作先核对此状态，不自动ZERO/重发PICK/假报抓取完成。Mac证据`output/arm_listen_20261120/arm_lower_aligned_1795162639/`，Pi output同名目录。仅部署忽略目录中的独立试验脚本，未改桌面软件、整车入口或雷达。
+
+## 云台后退60mm定位（2026-11-20）
+
+用户要求监听KEY记录原点后直接测试水平对齐，不下降。独占UART/desktop启动锁，复用物料相机；READY后静止新帧确认，TEST_BEGIN test_id1795161695准备拍照位耗时7.67s，前后反馈最低-60.251mm。此次后退发生在opcode6 PREPARING，尚未发送ALIGN；`car_code1 6/Core/Src/arm_work.c` begin_work固定调用pose_plan，仍包含CLEAR_REACH=-19098cdeg（60mm）。新版微调分支仅用于ALIGN，不能消除这一次拍照准备避让。
+
+到WAIT_VISION后7个稳定新帧黄色顶面中位(562,294)，参考(648,359)，误差(-86,-65)px；现有局部矩阵要求前伸，超过原点reach上限0，corrected_target拒绝，因此未发ALIGN/PICK/GRIP_DONE。STOP确认state13/fault4取消、origins=false；下一次运动须人工摆回后按KEY记录原点。证据Pi `output/arm_listen_alignment_1795161692/`，Mac `output/arm_listen_20261120/arm_listen_alignment_1795161692/`。此次不代表反馈容差补丁或自动对齐通过；下载目录源码仍为严格反馈行程检查，实机是否烧录补丁未确认。此前独立下降脚本已退出；未将下降尝试宣称成功。
+
+随后同日重测test_id1795161845：TEST_BEGIN仍后退60.254mm/7.666s；黄色稳定顶面(579,445)。ALIGN command2请求机构yaw=-0.5316°、reach=-2.3471mm，发送前反馈[-2,-3,+26]cdeg、目标[0,-159,-747]cdeg；按v6源码只有current_strict_travel失败，+26cdeg前后反馈约+0.08168mm超过严格0上限，其余同高度/步幅/安全姿态均通过。实机ALIGN active_axis0证实进入完整避让，程序在Z阶段即STOP，未等第二次后退；STOPPED/origins=false。未PICK。证据Mac `output/arm_listen_20261120/arm_listen_alignment_1795161842/`（Pi同名子目录）。反馈边界问题实测仍存在，需电控合入反馈容差补丁后再测，不宣称已修复或自动对齐通过。
+
+用户随后要求允许避让完整跑水平对齐。test_id1795162013完成3次ALIGN，黄色顶面(578,446)→(603,420)，参考(648,359)，误差(-70,+87)→(-45,+61)px，尚未对齐。首次ALIGN因反馈+47cdeg仍完整避让，后两次满足微调条件各约0.71s；旧试验reach[-8,0]mm限幅在实际reach约-7.047mm后拒绝下步并STOP，并非电控电机故障。随后为完整闭环试验保持每步≤2.5mm/0.6°并加入误差收敛、总时长/累计行程保护，测试总范围reach[-25,0]mm/yaw±6°（软件试验范围，非已标定全程），用户重新摆回按键。test_id1795162153在TEST_BEGIN尚未到WAIT_VISION时由固件报FAULT2/active_axis1：reach=-19150cdeg、clear=-19098，差52cdeg≈0.1634mm，重现yaw_clear_now原始50cdeg门限与arm_can量化补偿到位标准不一致。STOP后保持FAULT/origins=false；未进入本轮视觉对齐、未PICK、不自动复位重试。Mac证据`output/arm_listen_20261120/arm_full_alignment_1795162009/`和`arm_full_alignment_extended_1795162119/`，Pi为output同名目录。完整对齐未通过；需电控统一反馈容差后再测，不能以移动方向正确代替准确对齐。
+
+## 独立云台标定重试通过（2026-11-19）
+
+用户要求重试；只读确认READY/原点有效后，test_id1795096002按原固件速度完成TEST_BEGIN、基准、后退4mm、yaw±1°、每次回基准及yaw+0.5°/reach-2mm独立验证，最终FINISH回READY_LEAVE，fault0且原点有效。未修改固件容差，未推断上轮固件保护根因已修复。每点7个不同来源帧，固定黄色物料与固定拍照高度的静止采样成功。
+
+修正矩阵（像素误差→径向/切向mm）=[[0.000165174,-0.222586456],[0.220357759,-0.012505212]]，组合留出点预测误差1.1165px。基准(679,377)，后退点(678,359)，yaw+1°点(660,377)、yaw-1°点(697,377)，回基准偏差≤1px。完整数据Pi `output/arm_calibration_20261119_run2/`，并保存 `config/arm_mapping.local.json`；Mac已取回同名忽略证据目录。此结果仅覆盖固定高度、yaw±1°/reach[-4,0]mm局部映射，转盘动态、实际抓取、较大范围未验证。turntable alignment仍null，未据此自动启用整车动作。原夹爪参考点(648,359)保留，不将本轮基准位置冒充为对准参考。
+
+## 独立云台标定首次实测（2026-11-19，固件避让保护中断）
+
+用户提供 `/Users/jzxzhou/Downloads/car_code1 5/`，本版ARM_VISION_TEST_MODE=1新增opcode6 TEST_BEGIN、ARM_EVENT flags bit3。Pi已兼容6操作/新标志，六种payload与新客户端逐字节一致。只读确认后用户摆好并按键记录原点，READY、origins_valid=true，获用户确认收回60mm和小角度转动有空间后执行静止采样；用户授权测试标定，不涉及两舵机。底盘未运动。独立测试暂停chassis-button并持有desktop_remote启动锁，共用唯一UART和物料相机HTTP状态。
+
+新增tools/arm_calibrate.py，限定原点高度、yaw±1°、reach[-4,0]mm采样，实际编码器反馈换算位移、每点7个新帧/跨度至少0.6s/抖动≤3px、回基准复核及独立留出点；计算二维像素到径向/切向矩阵，失败发STOP并保留固件FAULT锁存。首次test_id1795096001，WAIT_VISION成功，基准实际reach+0.126mm，黄色顶面(643,379)；后退目标4mm、实际reach-3.911mm时顶面(643,363)，两点各7帧稳定。这只是一轴约4px/mm观察，不足以输出完整矩阵。物料参考像素仍是此前用户确认的(648,359)，本轮未重新宣称基准物料已对准。
+
+返回基准时command4在yaw避让检查触发state14 FAULT、fault2 ARM_WORK_POSE、active_axis1，原点失效。实际reach=-19150cdeg，避让目标-19098cdeg，误差52cdeg≈0.163mm，大于guard的50cdeg。arm_can.c到位检查额外加入半个输入脉冲与编码器量化补偿，arm_work.c yaw_clear_now只比较原始tolerance，两处标准不一致。源码未修改/烧录，未重设原点或重试动作。STOP请求后固件保留FAULT（Route_OnStop遇FAULT直接返回，之前fail已StopAll并清原点），查询确认仍FAULT、origins=false，路线EMPTY。待电控修复一致性并重新记录原点，再补旋转采样和回归验证。Pi日志 `output/arm_calibration_20261119_run1/`，源码备份 `backups/arm_calibration_20261119_KefguejK/`，Mac证据 `output/arm_calibration_20261119/`；软件范围545 passed/172 subtests。当前没有生成有效运动标定文件，turntable alignment仍null。
+
+## 转盘等待流程、Mac相机切换与标定（2026-11-19）
+
+用户要求任务码231按黄→蓝→红等待转盘目标进入夹爪下方再微调。新增TurntableWork接入常用按键入口，复用QR本轮绑定、唯一物料采集和云台闭环；默认真实到站等待指定颜色的新帧，去掉原料区2秒模拟WORK_DONE。当前Pi turntable_work已enabled，但alignment=null，检测到目标后明确calibration_required并保持静止，180秒站点超时按既有STOP处理；没有标定不会发ALIGN或伪造完成。已标定时支持三色逐个对齐的测试序列，结果physical_grasp_completed=false；两舵机后续实现。数字圆环站未标定时明确拒绝模拟放行。
+
+物料服务当前原图1280×720，接近窗口(480,240,320,240)、指定颜色唯一选择，初始黄色2；目标切换通过本机POST /material-target，切换会清旧目标并拒绝旧代次在途结果。用户将黄色放到实际夹取位置后10个来源帧顶面中心中位数(648,359)，x范围648—649、y359；保存为当前姿态候选参考。用户测量旋转轴中心至抓取中心水平距离23cm=230mm，已记录；运动映射、拍照姿态及安全行程尚未标定。只读云台查询成功时状态NEED_ORIGIN、origins_valid=false。本版ALIGN仅在路线WAIT_WORK中可用，待机点动仅有Keil arm_work_debug入口；用户拟让电控开放串口待机查询/单轴绝对运动/回拍照位/停止接口，之后继续小步采样，尚未运动标定或实机自动对齐。
+
+Mac小车调试台新增“相机与物料对齐”页，可切换物料和扫码相机，显示接近窗口/顶面中心/参考点/任务顺序。用户明确桌面软件只在Mac更新；HTML随Mac app打包，Pi仅camera-console本机8091数据/帧与扫码采集租用接口。扫码预览共用QRStationWork采集，不解码；路线预热前同步释放查看占用，扫码完成后关闭，关闭/切页/8秒无查看心跳会释放。真机已验证手动预览→释放→路线预热→关闭，未发车。独立雷达未修改。
+
+Pi备份/部署记录 `backups/turntable_console_20261119_s8FTwUu6/`，Mac证据 `output/turntable_console_20261119/`。Mac全量540 passed、172 subtests，窗口连接两种真实相机画面已检查，840宽页面scrollWidth与innerWidth均802。软件验证不代表转盘动态抓取验收。机械标定仍待电控待机运动接口、有效原点和实测范围。
+
+## 双相机视觉部署（2026-11-19）
+
+用户明确本阶段只做云台对齐，夹爪和料盘两个舵机后续实现。SSH恢复，Pi检查时IP172.16.25.7。已确认新物料相机 Generic 200901010001 by-id 指向 video2，车头 icSpring 指向 video0；两者独立。新增并部署 `deploy/material-vision.service` 和配置样例，实际配置 `config/material_vision.local.yaml` 只在Pi保存且被忽略。服务已启用 user systemd 开机启动，当前PID2064、NRestarts=0（检查时快照）。
+
+物料服务8090独占Generic相机，同一FrameStreamer帧源运行HSV、top_face、中央窗口(480,240,320,240)以及既有Hough色环检测；关闭本相机二维码、转盘门控、去畸变及串口。二维码仍走既有按键扫码进程，不占用另一相机。色环位置数字未启用，ring_no不是可靠放置位置；云台对齐仍需要拍照姿态、参考像素、半径/尺度/行程及环位置识别标定，实际arm_alignment未启用。
+
+同步55个相机/协议/对齐和必要测试入口文件至Pi并逐文件SHA256一致；旧文件与部署清单在 `backups/material_camera_20261119_t7zzmSKH/`。核对WAIT_CONTROLLER后有序重启按键服务，未发车或云台运动。独立雷达服务未修改。Mac520 passed/172 subtests，Pi新增协议/对齐相关40 passed；Pi40次静止HTTP抽样均采集/物料/色环观测有效、不同来源帧，累计错误0。真实预览看到夹爪和外围彩色物料、中央为空，输出无目标符合当时画面；实际物料顶面、色环和移出清空验收等待摆放，未宣称识别准确率或自动对齐完成。Mac8090 SSH隧道已建立，现场图片/状态及清单在忽略目录 `output/material_camera_deploy_20261119/`。检查时电控仍WAIT_CONTROLLER、监看无近期回复，待恢复后才能做云台实机联调。
+
+## 新 CAN 机械臂固件接入（2026-11-19，实机联调待连接）
+
+用户提供 `/Users/jzxzhou/Downloads/car_code1 3/` 并明确已烧录。只读核对 arm_work.h/c、arm_config.h、route_client.py 和调试说明：电机 ID5/6/7 改用 CAN1，Pi 的 UART 0x31/0x32/0x83 与 32/52 字节格式不变，五种操作的 payload 与新客户端逐字节一致。原点为最高/最前，正 Z 上升、正 yaw 右转、正 reach 前伸，Z/reach 上限0；负向总行程和 CLEAR_REACH=0 等避让参数仍为占位，不能当作实测标定。
+
+Pi 新增 DEBUG_MOVING(15)、DEBUG_HOLD(16) 解析；对齐时遇外部调试立即失败，preflight 输出实际状态/故障/原点标志。electrical_comm 新增只读 arm-status 查询（同一连接、无运动请求）。新增4项回归，软件范围520 passed、172 subtests passed。未启用抓放或更改真实标定。
+
+本版 arm_work.h/c 仍明确缺少夹爪 PWM/开合与车载料盘转运，WAIT_GRIP 仅接受外部真实夹取完成后的 GRIP_DONE；PICKED 仅为抬升到位。放置/松爪也无现成命令。用户随后明确夹爪与料盘两个舵机暂不实现，本阶段仅做视觉和云台对齐。SSH pi-vision 超时，cuiguo.local 无法解析；已向用户索取当前 IP 与实际夹爪控制方式，尚未部署或完成硬件联调。
+
+## 无引用代码清理（2026-11-18，本机完成）
+
+核对源码、配置、部署入口与测试引用后，删除三份无当前调用者的模块：`pi_vision/state_machine.py`（早期空壳状态机，现任务流程使用 mission.py）、`pi_vision/plane_calib.py` 和 `pi_vision/world_map.py`（配套 calibrate_plane 工具已不存在，当前夹爪对齐使用独立标定）。共删除 244 行；README 已去掉旧状态机引用。旧配置的 world_homography 字段继续兼容读取/保存。移除前源码及哈希清单保存在忽略目录 `output/code_cleanup_20261118/`。本次未删除测试，516 passed、172 subtests passed；stream、按键、路线与通信监看帮助入口、JS 检查通过。本次变更仅在 Mac，未部署树莓派。
+
+## 工程目录整理（2026-11-18，本机完成）
+
+根目录使用 README 作为导航。使用说明迁至 `docs/guides/`，接口和设计迁至 `docs/design/`；旧 README 的详细视觉内容保存在 `docs/guides/VISION.md`。测试按 electrical、vision、mission、desktop、perception、lidar 分组，独立 `tests/test_lidar.py` 保留原路径及原排除命令；pytest 默认仅发现 tests 内的测试。常用软件测试命令仍为 `python3 -m pytest -q tests --ignore=tests/test_lidar.py`，JS 检查改为 `node tests/lidar/test_lidar_display.js`。
+
+历史更新包、恢复包、浏览器记录、调查与原本地笔记集中到被忽略的 `archive/`，未删除。迁移清单为 `output/project_organization_20261118/moves.json`。源码包、tools 命令、systemd、实际配置及采集输出路径沿用现状。本次只整理 Mac 工作区，树莓派连接超时，未同步本次目录变化。整理后软件范围 516 passed、172 subtests passed，JS 检查通过，文档相对链接均可解析。
+
+## 原料区 14 格雷达回波（2026-11-18，已部署）
+
+按用户确认，原料台可能突出至 14 格。两启停区统一在场地坐标分格后排除该格的动态回波投票，地图、点到道路的封边和八段规划共用此结果。原始点云保留；真实物体落入 14 格也会被同样忽略。Pi 项目及独立雷达运行目录已同步。现场静止 15 圈每圈仍有 6～7 个点落在 14 格，14 格占据票为零，采样末帧占据 5、13；用该快照试算八段均有路径，未发车。Pi 备份及验证记录在 `~/competition_vision/backups/lidar14_L5BBiFcC/`。
+
+## 三轴夹爪视觉对齐代码接入（2026-11-18，尚未部署/标定）
+
+用户确认相机固定在夹爪正上方、随夹爪一起运动，粗加工/暂存时底盘不动；机构为旋转＋上下＋前后。提供新电控源码 `/Users/jzxzhou/Downloads/car_code1 2/`，已只读核对README_arm、arm_work/arm_config和Python客户端，未修改或烧录它。用户明确新固件烧录、轴方向/行程/拍照姿态实测、物料相机接入均尚未完成。本轮SSH到pi-vision超时，当前设备/服务状态未确认；本地新代码尚未部署，勿把旧READY快照当现状。
+
+已新增 `pi_vision/arm_protocol.py`、`arm_alignment.py`、`tools/arm_alignment_work.py` 并接入常用chassis_button_service/run_closed_loop；0x31/0x32/0x83复用原ElectricalClient单UART，ARM52字节与底盘36字节状态分别解析。上下每圈40mm（9电机度/mm）、前后每圈113.1mm、机构yaw乘3；另需实测三轴符号、原点到夹爪半径、相机参考像素、观察高度/目标平面与径向/切向像素校正矩阵。按当前伸出半径做极坐标旋转/伸缩修正，只调整水平轴，不用猜测比例或主动下降。保留参数/行程/步数/总时长限制，停稳后新帧和连续确认；对齐失败沿用路线STOP，无2秒回退。原始传动比不是视觉标定。
+
+目前仅实现明确标注的 `alignment_only` 测试：每个受管站102..107对齐一个配置目标→FINISH→等待READY_LEAVE→测试WORK_DONE；结果明确physical_grasp_completed/place_completed=false。未实现三件完整抓放、夹爪开合、料盘转运、同色底层/上层码垛定位或实际成功检测，不宣称整轮比赛逻辑完成。电控本身也未实现夹爪/料盘；PICKED仅代表外部确认后抬升。协议提供PICK/GRIP_DONE接口但对齐测试不调用；原点只允许人工摆正后显式记录，不自动ZERO。电控ARM_PICK_DROP_CDEG=9000按本次40mm/圈是10mm，固件注释/README存在旧占位值，不照注释推断实测行程。
+
+`config/arm_alignment.example.json` 默认enabled=false、measured=false、关键参数null；仅显式启用且校验/人工原点与视觉源通过后才工作，未配置时旧二维码/驻留测试保留。相机复用FrameStreamer/state，新增camera_source身份校验；物料要求HSV+top_face+中央单目标，环用position_id 1/2/3而非占位ring_no。stream/ROS入口共享既有圆环配置，stream新增显式ring-backend/ring-roi/position-digits/position-orientation参数，未改颜色阈值/识别算法。真实印刷环/转角/遮挡仍待实测，源码与用户未测参数不能充当启用授权。
+
+软件范围全量514 passed、172 subtests passed；新增40项覆盖传动与半径换算、5种协议操作/ACK事件交错/去重重试、标定与新帧/身份/行程边界、对齐再观测和收回门、无夹取成功冒充、整条测试路线的六站对齐替代驻留与失败STOP；5种操作payload已与用户新客户端逐字节对照一致。stream --help和diff检查通过；无本轮相机/串口/电机实机证据。下一步先烧录并逐轴确认方向/行程/避让姿态、安装物料相机并标定，再部署启用做静止对齐，最后再接真实抓放。
+
+## 按键测试扫码相机预热与关闭（2026-11-18）
+
+常用 `chassis-button.service` 已接入真实二维码；本机 `qr_station.camera` 为 `/dev/v4l/by-id/usb-icSpring_icspring_camera-video-index0`（检查时video0，video1是同一设备另一节点）。收到本轮新按键后由唯一子进程提前打开相机，规划/行驶期间持续读帧但不解码、不存任务码；上传/START前验证采集心跳。work_id101、WAIT_WORK/phase4且位置/航向合格后才发扫码边界，丢弃后续4帧，再接受边界之后开始读取的不同帧。沿用QRDetector和严格合法性校验，至少3帧、确认跨度0.2秒、最大帧间隔1秒；15秒到站超时，父进程也限制阻塞。时间戳是单调时钟的软件读帧时间，非硬件曝光时间。每轮新建会话，无旧任务码回退。扫码进程先释放相机再回报成功，随后发送本站WORK_DONE；超时/故障/取消/规划失败也关闭，下一轮新按键才再预热，READY时相机不占用。其他站仍2秒模拟驻留；颜色/色环/抓放/显示/计数未接入，正式后端未变。详见CHASSIS_BUTTON_START.md。
+
+Pi原来缺少zxing-cpp，仅用OpenCV时，完整屏幕码也曾检出轮廓但解码失败。已安装zxing-cpp 3.1.1的CPython3.12/aarch64 wheel至cuiguo用户site-packages；安装记录/wheel在Pi output，依赖列入pyproject.toml的qr可选项。旧版到站冷开相机实测首帧约902ms、解码每帧约18ms、含确认共1.217秒。新版真实相机静止连续3轮均确认 `156+123+516+231`，从模拟到站边界至父进程返回结果分别0.871/0.868/0.891秒（含丢帧、确认及关闭回收）；预热另约1.95—2.08秒，安排在按键后的新扫描规划期间。每轮扫码后子进程已退出且fuser无相机占用。仅为固定屏幕码静止测试，未验整车到站、其他摆放/光照或长期运行。
+
+Mac范围全量474 passed、172 subtests passed；Pi相关91 passed，部署文件SHA256一致。测试覆盖预热不解码、边界/队列帧和重复帧排除、原连续确认、晚到结果拒绝、规划失败/超时/进程阻塞回收等。部署前核对READY，备份 `/home/cuiguo/competition_vision/backups/qr_prewarm_20261118_125654/before.tar.gz`；重启后active/READY、相机已关闭（检查时快照），未触发发车、未修改雷达模块。静止证据Pi `output/qr_prewarm_static_20261118.json`，Mac `output/qr_station_20261118/`（忽略）。
+
+## Mac桌面调试台（2026-11-07）
+
+已安装 `/Users/jzxzhou/Applications/小车调试台.app`，桌面同名.app为符号链接。PyQt6+QtWebEngine复用雷达/通讯页面，默认自动通过已有pi-vision SSH密钥连接，支持IP覆盖、独立动态隧道端口、断线重试与日志保存。远端启动脚本随SSH stdin发送，复用正式/测试UART服务，均未活动时start现有chassis-button待机，再确保监看与雷达后端存在。连接会启用实体按键待机，关闭软件只结束本机SSH连接，Pi服务继续运行。
+源码 `tools/robot_desktop.py`、`desktop_remote.py`、`build_robot_desktop.py`，pyproject新增desktop可选依赖。独立构建环境 `output/desktop_build/venv`；构建输出在 `~/Library/Caches/CompetitionRobot/desktop_build/dist`，避免Documents文件提供程序附加FinderInfo破坏签名。应用已本地ad-hoc签名且codesign verify通过。12项远端启动/监看测试通过，Qt窗口、SSH失败重试/断开、打包后两个内嵌页面加载通过。当前Pi SSH超时且cuiguo.local无法解析，尚未完成现场一键连接与后端启动验收，不能宣称网络卡顿已解决。
+
+## 雷达预览卡顿排查（2026-11-05）
+
+雷达本机持续6Hz、约500余点，/state本机约8～90ms；Mac端多次5～8秒超时，定向ping链路本地IPv6往返约2.6秒。已部署lidar_view.py/html/display.js：HTTP gzip、后台标签页停轮询、浏览器超时8秒；仅屏幕灰色旧回波可保留15秒，实时/运动证据1秒有效期未变。36项Python相关测试及JS显示测试通过；原3文件备份在Pi独立雷达目录before_preview_network_20261105_194418。仅在控制器EMPTY、服务READY时重启独立雷达预览为PID6652，未重启底盘服务。
+试验IPv4(设备现场报告172.16.24.76)和IPQoS=none未恢复稳定低延迟；临时8876隧道已无监听。后续SSH也超时，未完成页面实时验收，等待用户选择同一手机热点/网线/只能现场Wi-Fi，勿把页面优化当作网络故障已解决。
+
+## 通信监看页面（2026-11-05）
+
+新增 `tools/communication_monitor.py/.html`，独立只读HTTP服务8767，复用按键服务的wire.jsonl/status.json，不打开串口、不操作车辆；可选测试/正式日志源，显示解码报文、状态、原始HEX、搜索及下载。`deploy/communication-monitor.service` 已准备，默认从两种本机配置读取output_root。27项监看/协议测试通过，真实历史日志及桌面/手机浏览器交互已验证。现已部署Pi并启用用户级 communication-monitor.service 开机启动；Mac8767历史进程已退出，改为SSH隧道接Pi实时页。接口historical=false，3秒内日志ID及TX/RX时间递增、controller_recent=true、后台READY；不重启或操作车辆控制服务。下次Mac隧道丢失需重连8767。
+
+## 区2转向方向复测配置（2026-11-03）
+
+区1实车KEY1路线route_id 1793711710已20点DONE、8站完成、fault=0。之后实体KEY0被待机服务接收并完成扫描/规划准备，但两次在上传/START前因工作站车体转向扫掠与障碍/禁行矩形相交而拒绝：pose约(2050,1200)mm/yaw−68°，冲突框x=1850..2400、y=550..1000mm；未发路线/START，车辆未移动。曾有一次待机通信重建，随后新的KEY0也被接收并以相同几何错误失败，非本次最终失败原因。
+
+按用户要求，底盘纯测试的 `test_ignore_turn_obstacles` 改为本机profile持续开关，不再在首次选区后自动清除。开启时仅跳过车体转向扫掠与占据/禁行区的相交检查；场地边界、平移外廓、规划中心线/占据路径、姿态、控制器故障和超时保护仍启用。正式比赛入口仍拒绝此测试开关。测试代码/文档已部署到Pi并SHA256一致，Pi两区私有profile均设为true；备份在 `/home/cuiguo/competition_vision/backups/turn_override_20261103/`。Mac与Pi相关测试各82项通过。服务重启后短时无STATUS回复，后来恢复READY；两次KEY0各触发一条19点新路线（route_id `1793712711`、`1793712854`），上传与START均获接受。两次START后约0.16秒、point_index仍为0时，STM32都回报 `state=FAULT`、`fault=1`、`chassis_fault=3`、`fault_address=4`，估计位置仍为起点 `(150,2250)`；Pi两次STOP均获确认。两次之间Pi记录到STATUS无匹配回复，随后READY tick从126921回退至1091，符合控制器重启/计时器回退迹象，但重启原因未知。最新服务状态为WAIT_CONTROLLER，近期原始线上仍持续收到state=FAULT的合法STATUS帧；这是电控故障态，不等于当前串口无RX。当前电控源码目录已不存在，现有协议文档没有该版本chassis_fault枚举，故障码语义未确认；不能归因为具体电机/供电问题。暂不再START，需先按当前固件故障码表查明并清除fault。
+
+## 工作区到站转向适配（2026-11-03，最新）
+
+按STM32新规则，Pi路线现有本地开关 `work_heading_mode_enabled`；测试示例和Pi两区本机profile已启用，串口二进制V1格式/yaw字段/CRC不变。已知work_id 101..108的工作航向相对各自路线 initial_pose 绝对计算，行驶保持前一站朝向、到站后主控转向；日志/HTML区分报文yaw、行驶车头和工作航向。RUNNING/phase6只轮询，70秒单次转向上限；WAIT_WORK/phase4验证路线/点/位置/实际工作航向/故障，保留原STOP保护。正式入口的on_work每站只启动一次，之后由可选poll_work查询；WORK_DONE检查ACK和路线/点字段。
+
+车体矩形外廓审核现在检查站间平移与工作站旋转扫掠，保留原中心线障碍检查。保守覆盖方法、偏角表和限制见 `docs/guides/WORK_AREA_HEADING.md`。对Pi保存的route 1793707732旧20点计划回放显示：工作点1二维码正确回报 `(350,1197,179.16°)` 会通过姿态容差；但旧计划的原料第一次180°转向扫掠与历史占据格13相交，新几何审核会拒绝上传。该障碍来自旧快照，不代表当前现场；下一轮需按新扫描重新规划/审核，不能复用旧计划证明净空。
+
+Mac项目全量：`python3 -m pytest -q tests --ignore=tests/test_lidar.py`，433 passed、172 subtests passed。Pi本次变更相关测试121 passed；Pi历史全量测试无法收集，包含`tests/._test_chassis_route_test.py`重复临时文件且旧`test_chassis_button_service.py`引用已删除RoundLatch接口，与本次代码无关。文件已同步Pi并核对关键SHA256；备份 `/home/cuiguo/competition_vision/backups/work_heading_20261103/before.tar.gz`。已设置Pi两区profile开关true并重启底盘待机服务；当前服务active，但状态为`WAIT_CONTROLLER`，说明控制器故障/STOP状态尚未重新READY。历史route 1793707732已被旧逻辑STOP并确认STOPPED；部署期间没有重新上传、START或运动。competition-button服务保持inactive，未配置正式后端。需要电控清除/复位当前停止状态，再由新按键触发新扫描规划；重新规划若被几何拒绝，应查看新route的冲突点，不要用旧路线绕过校验。
 
 ## 移除所有按键启动锁（2026-11-03，最新）
 
@@ -178,7 +351,7 @@ STM32上电后，20:06:58首次STATUS得到匹配ACK OK、EMPTY/无故障上报�
 
 ## 最新交接：新版按键协议与纯底盘测试（2026-11-02）
 
-用户提供新版 `/Users/jzxzhou/Downloads/car_code1 2/`，要求测试和通用正式接口都接KEY0/KEY1选区并部署Pi，准备联调。用户选择 **USB转TTL**，不用修改GPIO ttyAMA0控制台。先读 `ELECTRICAL_COMMUNICATION.md`、`CHASSIS_ROUTE_TEST.md`。旧拟议nonce/boot_id/revision协议已完全撤下，不兼容新版命令含义。
+用户提供新版 `/Users/jzxzhou/Downloads/car_code1 2/`，要求测试和通用正式接口都接KEY0/KEY1选区并部署Pi，准备联调。用户选择 **USB转TTL**，不用修改GPIO ttyAMA0控制台。先读 `docs/guides/ELECTRICAL_COMMUNICATION.md`、`docs/guides/CHASSIS_ROUTE_TEST.md`。旧拟议nonce/boot_id/revision协议已完全撤下，不兼容新版命令含义。
 
 新版实际协议：KEY1(PA15)→启停区1、KEY0(PC5)→启停区2；0x82 START_AREA是12字节request_id/tick/area/key/reserved，Pi以0x15 AREA_ACK确认，0x16 UPLOAD_FOR_AREA携带request_id＋路线内容。最大payload1304/整帧1314，仍64点。按键重发去重、扫描中换区丢旧结果、绑定上传；KEY0在活动态停车，KEY1在活动态忽略。按住任一键禁止START，Pi最多等10秒松键/IMU就绪。主控重启后需重建Pi Client重新按键；无boot_id，不声称检测所有快速掉电重启。
 
@@ -200,7 +373,7 @@ Mac全套 `346 passed, 172 subtests passed`；通讯/按键/测试相关53项。
 
 用户最新要求：助手直接搭任务框架，不再安排反复拿放物料、扫码或网页显示。保留现场调参、坐标标定、真实动作反馈接口；定位精调等真实安装后再做，不为桌面 3 px 目标改阈值或冻结坐标。朋友截图仅作思路参考，不要求获取对方完整代码才能继续本项目。
 
-推进计划见 `DEVELOPMENT_PLAN.md`，视觉顺序为任务调度核心/模拟 → ROS 2 收发 → 真实视觉结果与电控后端 → 固定安装标定 → 场地与整车验收。用户报告电机/电控进度为零，不假定底盘或机械臂能执行；先完成独立可运行的软件主线。2026-11-01 用户另行明确要求雷达实时观察和场地避障参考实现，已启动独立雷达观察工具，见文末。仍保留漏检、额外颜色和 USB 掉线等未解决事实，不将模拟通过当作实车通过。
+推进计划见 `docs/design/DEVELOPMENT_PLAN.md`，视觉顺序为任务调度核心/模拟 → ROS 2 收发 → 真实视觉结果与电控后端 → 固定安装标定 → 场地与整车验收。用户报告电机/电控进度为零，不假定底盘或机械臂能执行；先完成独立可运行的软件主线。2026-11-01 用户另行明确要求雷达实时观察和场地避障参考实现，已启动独立雷达观察工具，见文末。仍保留漏检、额外颜色和 USB 掉线等未解决事实，不将模拟通过当作实车通过。
 
 相机安装位置尚未固定、物料摆放在变化。此前静止抽样只作诊断，未隔离相机移动/视角/摆放影响，不能作算法定位稳定性验收，也不能确认全部问题均由摆放导致。暂停重复摆放和像素精调；时效/有效性语义保留，固定安装后再做精度与机械标定；这些未验项不阻塞当前任务框架。
 
@@ -211,36 +384,36 @@ Mac全套 `346 passed, 172 subtests passed`；通讯/按键/测试相关53项。
 - 新增 `pi_vision/mission.py`：严格任务码确认、按容量 1/2/3 编排两批任务、逐动作反馈推进、托盘占用和计数、第二批同色码垛位置映射、取消/故障停止、过期/重复/迟到结果拒绝。既有 `state_machine.py` 是视觉模式切换器，保留不改；新调度层不直接接旧串口，不开启硬件。
 - 新增 `pi_vision/mission_demo.py`：无需相机/电控完整模拟，示例 `python3 -m pi_vision.mission_demo --capacity 3`；输出明确标记 `software_simulation_only`。示例完整计划为 59 个步骤（扫码另计），容量 1 为 75 步；模拟抓取装车 12、放置 12、码垛 3，不是官方得分或真实成功次数。
 - 新增 `pi_vision/mission_ros.py`：schema 1 JSON 的 ROS 2 任务调度节点，指令/反馈/状态/控制接口；模拟主题 `mission_sim/*` 与非模拟 `mission/*` 隔离，默认不自动启动。不是已接相机的 ROS 视觉节点，也不是电控驱动；此次没有推翻或接管下文已有 STM32 主导方案。任务计划可作主控实现的可执行参考，最终只选一个流程所有者。
-- 接口与运行说明：`MISSION_FRAMEWORK.md`；新增 `tools/mission_ros_smoke.py` 可用真实 ROS 2 pub/sub 模拟后端跑通流程，不访问相机/串口/电机。位置都是符号目标，无编造地图、毫米距离或标定值。真实后端必须拒绝未标定/过期目标，并独立负责本地停机保护。
-- 新增 `tests/test_mission_framework.py`，覆盖全部三色组合与容量、两批/码垛语义、确认和去重、目标有效性、反馈和计数、超时/取消/停止确认、相机会话变化、模拟与真实隔离。Mac 视觉范围全套 `152 passed, 172 subtests passed`；Pi `151 passed, 1 skipped`（缺少 Node.js 的网页 JS 模拟，在 Mac 已执行）。硬件未接入项明确后置，不继续安排人工逐项验收作为门槛。
+- 接口与运行说明：`docs/design/MISSION_FRAMEWORK.md`；新增 `tools/mission_ros_smoke.py` 可用真实 ROS 2 pub/sub 模拟后端跑通流程，不访问相机/串口/电机。位置都是符号目标，无编造地图、毫米距离或标定值。真实后端必须拒绝未标定/过期目标，并独立负责本地停机保护。
+- 新增 `tests/mission/test_mission_framework.py`，覆盖全部三色组合与容量、两批/码垛语义、确认和去重、目标有效性、反馈和计数、超时/取消/停止确认、相机会话变化、模拟与真实隔离。Mac 视觉范围全套 `152 passed, 172 subtests passed`；Pi `151 passed, 1 skipped`（缺少 Node.js 的网页 JS 模拟，在 Mac 已执行）。硬件未接入项明确后置，不继续安排人工逐项验收作为门槛。
 - 已在 Pi 的 ROS 2 Jazzy 通过真正的指令/反馈/状态主题进行纯模拟：正常例收到 60 条命令（扫码＋59 步），最终 completed，模拟计数抓取 12/放置 12/码垛 3、托盘空；抓取失败例收到 6 条命令，最终 fault，停止反馈确认，未计任何抓放成功。证据 `output/material_diagnostics/mission_framework_20261031_Al67eI/normal.json`、`failure.json` 和对应日志。测试进程用独立 ROS domain 73、仅本机发现，未启相机/网页/串口/电机，结束后退出，不留后台任务节点；不代表真实抓放或整车通过。
 
 ## 真实视觉 ROS 2 后端（2026-10-31 已部署）
 
-- 新增 `vision_backend.py`（请求/观测适配）、`vision_ros.py`（ROS 2 节点）、`tools/vision_ros_smoke.py`（有界检查）、`tests/test_vision_backend.py`。复用既有 FrameStreamer 和 HSV；stream 仅新增默认开启的 `preview_enabled`，此后端关闭预览绘制及编码，无网页/串口/动作端。物理相机一个采集入口，依次承担扫码与物料角色；双摄尚未接入。
+- 新增 `vision_backend.py`（请求/观测适配）、`vision_ros.py`（ROS 2 节点）、`tools/vision_ros_smoke.py`（有界检查）、`tests/vision/test_vision_backend.py`。复用既有 FrameStreamer 和 HSV；stream 仅新增默认开启的 `preview_enabled`，此后端关闭预览绘制及编码，无网页/串口/动作端。物理相机一个采集入口，依次承担扫码与物料角色；双摄尚未接入。
 - `mission/command` → `mission/feedback`，只接真实模式 schema 1 请求；支持 `read_task` 新帧候选和原料区 `scan_material` 的指定颜色。保留原图坐标、框中心点定义、来源帧/会话、主机读帧完成时间和 HSV 哈希。空目标、多目标歧义、请求前旧帧、重复/过期指令、处理/相机故障均不伪装成功。粗加工重抓和 `locate_position` 仍要求位置身份；新增可选 `NumberedRingDetector` 环内数字模板，必须同时显式提供 `--position-digits --position-orientation`，否则仍失败关闭。
 - PDF 平面图（T 第 5 页，A 第 20 页）给出 `580×150 mm` 长条、三目标沿长边排列且两端间距 `300 mm`；每个目标含 1—5 号同心评分环和中心位置数字，图上数字并非统一朝向。ICAROB2024 论文的相关方法是 HSV/二值形态处理后筛轮廓并拟合最小外接圆。本实现沿用现有多同心轮候选检测，在数字裁剪中先去除长横/纵尺寸线，再逐点比较四向模板；位置数字与评分环号分开，逐点输出位置号、环中心候选、环半径和数字方向。ROS 仍要求至少 3 个新鲜帧且跨度达到 0.2 秒。Mac/Pi 合成 PDF 布局场景能识别 3/2/1（含 180/180/0 度方向），缺字/重复仍无效；该几何测试不代表真实打印字体、透视、地面反光或实物验收。
 - 物料追踪此前未实现：`MaterialStability` 仅用于短暂遮挡时维持串口上报中心，不提供跨帧身份。新增 `MaterialTracker` 按颜色、帧间位移和时间间隔做保守关联，并在 `/state` 与 ROS 目标中输出服务会话内的 `track_id`/`tracking_status`。短时遮挡期间 ID 可保留，但空帧目标列表仍为空且旧坐标不复用；超时、颜色变化或关联歧义会结束旧 ID。位置和物料坐标目前均为左上原点的原图像素，`metric_coordinates_valid=false`、`calibration_required=true`；没有输出/伪造毫米坐标或机械抓取点。
 - 停止或后续动作命令关闭识别，但不发送整车 `stopped=true`；整车停止仍由动作端负责。此视觉后端不启动任务主控，不决定 STM32/树莓派哪个拥有整车流程；局部对准软件见下一节，真实坐标标定和机械动作仍未接入。节点启动后持续采集、算法按请求启停，退出释放相机；不能与网页服务或 qr_check 同开。
 - Mac 全部视觉范围测试 `177 passed, 172 subtests passed`；Pi `176 passed, 1 skipped`，跳过缺少 Node.js 的网页 JS 模拟（已在 Mac 执行）。生成图像经真实检测器/采集线程/ROS 收发：物料 10 条观测、二维码 13 条，均满足工具检查；不属于真实场景识别验收。
 - Pi 真实相机 ROS 观测：物料约 5 秒 17 条观测，包含 ok/no_target，采集 49 帧、错误 0；未核对当前物料真值，不能给出正确率。扫码约 5 秒 8 条 no_target，采集错误 0、无任务码，未安排用户展示码，因此仅确认空观测通路，不能算本轮合法码识别成功。两个检查均无 JPEG、停止后算法全关，进程退出后 fuser 确认相机释放；无后台节点遗留。
-- 上述检查使用独立 ROS domain 74、LOCALHOST 发现，没有运行任务调度或动作后端；生成/真实证据分别在 Pi `output/material_diagnostics/vision_ros_20261031_N283rO/` 的 `generated_material.json`、`generated_qr.json`、`live_material.json`、`live_qr.json` 及日志。该目录被 Git 忽略。部署前核对 Pi 原 stream 与 Mac 改前 SHA256 完全相同，备份 `backups/vision_ros_20261031_qB4ucB/before_stream.tar`，不覆盖其他工作区改动。启动说明见 `MISSION_FRAMEWORK.md`。
+- 上述检查使用独立 ROS domain 74、LOCALHOST 发现，没有运行任务调度或动作后端；生成/真实证据分别在 Pi `output/material_diagnostics/vision_ros_20261031_N283rO/` 的 `generated_material.json`、`generated_qr.json`、`live_material.json`、`live_qr.json` 及日志。该目录被 Git 忽略。部署前核对 Pi 原 stream 与 Mac 改前 SHA256 完全相同，备份 `backups/vision_ros_20261031_qB4ucB/before_stream.tar`，不覆盖其他工作区改动。启动说明见 `docs/design/MISSION_FRAMEWORK.md`。
 - 独立 CLI 另做 3 秒启动/SIGTERM 退出检查：日志出现节点就绪，外层 timeout 预期返回 124，相机释放，无相关后台 Python 进程；日志 `cli_shutdown.log`。当前节点未常驻，不占相机。完整机械/导航后端尚未存在，不启动真实任务调度去等待虚假动作反馈。
 
 ## 局部对准软件（2026-10-31 已部署）
 
-- 新增 `alignment.py`、`alignment_demo.py`、`alignment_ros.py`、`tools/alignment_ros_smoke.py`、`tests/test_alignment.py`。流程为固定观察姿态请求→动作端确认停稳→等待稳定时间→新帧观测→限幅修正→停稳反馈→重新观测，容差内连续新帧且满足时间跨度才 aligned，来源过期后变 expired 并清空目标。当前仅支持原料区指定颜色，独立于整轮任务，不自动替换 STM32 主控或任务调度器。
+- 新增 `alignment.py`、`alignment_demo.py`、`alignment_ros.py`、`tools/alignment_ros_smoke.py`、`tests/mission/test_alignment.py`。流程为固定观察姿态请求→动作端确认停稳→等待稳定时间→新帧观测→限幅修正→停稳反馈→重新观测，容差内连续新帧且满足时间跨度才 aligned，来源过期后变 expired 并清空目标。当前仅支持原料区指定颜色，独立于整轮任务，不自动替换 STM32 主控或任务调度器。
 - 标定绑定相机/原图尺寸/点定义/HSV 哈希/观察姿态/平面和本车局部像素误差到动作 X/Y 的 2×2 映射。真实模式缺标定拒绝 start，模拟标定与真实模式严格隔离；本轮没有生成本车真实标定或照抄截图比例。修正请求附来源及失效期限，实际动作端须在执行前检查期限和标定。默认 3 px、单步 10 mm 等仅为软件可配预算，未验证为本车可用值。
 - 独立主题 `alignment[_sim]/control`、`vision_command/feedback`、`motion_command/feedback`、`status`；视觉子协议兼容现有后端，未来通过重映射复用唯一相机，不另开采集。动作端接口 `hold_observation_pose/adjust_xy/stop` 仍待真实驱动。丢目标/歧义/标定不匹配/超时/预算耗尽请求停止；停止未确认保留故障且禁止重新开始，ACK 不等于完成，不盲目重发修正。没有通过对准模块生成抓放成功计数。
 - Mac 全部视觉范围测试 `204 passed, 172 subtests passed`；Pi `203 passed, 1 skipped`，跳过仍为网页 JS 模拟。测试包括真实视觉适配器协议联通（假数据，无硬件）、旧帧/高帧率连续确认、修正限幅、累计/次数预算、停稳后帧下限、相机会话变化和停止未确认阻止重启。
 - Pi ROS 2 真正 pub/sub 的纯模拟正常例：2 次修正后 aligned，stop_confirmed=true；target_lost、motion_timeout 均 fault 并确认停止；stop_timeout 为 fault、stop_confirmed=false。证据 `output/material_diagnostics/alignment_ros_20261031_UyW7Yq/` 下 `normal.json`、`target_lost.json`、`motion_timeout.json`、`stop_timeout.json` 及日志。使用独立 domain 75、LOCALHOST，仅模拟主题，无相机/串口/电机/雷达。结束后无相关后台 Python 进程或相机占用。
-- 说明见 `ALIGNMENT_INTERFACE.md`。此阶段证明软件流程和 ROS 收发，不代表本车运动收敛、抓放精度或整车通过。下一步先补位置身份/双摄角色与电控联调所需接口，真实动作等待观察姿态、轴方向和标定确认，不安排反复人工摆放作为软件门槛。
+- 说明见 `docs/design/ALIGNMENT_INTERFACE.md`。此阶段证明软件流程和 ROS 收发，不代表本车运动收敛、抓放精度或整车通过。下一步先补位置身份/双摄角色与电控联调所需接口，真实动作等待观察姿态、轴方向和标定确认，不安排反复人工摆放作为软件门槛。
 
 ## 2026-10-31 视觉检查记录（历史，不作为框架开发门槛）
 
 ### 本轮 ROS 状态核对与论文参考
 
-- 用户确认另一个对话已部署 ROS 2。本轮重新读取交接和 `MISSION_FRAMEWORK.md`：已完成的是任务调度及 ROS 主题模拟，不是已接真实相机的视觉后端。Pi 只读检查确认 `mission_ros.py` 存在、稳定相机入口存在，未发现相关运行节点；未重启、打开相机或串口，也未重复模拟测试。设备入口存在不证明实际采集健康。
+- 用户确认另一个对话已部署 ROS 2。本轮重新读取交接和 `docs/design/MISSION_FRAMEWORK.md`：已完成的是任务调度及 ROS 主题模拟，不是已接真实相机的视觉后端。Pi 只读检查确认 `mission_ros.py` 存在、稳定相机入口存在，未发现相关运行节点；未重启、打开相机或串口，也未重复模拟测试。设备入口存在不证明实际采集健康。
 - 当前建议下一项为按请求接入真实视觉结果后端：复用现有采集/HSV 与时效逻辑，先接 `read_task`、原料区 `scan_material`；不依赖网页。粗加工重抓需要 position_id，`locate_position` 需要真实位置身份，尚不支持时明确返回未支持/失败，不填固定位置。按“固定路线粗到位→朝向校正→固定观察姿态→视觉对准→重新观测→标定动作”准备接口，但任务流程所有者仍须与电控确定，不能默认树莓派接管 STM32 主流程。
 - 论文 1：Bi 等，ICAROB2024，*Intelligent Logistics Handling Robot: Design, Control, and Recognition*，DOI `10.5954/ICAROB.2024.OS13-1`，来源 `https://alife-robotics.co.jp/members2024/icarob/data/html/data/OS/OS13-1.pdf`。网站直取多次超时，已通过同一原站检索返回的第 6 节相关正文核对：6.1 用 HSV 二值化、膨胀及轮廓获得物料图像重心；6.2 用二值化、轮廓筛选、最小外接圆定位色环，并非直接霍夫圆。未获得可直接移植的六色阈值/本车精度证据；不声称已完整核验所有页或重现实验。
 - 论文 2：杨玉燕、高洪，《基于仿真工业场景的智能物流小车设计与实现》，DOI `10.61369/TACS.2025090014`，来源 `https://api.arttechpress.com/uploads/file/asp/2026011913541686b3d3799.pdf`，共 3 页。第 2—3 页采用编码器路径闭环、陀螺仪朝向校正、视觉 X/Y 对准；物料是红绿蓝三色 HSV＋轮廓，色环使用 YOLOv8＋OpenVINO。不是六色阈值验证，且其 i7 视觉主机性能不能类推 Pi；本文不足以证明本车需要切换 YOLO。
@@ -356,7 +529,7 @@ Mac全套 `346 passed, 172 subtests passed`；通讯/按键/测试相关53项。
 - Mac 与 Pi 的 HEAD 均为 `f563961`，但已有同步到 Pi 的视觉参数/诊断接口工作区改动，尚未提交或推送。交接文件创建在 Mac，并已同步到 Pi；原文件见 Pi `backups/hsv_interfaces_20261023/original_sources.tar`，新文件不在此历史备份内。
 - 原 `/home/j/competition_vision` 和用户 `j` 属于重刷前环境，不再用于新系统命令。
 - 本次整理前 Mac 有未跟踪文件 `tools/pi_network_diagnose.sh`；保持原样。它使用 NetworkManager/nmcli，不能直接作为当前 Ubuntu 网络的通用诊断入口。
-- `docs/` 是被 Git 忽略的本地历史资料，部分内容过时；不要依赖其中旧账号、旧地址、旧测试数量或旧后端结论。
+- `docs/guides/`、`docs/design/` 是工程文档；原被忽略的本地历史笔记已移至 `archive/notes/`，其中旧账号、地址、测试数量及后端结论须重新核对。
 
 ## 已确认环境与连接
 
@@ -777,7 +950,7 @@ valid=true、约10.0Hz、361点/圈、pose=null；串口仅由PID1288占用。�
 - 雷达相对坐标默认半径3.4m，覆盖2.4m场地角到角的理论距离；仍可选6m查看场外回波，场地投影裁剪到2.4m。
   远处扫描点不会因此丢失，但超出场界的点不会误画到场内。
 - 已部署Pi独立目录，浏览器桌面/390px检查无横向溢出，雷达约10Hz/363点、位姿null。
-  `node tests/test_lidar_display.js`通过，导航/服务15项通过，git diff --check通过。
+  `node tests/lidar/test_lidar_display.js`通过，导航/服务15项通过，git diff --check通过。
 - 图片只能说明平面图的朝向与场景布局，不能精确给出雷达旋转中心或T-mini坐标轴方向；不能从照片
   自动推断准确yaw。用户可在网页地图点击雷达中心，选择真实朝向后查看重合；场地2.4m尺寸不限制雷达量程，
   但近地扫描高度、遮挡、目标材质仍会影响实物检出。无自动定位或移动跟踪。
@@ -893,7 +1066,7 @@ PID10548的一小时bounded runtime已自然结束（约21:34），因此Mac收�
 - 用户随后只要简单动画：网页已加入播放/暂停/重播与1/2/4倍速，白色箭头按8段顺序移动。
   RoutePlayback在JS单独实现，默认2倍速全程约11秒，站点停0.6秒（展示时间）不代表真实抓放动作。
   JS测试验证位置、暂停、8段顺序、重播/结束；实页实际播放至“8段演示完成”，暂停/重播通过。
-- 导航/服务/批次28项测试及display JS通过，新增tests/test_lidar_mission.py，含两区8段连通、避阻断边、
+- 导航/服务/批次28项测试及display JS通过，新增tests/lidar/test_lidar_mission.py，含两区8段连通、避阻断边、
   快照不改写/新障碍警告、缺数据拒算、稀疏远端过期、自身遮罩不屏蔽整格真实障碍。网页1365/390宽度无横溢出。
 - 更新前核对78614服务与SDK子进程后有序结束，确认by-id空闲后启动PID100728，目录
   /home/cuiguo/ydlidar_work/live_view_20261101/runtime_eight_routes_20261101_223705，最长3600秒约23:37到期。

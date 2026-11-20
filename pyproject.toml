@@ -7,11 +7,13 @@ name = "robot-perception"
 version = "0.1.0"
 description = "Vision and lidar safety tools for the engineering competition robot"
 requires-python = ">=3.10"
-dependencies = ["numpy>=1.24", "opencv-python-headless>=4.8", "PyYAML>=6.0"]
+dependencies = ["numpy>=1.24", "opencv-python-headless>=4.8", "PyYAML>=6.0", "Pillow>=9.0"]
 
 [project.optional-dependencies]
+qr = ["zxing-cpp==3.1.1"]
 inference = ["onnxruntime>=1.16"]
 serial = ["pyserial>=3.5"]
+desktop = ["PyQt6>=6.6", "PyQt6-WebEngine>=6.6"]
 dev = ["pytest>=8.0"]
 
 [project.scripts]
@@ -20,3 +22,6 @@ pi-vision-stream = "pi_vision.stream:main"
 
 [tool.setuptools.packages.find]
 include = ["robot_perception*", "pi_vision*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

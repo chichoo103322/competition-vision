@@ -1,0 +1,13 @@
+[Unit]
+Description=Shared material and QR camera console
+After=material-vision.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/competition_vision
+ExecStart=/usr/bin/python3 -u -m tools.camera_console --config %h/competition_vision/config/chassis_button.local.json
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

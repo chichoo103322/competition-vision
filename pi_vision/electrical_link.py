@@ -10,7 +10,9 @@ import struct
 import time
 
 from . import electrical_protocol as p
+from . import arm_protocol as arm
 from .electrical_coordinates import direction_review, ELECTRICAL_FRAME
+from .electrical_routes import configure_work_heading_mode, expected_work_yaw, work_pose_error
 
 
 class Rejected(RuntimeError):
@@ -31,6 +33,8 @@ class ElectricalClient:
         self.clock = clock
         self.decoder = p.Decoder(clock)
         self.sequence = secrets.randbelow(65536)
+        self.arm_events = deque(maxlen=256)
+        self.arm_generation = 0
         self.events = deque(maxlen=256)
         self._pending = deque()
         self._status = None
@@ -65,6 +69,9 @@ class ElectricalClient:
                     if packet_reply is None:
                         break
                     typ, seq, body = packet_reply
+                    if typ == arm.ARM_EVENT:
+                        self._record_arm(body)
+                        continue
                     if typ == p.START_AREA:
                         self._record_area(body)
                         continue
@@ -101,6 +108,50 @@ class ElectricalClient:
         result = self._exchange(p.STATUS)
         self._status, self._received_at = result, self.clock()
         return result
+
+    def _record_arm(self, body):
+        try:
+            report = arm.arm_status_payload(body)
+        except ValueError:
+            return
+        self.arm_generation += 1
+        self.arm_events.append(dict(report, received_monotonic_s=self.clock()))
+
+    def arm_status(self):
+        generation = self.arm_generation
+        self._exchange(arm.ARM_STATUS)
+        if self.arm_generation == generation:
+            raise TimeoutError('fresh ARM status missing; do not infer motion completion from ACK')
+        return dict(self.arm_events[-1])
+
+    def arm_command(self, route_id, point_index, work_id, command_id, opcode,
+                    z_deg=0, yaw_deg=0, reach_deg=0, reference_id=0):
+        # Retries keep the exact frame/command_id; MCU deduplicates the last accepted command.
+        return self._exchange(arm.ARM_COMMAND, arm.arm_command_payload(
+            route_id, point_index, work_id, command_id, opcode,
+            z_deg, yaw_deg, reach_deg, reference_id))
+
+    def arm_zero(self, command_id):
+        """Explicit operator action after physically placing the manual origin. Never auto-called."""
+        return self.arm_command(0, 0, 0, command_id, 1)
+
+    def arm_align(self, route_id, point_index, work_id, command_id, z_deg, yaw_deg, reach_deg):
+        return self.arm_command(route_id, point_index, work_id, command_id, 2,
+                                z_deg, yaw_deg, reach_deg)
+
+    def arm_test_begin(self, test_id, work_id):
+        return self.arm_command(test_id, 0, work_id, 1, 6)
+
+    def arm_pick(self, route_id, point_index, work_id, command_id, aligned_command_id):
+        return self.arm_command(route_id, point_index, work_id, command_id, 3,
+                                reference_id=aligned_command_id)
+
+    def arm_grip_done(self, route_id, point_index, work_id, command_id, aligned_command_id):
+        return self.arm_command(route_id, point_index, work_id, command_id, 4,
+                                reference_id=aligned_command_id)
+
+    def arm_finish(self, route_id, point_index, work_id, command_id):
+        return self.arm_command(route_id, point_index, work_id, command_id, 5)
 
     def pose_snapshot(self, max_age_s=0.5):
         if not math.isfinite(max_age_s) or max_age_s <= 0:
@@ -167,7 +218,9 @@ class ElectricalClient:
             if packet is None:
                 continue
             typ, seq, body = packet
-            if typ == p.START_AREA:
+            if typ == arm.ARM_EVENT:
+                self._record_arm(body)
+            elif typ == p.START_AREA:
                 self._record_area(body)
             elif typ == p.EVENT:
                 try:
@@ -204,22 +257,22 @@ class ElectricalClient:
             except AreaSuperseded:
                 continue
 
-    def run_after_key(self, planner, on_work=None, *, key_timeout=60, run_timeout=600,
+    def run_after_key(self, planner, on_work=None, *, poll_work=None, key_timeout=60, run_timeout=600,
                       sleep=time.sleep, cancelled=lambda: False):
         """Production entry: same key/plan binding, ONLY real work feedback.
 
         planner(signal, check_current) returns a commissioned route with
-        start_zone. on_work(client, status) must be nonblocking: None=pending,
-        True=actually completed, False=failed. Without it, remain at WAIT_WORK.
-        Use state keyed by route_id/point_index to start each real job only once.
+        start_zone. on_work(client, status) is called once per station to start
+        real work; poll_work(client, status) subsequently polls its result.
+        Both are nonblocking: None=pending, True=completed, False=failed.
         """
         if not math.isfinite(run_timeout) or run_timeout <= 0:
             raise ValueError('run_timeout must be finite and positive')
         signal, route = self.plan_after_key(planner, timeout=key_timeout, cancelled=cancelled)
-        return self.run_selected_route(signal, route, on_work, run_timeout=run_timeout,
+        return self.run_selected_route(signal, route, on_work, poll_work=poll_work, run_timeout=run_timeout,
                                        sleep=sleep, cancelled=cancelled)
 
-    def run_selected_route(self, signal, route, on_work=None, *, run_timeout=600,
+    def run_selected_route(self, signal, route, on_work=None, *, poll_work=None, run_timeout=600,
                            sleep=time.sleep, cancelled=lambda: False, before_start=lambda: None):
         """Production execution after the shared prewarmed button gate.
 
@@ -229,6 +282,9 @@ class ElectricalClient:
             raise ValueError('run_timeout must be finite and positive')
         if route.get('test_mode'):
             raise ValueError('test route is forbidden in production execution')
+        if type(route.get('work_heading_mode_enabled')) is not bool:
+            raise ValueError('production route requires explicit work_heading_mode_enabled')
+        configure_work_heading_mode(route, route['work_heading_mode_enabled'])
         touched = False
         try:
             self.check_start_area(signal)
@@ -238,6 +294,8 @@ class ElectricalClient:
             self.start_when_ready(route['route_id'], sleep=sleep, cancelled=cancelled)
             deadline = self.clock() + run_timeout
             released = set()
+            work_started = set()
+            turning = {}
             last_index = -1
             while self.clock() < deadline:
                 if cancelled():
@@ -252,22 +310,47 @@ class ElectricalClient:
                 if status['state'] in (0, 1, 5, 6) or status['fault'] or status['chassis_fault']:
                     raise RuntimeError(f'controller stopped/fault: {status}')
                 gates = {i for i, point in enumerate(route['points']) if point.get('work_id', 0)}
+                if any(i < index and i not in released for i in gates):
+                    raise RuntimeError('work point skipped by another controller')
+                if status['state'] == 2 and status['phase'] == 6:
+                    turn_key = (route['route_id'], index)
+                    turning.setdefault(turn_key, self.clock())
+                    if self.clock() - turning[turn_key] > 70:
+                        raise TimeoutError(f'work-area turn timeout at point_index={index}')
+                    sleep(.2)
+                    continue
                 if status['state'] == 4:
                     if index != len(route['points']) or released != gates:
                         raise RuntimeError('unexpected DONE without all real work feedback')
                     return status
-                if any(i < index and i not in released for i in gates):
-                    raise RuntimeError('work point skipped by another controller')
                 if status['state'] == 3:
-                    if (index not in gates or index in released or status['phase'] != 4 or
+                    if (index not in gates or status['phase'] != 4 or
                             status['work_id'] != route['points'][index]['work_id']):
                         raise RuntimeError('unexpected work point')
+                    pose_error = work_pose_error(status, route, index)
+                    if pose_error:
+                        raise RuntimeError(pose_error)
+                    if index in released:
+                        sleep(.2)
+                        continue
                     if on_work is not None:
-                        result = on_work(self, dict(status))
+                        key = (route['route_id'], index)
+                        first_notification = key not in work_started
+                        work_started.add(key)
+                        work_status = dict(status, work_key=key,
+                                           work_first_entry=first_notification,
+                                           expected_work_yaw_deg=expected_work_yaw(route, route['points'][index]))
+                        callback = on_work if first_notification else poll_work
+                        result = callback(self, work_status) if callback is not None else None
                         if result is not None:
                             if type(result) is not bool:
                                 raise ValueError('work result must be None/True/False')
-                            self.work_done(route['route_id'], index, success=result)
+                            ack = self.work_done(route['route_id'], index, success=result)
+                            if (ack.get('request') != p.WORK_DONE or ack.get('code') != 0 or
+                                    ack['route_id'] != route['route_id'] or
+                                    ack['point_index'] not in (index, index+1) or
+                                    ack['state'] in (0, 1, 5, 6) or ack['fault'] or ack['chassis_fault']):
+                                raise RuntimeError('WORK_DONE ACK rejected/mismatched')
                             if not result:
                                 raise RuntimeError('real work failed')
                             released.add(index)
@@ -302,7 +385,8 @@ class ElectricalClient:
         if route.get('valid_for_motion') is not True and not permitted_test:
             raise ValueError('preview/uncommissioned route cannot be uploaded')
         payload = p.upload_payload(route)
-        self.last_upload_review = direction_review(payload)
+        self.last_upload_review = direction_review(payload, work_heading_mode_enabled=route.get(
+            'work_heading_mode_enabled', False))
         if start_request_id is not None:
             if (self.selected_area is None or self.selected_area['request_id'] != start_request_id or
                     route.get('start_zone') != self.selected_area['area']):
@@ -328,7 +412,10 @@ class ElectricalClient:
         p.integer(point_index, 0, 63, 'point_index')
         if type(success) is not bool:
             raise ValueError('success must be an explicit boolean from real work feedback')
-        return self._exchange(p.WORK_DONE, struct.pack('<IHBB', route_id, point_index, success, 0))
+        ack = self._exchange(p.WORK_DONE, struct.pack('<IHBB', route_id, point_index, success, 0))
+        if ack.get('request') != p.WORK_DONE or ack.get('code') != 0:
+            raise RuntimeError('WORK_DONE ACK mismatch/rejected')
+        return ack
 
     def vision(self, route_id, point_index, work_id, *, dx_mm, dy_mm, dyaw_deg, confidence):
         """Only calibrated body offsets: +X forward, +Y left, CCW positive."""

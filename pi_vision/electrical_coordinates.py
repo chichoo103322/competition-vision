@@ -42,21 +42,32 @@ def electrical_to_nominal_pose(pose):
     return _rotate_pose(pose)
 
 
-def direction_review(payload):
-    """Decode ordinary UPLOAD bytes (without the start-area request prefix)."""
+def direction_review(payload, *, work_heading_mode_enabled=False):
+    """Decode V1 bytes and apply the separately configured STM32 heading mode."""
     if len(payload) < 20:
         raise ValueError('incomplete route header')
     route_id, count, reserved, x, y, yaw = struct.unpack_from('<IHHiii', payload)
     if reserved or not 1 <= count <= 64 or len(payload) != 20 + count * 20:
         raise ValueError('invalid route payload')
     initial = dict(x_mm=x, y_mm=y, yaw_deg=yaw / 100)
+    from .electrical_routes import WORK_HEADING_OFFSETS_DEG, wrap_deg
+    if type(work_heading_mode_enabled) is not bool:
+        raise ValueError('work_heading_mode_enabled must be boolean')
+    mode_active = work_heading_mode_enabled and any(
+        struct.unpack_from('<H', payload, 20 + i*20 + 16)[0] in WORK_HEADING_OFFSETS_DEG
+        for i in range(count))
+    current_heading = initial['yaw_deg']
     legs = []
     for index in range(count):
         nx, ny, nyaw, move, turn, work, flags = struct.unpack_from('<iiiHHHH', payload, 20 + index * 20)
-        rotation = ((nyaw - yaw) / 100 + 180) % 360 - 180
+        travel_heading = current_heading if mode_active else nyaw/100
+        expected_work_heading = (wrap_deg(initial['yaw_deg'] + WORK_HEADING_OFFSETS_DEG[work])
+                                 if mode_active and work in WORK_HEADING_OFFSETS_DEG else
+                                 wrap_deg(nyaw/100)) if work else None
+        rotation = wrap_deg(travel_heading-current_heading)
         if rotation == -180:
             rotation = 180  # route.c chooses positive rotation at exactly 180.
-        theta = math.radians(nyaw / 100)  # Firmware turns BEFORE translating.
+        theta = math.radians(travel_heading)
         dx, dy = nx - x, ny - y
         forward = math.cos(theta) * dx + math.sin(theta) * dy
         left = -math.sin(theta) * dx + math.cos(theta) * dy
@@ -67,12 +78,45 @@ def direction_review(payload):
         actions = ([] if not rotation else [dict(action='逆时针转向' if rotation > 0 else '顺时针转向',
                                                  angle_deg=abs(rotation))])
         actions += [item for item in movements if item['distance_mm'] > 0]
+        arrival_rotation = (wrap_deg(expected_work_heading-travel_heading)
+                            if mode_active and work else 0)
+        if arrival_rotation:
+            actions.append(dict(action='到站逆时针转向' if arrival_rotation > 0 else '到站顺时针转向',
+                                angle_deg=abs(arrival_rotation)))
         legs.append(dict(point_index=index, target=dict(x_mm=nx, y_mm=ny, yaw_deg=nyaw / 100),
+                         wire_yaw_deg=nyaw/100, travel_yaw_deg=travel_heading,
+                         expected_work_yaw_deg=expected_work_heading,
                          dx_mm=dx, dy_mm=dy, forward_mm=forward, left_mm=left,
                          actions=actions, work_id=work))
-        x, y, yaw = nx, ny, nyaw
+        x, y = nx, ny
+        current_heading = expected_work_heading if mode_active and work else travel_heading
     return dict(route_id=route_id, coordinate_frame=ELECTRICAL_FRAME,
                 axes='photo-aligned field: origin lower left, +X right, +Y up', yaw='CCW positive; 0 = +X',
                 wire_units=dict(x_y='mm', yaw='0.01 degree'),
+                work_heading_mode_enabled=work_heading_mode_enabled, work_heading_mode_active=mode_active,
                 assumption='ideal waypoint poses; actual controller uses feedback and tolerances',
                 initial_pose=initial, legs=legs)
+
+
+def direction_review_html(review):
+    """Standalone visual review: wire yaw, travel heading and work heading differ."""
+    from html import escape
+    def cell(value):
+        return escape(str(value))
+    rows = []
+    for leg in review['legs']:
+        target = leg['target']
+        rows.append('<tr>' + ''.join('<td>'+cell(v)+'</td>' for v in (
+            leg['point_index'], leg['work_id'], target['x_mm'], target['y_mm'],
+            leg['wire_yaw_deg'], leg['travel_yaw_deg'],
+            leg['expected_work_yaw_deg'] if leg['expected_work_yaw_deg'] is not None else '—',
+            '；'.join(str(a) for a in leg['actions']))) + '</tr>')
+    return ('<!doctype html><meta charset="utf-8"><title>路线实际航向核对</title>'
+            '<style>body{font-family:system-ui;margin:24px}table{border-collapse:collapse}'
+            'td,th{border:1px solid #aaa;padding:8px;text-align:left}th{background:#eef}</style>'
+            '<h1>路线 '+cell(review['route_id'])+' 实际航向</h1>'
+            '<p>照片同向地图：右 +X、上 +Y；逆时针为正；角度单位 °。'
+            '工作区朝向模式：'+cell(review['work_heading_mode_active'])+'。180° 与 −180° 等价。</p>'
+            '<table><tr><th>零起始点索引</th><th>work_id</th><th>X mm</th><th>Y mm</th>'
+            '<th>报文 yaw</th><th>行驶车头</th><th>到站工作航向</th><th>动作顺序</th></tr>'
+            +''.join(rows)+'</table><p>此表为计划，不代表实车测量；工作转向由 STM32 执行。</p>')

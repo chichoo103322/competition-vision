@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import copy
 import fcntl
+import gzip
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
@@ -19,6 +20,13 @@ try:
 except ImportError:
     from lidar_navigation import NavigationPreview, local_candidates
     from lidar_mission import build_mission_plan, mission_status
+
+
+def compress_preview(body, accept_encoding):
+    """Reduce browser traffic without dropping points or changing scan validity."""
+    if len(body) > 1024 and 'gzip' in accept_encoding:
+        return gzip.compress(body, compresslevel=1), 'gzip'
+    return body, None
 
 
 class ScanState:
@@ -164,9 +172,13 @@ def main():
             else:
                 self.send_error(404)
                 return
+            body, encoding = compress_preview(body, self.headers.get('Accept-Encoding', ''))
             self.send_response(200)
             self.send_header("Content-Type", mime)
             self.send_header("Cache-Control", "no-store")
+            self.send_header("Vary", "Accept-Encoding")
+            if encoding:
+                self.send_header("Content-Encoding", encoding)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             try:

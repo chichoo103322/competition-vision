@@ -29,7 +29,7 @@ from .rotation_gate import RotationGate
 from .material_tracking import MaterialStability, MaterialTracker
 from .task_confirmation import TaskCodeConfirmation, parse_competition_task
 from .preview_page import FRAME_CLIENT_JS
-from .material_region import MaterialRegionDetector, ordered_materials, center_material
+from .material_region import MaterialRegionDetector, ordered_materials, center_material, search_material
 from .protocol import (
     COLOR,
     CMD_RESCAN,
@@ -92,11 +92,17 @@ class FrameStreamer:
         preview_timeout: float = 3.0,
         preview_enabled: bool = True,
         material_target_window=None,
+        material_search_color=None,
     ) -> None:
         for name, value in (('capture_timeout', capture_timeout), ('result_timeout', result_timeout), ('qr_timeout', qr_timeout), ('preview_timeout', preview_timeout)):
             if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f'{name} must be a finite positive number')
         self.material_target_window = tuple(material_target_window) if material_target_window is not None else None
+        if material_search_color is not None and (
+                type(material_search_color) is not int or not 1 <= material_search_color <= 6
+                or material_target_window is None):
+            raise ValueError('material color search requires business color 1..6 and an explicit search window')
+        self.material_search_color = material_search_color
         self.capture_timeout = capture_timeout
         self.result_timeout = result_timeout
         self.qr_timeout = qr_timeout
@@ -320,6 +326,22 @@ class FrameStreamer:
         with self._lock:
             self._target_color = color
 
+    def set_material_search_color(self, color):
+        if type(color) is not int or not 1 <= color <= 6:
+            raise ValueError('business color must be 1..6')
+        with self._lock:
+            if self.enable_qr or self.material_target_window is None:
+                raise ValueError('dedicated material camera with explicit approach window required')
+            if self.material_search_color == color:
+                return
+            self.material_search_color = color
+            self._qr_generation += 1
+            self._mode_source_floor = self._raw_sequence
+            self._latest_materials = []
+            self._material_tracker.reset()
+            self._observations['materials'] = Observation()
+            self._material_localization_status = 'waiting_for_requested_color'
+
     def set_scan_detection(self, mode: Optional[int]) -> None:
         """按电控扫描模式控制检测算法启停（算法开关）。
 
@@ -447,6 +469,8 @@ class FrameStreamer:
                 'schema_version': 2, 'session_id': self.session_id,
                 'server_monotonic_s': now, 'server_unix_s': time.time(),
                 'coordinate_frame': 'camera_image', 'coordinate_units': 'pixels',
+                'camera_source': getattr(getattr(getattr(self._pipeline, 'camera', None),
+                                                  'config', None), 'source', None),
                 'task': task,
                 'qr_observation': qr_observation,
                 'qr_session': {'status': qr_session_status, 'generation': self._qr_generation,
@@ -472,7 +496,9 @@ class FrameStreamer:
                 },
                 "material_target_window": self.material_target_window,
                 "material_localization_status": self._material_localization_status if material_observation['valid'] else 'unavailable',
-                "material_selection": "nearest_window_center" if self.material_target_window else "all_candidates",
+                "material_selection": ("unique_color_in_search_window" if self.material_search_color is not None
+                                       else "nearest_window_center" if self.material_target_window else "all_candidates"),
+                "material_search_color": self.material_search_color,
                 "materials": materials,
                 "material_observation": material_observation,
                 "material_roi": list(self._pipeline.material_detector.roi)
@@ -680,6 +706,7 @@ class FrameStreamer:
                     'coordinate_meaning': 'see_material_point_kind_not_calibrated_grasp',
                     'frame_size': [frame.shape[1], frame.shape[0]], 'roi': roi,
                     'material_target_window': self.material_target_window,
+                    'material_search_color': self.material_search_color,
                     'camera_requested': asdict(self._camera.config) if isinstance(getattr(self._camera, 'config', None), CameraConfig) else None,
                     'backend': type(base).__name__, 'profile': profile,
                     'material_center_method': getattr(base, 'center_method', 'box'),
@@ -710,8 +737,11 @@ class FrameStreamer:
             if kind == 'materials':
                 if self.material_target_window is not None and not error:
                     try:
-                        effective = center_material(effective, self.material_target_window,
-                                                    (self._latest_raw.shape[1], self._latest_raw.shape[0]))
+                        size = (self._latest_raw.shape[1], self._latest_raw.shape[0])
+                        effective = (search_material(effective, self.material_target_window, size,
+                                                     self.material_search_color)
+                                     if self.material_search_color is not None else
+                                     center_material(effective, self.material_target_window, size))
                     except ValueError:
                         effective = []
                         observation.error = 'invalid_material_target_window'
@@ -955,6 +985,28 @@ class SerialController:
 
 
 class StreamHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        if urlsplit(self.path).path != '/material-target' or self.headers.get('Sec-Fetch-Site') == 'cross-site':
+            self.send_error(403)
+            return
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            if not 0 < length <= 128:
+                raise ValueError('invalid request size')
+            data = json.loads(self.rfile.read(length))
+            if not isinstance(data, dict) or set(data) != {'color_id'}:
+                raise ValueError('color_id required')
+            _streamer.set_material_search_color(data['color_id'])
+        except (ValueError, TypeError) as exc:
+            self.send_error(400, str(exc))
+            return
+        body = b'{"ok":true}'
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
         if path == "/":
@@ -1157,6 +1209,10 @@ def main() -> None:
     parser.add_argument("--preview-fps", type=float, default=5.0, help="仅预览最大帧率，默认 5")
     parser.add_argument("--no-qr", action="store_true", help="关闭二维码检测")
     parser.add_argument("--materials", action="store_true", default=None, help="开启物料检测")
+    parser.add_argument('--ring-backend', choices=('hough', 'morphology'), default='hough')
+    parser.add_argument('--ring-roi', type=int, nargs=4, metavar=('X', 'Y', 'W', 'H'))
+    parser.add_argument('--position-digits', action='store_true')
+    parser.add_argument('--position-orientation', type=int, choices=(0, 90, 180, 270))
     parser.add_argument("--rings", action="store_true", default=None, help="开启圆环检测")
     parser.add_argument("--no-materials", action="store_true", help="强制关闭物料检测")
     parser.add_argument("--no-rings", action="store_true", help="强制关闭圆环检测")
@@ -1173,6 +1229,8 @@ def main() -> None:
                         help="物料后端：auto沿用YOLO；hsv为实验性六色轮廓检测")
     parser.add_argument('--material-center', choices=('box', 'centroid', 'top_face'), default='box')
     parser.add_argument('--material-target-window', type=int, nargs=4, metavar=('X','Y','W','H'))
+    parser.add_argument('--material-search-color', type=int, choices=range(1, 7),
+                        help='原料区在显式搜索窗口中寻找唯一指定颜色，无需预先居中')
     parser.add_argument('--hsv-profile', help='HSV YAML 参数文件；省略时保留原有基线')
     parser.add_argument('--diagnostics-dir', help='新建诊断目录，限量保存同帧原图和识别结果')
     parser.add_argument('--diagnostics-samples', type=int, default=30)
@@ -1191,6 +1249,12 @@ def main() -> None:
     parser.add_argument("--algorithms-on", action="store_true", default=None, help="启动时识别算法默认全开（覆盖 config algorithms_default_on；--no-qr/--no-materials/--no-rings 仍可单独关）")
     parser.add_argument("--no-algorithms-on", action="store_true", default=None, help="启动时识别算法默认全关（覆盖 config algorithms_default_on；--materials/--rings 仍可单独开）")
     args = parser.parse_args()
+    if args.material_search_color is not None and args.material_target_window is None:
+        parser.error('--material-search-color requires --material-target-window')
+    if args.position_digits != (args.position_orientation is not None):
+        parser.error('--position-digits requires an explicit --position-orientation')
+    if args.ring_backend == 'morphology' and args.ring_roi is None:
+        parser.error('--ring-backend morphology requires --ring-roi X Y W H')
     for name in ('capture_timeout', 'result_timeout', 'qr_timeout', 'preview_timeout'):
         value = getattr(args, name)
         if not math.isfinite(value) or value <= 0:
@@ -1237,6 +1301,9 @@ def main() -> None:
     pipeline = VisionPipeline(config, camera=camera, qr_camera=qr_camera,
                               material_backend=args.material_backend, hsv_profile=hsv_profile,
                               material_center=args.material_center)
+    from .pipeline import configure_ring_pipeline
+    configure_ring_pipeline(pipeline, args.ring_backend, args.ring_roi,
+                            args.position_orientation if args.position_digits else None)
     if args.material_roi:
         pipeline.set_material_roi(args.material_roi)
     if args.fast:
@@ -1266,6 +1333,7 @@ def main() -> None:
         camera,
         pipeline,
         material_target_window=args.material_target_window,
+        material_search_color=args.material_search_color,
         rotation_gate=rotation_gate,
         enable_qr=enable_qr,
         enable_materials=enable_materials,

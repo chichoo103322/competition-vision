@@ -6,6 +6,8 @@ import math
 
 
 BOUNDS = (0.0, .55, 1.0, 1.4, 1.85, 2.4)
+# The raw-material station protrudes into field cell 14.
+IGNORED_OBSTACLE_CELLS = frozenset({14})
 DISPLAY_BOUNDARY_BAND_M = .03  # Display classification only, not a localization error bound.
 
 
@@ -230,7 +232,7 @@ class NavigationPreview:
             lx,ly=math.cos(angle)*r,math.sin(angle)*r
             p=(x+c*lx-s*ly,y+s*lx+c*ly)
             cell=grid_id(*p)
-            if cell is None:
+            if cell is None or cell in IGNORED_OBSTACLE_CELLS:
                 continue
             if cell==home and r<=self.settings['self_mask_radius_m']:
                 continue
@@ -285,6 +287,7 @@ class NavigationPreview:
         # All routes are software previews; unobserved cells/edges are never called safe.
         route.update(scope=scope,valid_for_motion=False,live_obstacle_evidence=bool(recent))
         return dict(settings=self.settings,grid_rects=grid_rects(),nodes=self.nodes,edges=self.edges,
+                    ignored_obstacle_cells=sorted(IGNORED_OBSTACLE_CELLS),
                     grid_votes=cells,edge_votes=edge_votes,occupied_cells=occupied,blocked_edges=blocked,
                     point_blocked_edges=point_blocked,cell_blocked_edges=cell_blocked,
                     boundary_only_cells=boundary_only,
