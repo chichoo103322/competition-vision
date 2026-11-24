@@ -1,8 +1,12 @@
 import copy
+from dataclasses import replace
+
+import numpy as np
 import pytest
 
 from tools.arm_three_color_trial import (
-    ArmTrial, ThreeColorTrial, TrialTuning, ObservationUnavailable, correction_target, parse_order)
+    ArmTrial, ThreeColorTrial, TrialTuning, ObservationUnavailable, correction_target,
+    edge_view_target, parse_order, tracking_approach, tray_approach, tray_correction)
 
 
 class Plant:
@@ -640,7 +644,6 @@ def test_real_grasp_radius_depends_on_face_and_radial_offset(tmp_path,axes,offse
 
 
 def test_logged_blue_edge_pose_requires_reachable_part_of_face(tmp_path):
-    from tools.arm_three_color_trial import tray_approach
     p = Plant()
     t = real_photo_trial(p, tmp_path, (123,84))
     assert t.wait_reachable_target(timeout=2)['pixel'] == [771,443]
@@ -721,6 +724,44 @@ def test_disc_target_traversing_grasp_window_waits_for_still_frames(tmp_path):
         t.observe(p.now, timeout=1)
 
 
+def test_disc_target_with_reliable_low_speed_can_align_for_pick(tmp_path):
+    plant = Plant()
+    t = real_photo_trial(plant, tmp_path, (0, 0))
+    plant.arm.update(state_name='ALIGNED', aligned_command_id=1)
+    snapshot = t.snapshot
+
+    def barely_moving():
+        state = snapshot()
+        seq = state['material_observation']['source_sequence']
+        state['materials'][0]['center_x'] += .5 * (seq - 500)
+        return state
+
+    t.snapshot = barely_moving
+    _, obs, _ = t.align_color()
+    assert obs['in_grasp_window'] and obs['velocity_reliable']
+    assert np.linalg.norm(obs['velocity_px_s']) == pytest.approx(2.5)
+    assert not any(c[0] in ('align', 'pick') for c in plant.calls)
+
+
+def test_grasp_window_edge_tracks_nearby_flicker_outside_grasp_radius(tmp_path):
+    plant = Plant()
+    t = real_photo_trial(plant, tmp_path, (85, 100))
+    snapshot = t.snapshot
+
+    def flicker():
+        state = snapshot()
+        seq = state['material_observation']['source_sequence']
+        state['materials'][0]['center_x'] += (0, 7, 2)[seq % 3]
+        state['materials'][0]['track_id'] = seq
+        return state
+
+    t.snapshot = flicker
+    obs = t.wait_reachable_target(timeout=1)
+    assert not obs['in_grasp_window']
+    assert {point[0] for point in obs['points']} == {733, 735, 740}
+    assert len({frame['sequence'] for frame in obs['source_frames']}) == 3
+
+
 def test_grasp_window_accepts_small_flicker_and_fresh_tracking_ids(tmp_path):
     plant = Plant()
     t = real_photo_trial(plant, tmp_path, (0, 0))
@@ -741,8 +782,6 @@ def test_grasp_window_accepts_small_flicker_and_fresh_tracking_ids(tmp_path):
 
 
 def test_blue_just_forward_can_approach_sideways_but_cannot_chase_past_boundary():
-    import numpy as np
-    from tools.arm_three_color_trial import tray_approach
     matrix = [[.000165,-.222586],[.220358,-.012505]]
     arm = Plant().arm
     plan = tray_approach(arm, np.array([68,-31]), 230, matrix, TrialTuning(), 32)
@@ -791,8 +830,6 @@ def test_failure_samples_are_bounded_unique_and_capture_errors_allow_recovery(tm
 
 
 def test_timed_planner_uses_short_moves_until_clearance_is_cheaper():
-    import numpy as np
-    from tools.arm_three_color_trial import tray_correction
     p = Plant()
     def choose(error, z=0):
         return tray_correction(dict(p.arm,z_cdeg=z), np.array(error), 230, p.mapping['matrix'],
@@ -802,18 +839,85 @@ def test_timed_planner_uses_short_moves_until_clearance_is_cheaper():
     assert choose((48,168))[2]
 
 
-@pytest.mark.parametrize('edge_hint, micro_only, expected', [
-    (None, False, [(1.5, -6.37)]),
-    (None, False, [(1.5, -6.37), (0, -12.73)]),
-    ([586, 571], False, [(-3.28, -53.79)]),
-    ([586, 571], False, [(-3.28, -53.79), (-3.8, -64.99)]),
-    ([586, 605], False, [(-3.8, -64.99)]),
-    ([391, 580], False, [(-12.05, -53.77)]),
-    ([912, 575], False, [(16.77, -67.43)]),
-    ([586, 571], True, [(1.5, -6.37)]),
+def test_edge_view_computes_retraction_from_pixel_and_current_pose():
+    plant = Plant()
+    tuning = TrialTuning()
+    shallow, _ = edge_view_target(
+        plant.arm, [678, 571], plant.reference, plant.mapping, tuning, visited=set())
+    deep, distance = edge_view_target(
+        plant.arm, [678, 660], plant.reference, plant.mapping, tuning, visited=set())
+    assert shallow[:2] == deep[:2] == [0, 0]
+    assert deep[2] < shallow[2] < 0
+    assert distance == pytest.approx(.8 * .22 * (660 - .69 * 720), abs=.002)
+    shifted, _ = edge_view_target(
+        dict(plant.arm, reach_cdeg=-3200, yaw_cdeg=500), [678, 660],
+        plant.reference, plant.mapping, tuning, visited=set())
+    assert shifted == [0, 500, deep[2] - 3200]
+    stronger, _ = edge_view_target(
+        plant.arm, [678, 660], plant.reference, plant.mapping, tuning,
+        visited={(0, 10, deep[2] + 30)})
+    assert stronger[2] < deep[2]
+    assert edge_view_target(
+        dict(plant.arm, z_cdeg=-51), [678, 660], plant.reference, plant.mapping,
+        tuning, visited=set()) is None
+
+
+def test_edge_view_obeys_limits_and_waits_when_pixels_cannot_improve():
+    plant = Plant()
+    tuning = TrialTuning(max_retraction_mm=20)
+    point = [1035, 699]
+    target, _ = edge_view_target(
+        plant.arm, point, plant.reference, plant.mapping, tuning, visited=set())
+    assert target == [0, 3600, -6366]
+    at_limit = dict(plant.arm, yaw_cdeg=target[1], reach_cdeg=target[2])
+    assert edge_view_target(
+        at_limit, point, plant.reference, plant.mapping, tuning, visited=set()) is None
+    assert edge_view_target(
+        plant.arm, [648, 359], plant.reference, plant.mapping, tuning, visited=set()) is None
+
+
+@pytest.mark.parametrize('offset', [(233, 226), (-170, 180)])
+def test_wide_tray_limits_allow_asymmetric_approach_after_opt_in(tmp_path, offset):
+    plant = Plant()
+    t = real_photo_trial(plant, tmp_path, offset)
+    error = np.asarray(offset)
+    matrix = [[.000165, -.222586], [.220358, -.012505]]
+    assert tray_approach(plant.arm, error, 230, matrix, t.tuning, 18.) is None
+    t.tuning = replace(t.tuning, wide_tray_yaw=True)
+    target, _ = tray_approach(plant.arm, error, 230, matrix, t.tuning, 18.)
+    yaw = target[1] / 300
+    assert -12 <= yaw < -6 if offset[0] < 0 else 12 < yaw <= 22
+    t.envelope(dict(plant.arm, yaw_cdeg=target[1], reach_cdeg=target[2]))
+    for outside in (-3691, 6691):
+        with pytest.raises(RuntimeError, match='envelope'):
+            t.envelope(dict(plant.arm, yaw_cdeg=outside))
+    step, _, coarse = tray_correction(
+        plant.arm, error, 230, matrix, t.tuning, 18., allow_coarse=False)
+    assert not coarse and abs(step[1]) <= 240 and -1115 <= step[2] <= 0
+
+
+def test_far_lower_top_face_can_use_damped_approach():
+    plant = Plant()
+    error = np.array([0, 330])
+    tuning = TrialTuning()
+    assert tray_approach(plant.arm, error, 230, plant.mapping['matrix'], tuning, 18.) is None
+    target, _ = tracking_approach(plant.arm, error, 230, plant.mapping['matrix'], tuning, 18.)
+    assert -19098 <= target[2] < -12000
+
+
+@pytest.mark.parametrize('edge_hint, micro_only, view_count', [
+    (None, False, 1),
+    (None, False, 2),
+    ([586, 571], False, 1),
+    ([586, 571], False, 2),
+    ([678, 660], False, 1),
+    ([391, 580], False, 1),
+    ([912, 575], False, 1),
+    ([586, 571], True, 1),
 ])
-def test_partial_rim_only_moves_to_measured_view_then_rechecks(
-        tmp_path, edge_hint, micro_only, expected):
+def test_partial_rim_only_moves_to_observation_height_then_rechecks(
+        tmp_path, edge_hint, micro_only, view_count):
+    import json
     p = Plant()
     t = real_photo_trial(p, tmp_path, (0,0))
     t.micro_only = micro_only
@@ -830,7 +934,7 @@ def test_partial_rim_only_moves_to_measured_view_then_rechecks(
     def partial():
         assert p.now < 105, 'timed out waiting for the measured view change'
         state = original()
-        if moves < len(expected):
+        if moves < view_count:
             seq = state['material_observation']['source_sequence']
             pixel = [750, 500] if moves == 0 else [665, 490]
             if edge_hint is not None:
@@ -850,15 +954,46 @@ def test_partial_rim_only_moves_to_measured_view_then_rechecks(
     p.arm_align = move
     _, obs, _ = t.align_color()
     moves = [cmd for cmd in p.calls if cmd[0]=='align']
-    assert [cmd[4:] for cmd in moves] == expected
-    assert len(t.view_targets) == len(expected) and obs['in_grasp_window']
+    assert len(moves) == len(t.view_targets) == view_count
+    assert all(cmd[3] == 0 and -190.98 <= cmd[5] < 0 for cmd in moves)
+    events = [json.loads(line) for line in (tmp_path/'events.jsonl').read_text().splitlines()]
+    observed_sources = [e['view_source'] for e in events if e['event'] == 'rim_view_change']
+    if edge_hint is None or micro_only:
+        assert [cmd[4:] for cmd in moves] == [(1.5, -6.37), (0, -12.73)][:view_count]
+        assert observed_sources == ['calibration_sample'] * view_count
+    else:
+        assert observed_sources == ['computed'] * view_count
+    assert obs['in_grasp_window']
     assert min(f['acquired'] for f in obs['source_frames']) > last_move_at
     assert not any(cmd[0]=='pick' for cmd in p.calls)
 
 
+def test_missing_rim_after_usable_top_face_can_request_another_view(tmp_path):
+    plant = Plant()
+    t = real_photo_trial(plant, tmp_path, (0, 0))
+    assert t.wait_reachable_target(timeout=1)['in_grasp_window']
+    first_usable = t.first_usable
+    snapshot = t.snapshot
+
+    def partial_until_move():
+        state = snapshot()
+        if not any(c[0] == 'align' for c in plant.calls):
+            seq = state['material_observation']['source_sequence']
+            state.update(materials=[], material_localization_status='top_face_not_confirmed',
+                         material_view_hint=dict(color_id=2, source_sequence=seq, pixel=[678, 660]))
+        else:
+            state['materials'][0].update(center_x=648, center_y=359)
+        return state
+
+    t.snapshot = partial_until_move
+    arm, obs, _ = t.align_color()
+    assert arm['reach_cdeg'] < -7000 and obs['in_grasp_window']
+    assert t.first_usable == first_usable
+    assert len([c for c in plant.calls if c[0] == 'align']) == 1
+    assert not any(c[0] == 'pick' for c in plant.calls)
+
+
 def test_micro_only_far_target_is_bounded_even_if_start_is_outside_corridor():
-    import numpy as np
-    from tools.arm_three_color_trial import tray_correction
     p = Plant()
     for z in (0, 2):
         arm = dict(p.arm,z_cdeg=z)

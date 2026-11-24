@@ -41,6 +41,7 @@ class TrialTuning:
     max_adjustments: int = 32
     max_total_correction_mm: float = 90.
     alignment_budget_s: float = 180.
+    wide_tray_yaw: bool = False
 
     def __post_init__(self):
         # Stay inside the firmware's ALIGN micro-motion corridor: 1deg/4mm,
@@ -64,6 +65,10 @@ class TrialTuning:
         error = np.asarray(error, dtype=float)
         return bool(error.shape==(2,) and np.isfinite(error).all()
                     and np.max(np.abs(error)) <= self.tolerance_px)
+
+    @property
+    def tray_yaw_limits(self):
+        return (-12., 22.) if self.wide_tray_yaw else (-6., 12.)
 
 
 class ObservationUnavailable(TimeoutError):
@@ -109,44 +114,54 @@ def tray_grasp_radius(axes, cap):
     return min(cap, min(axes) * .25)
 
 
-TRAY_PICK_MAX_YAW_DEG = 12.
 TRAY_GRASP_JITTER_PX = 12
+TRAY_STILL_SPEED_PX_S = 5.
+TRAY_MAX_TRACKING_SPEED_PX_S = 25.
+RIM_HINT_STATUSES = ('top_face_not_confirmed', 'clipped_region_no_complete_rim')
+
+
+def tray_photo_target(arm, radial, tangent, reference_radius, tuning):
+    """Convert a local displacement in mm to a bounded photo-height ALIGN target."""
+    reach = arm['reach_cdeg'] * 113.1 / 36000
+    yaw = arm['yaw_cdeg'] / 300
+    radius = reference_radius + reach
+    if not np.isfinite([radius, radial, tangent]).all() or radius <= 0 or radius + radial <= 0:
+        return None
+    desired_yaw = yaw + math.degrees(math.atan2(tangent, radius + radial))
+    desired_reach = math.hypot(radius + radial, tangent) - reference_radius
+    target_yaw = round(np.clip(desired_yaw, *tuning.tray_yaw_limits) * 300)
+    target_reach = max(math.ceil(-tuning.max_retraction_mm * 36000 / 113.1),
+                       min(0, round(desired_reach * 36000 / 113.1)))
+    return 0, target_yaw, target_reach
 
 
 def tray_approach(arm, error, reference_radius, matrix, tuning, grasp_radius):
     """Find a reachable photo-height pose and check its predicted residual in pixels."""
     matrix = np.asarray(matrix)
     radial, tangent = matrix @ error
-    reach = arm['reach_cdeg'] * 113.1 / 36000
-    yaw = arm['yaw_cdeg'] / 300
-    radius = reference_radius + reach
-    if radius + radial <= 0:
+    target = tray_photo_target(arm, radial, tangent, reference_radius, tuning)
+    if target is None:
         return None
-    desired_yaw = yaw + math.degrees(math.atan2(tangent, radius + radial))
-    desired_reach = math.hypot(radius + radial, tangent) - reference_radius
-    target_yaw = round(np.clip(desired_yaw, -6, TRAY_PICK_MAX_YAW_DEG) * 300)
-    target_reach = max(math.ceil(-tuning.max_retraction_mm * 36000 / 113.1),
-                       min(0, round(desired_reach * 36000 / 113.1)))
-    end_radius = reference_radius + target_reach * 113.1 / 36000
-    angle = math.radians(target_yaw / 300 - yaw)
-    displacement = np.array([end_radius * math.cos(angle) - radius, end_radius * math.sin(angle)])
+    end = dict(yaw_cdeg=target[1], reach_cdeg=target[2])
+    displacement = local_motion_mm(arm, end, reference_radius)
+    distance = float(np.linalg.norm(displacement))
     remaining = error - np.linalg.solve(matrix, displacement)
     residual_px = np.linalg.norm(remaining)
     if residual_px > grasp_radius:
         # A target just past the centre-reach boundary can still benefit from
         # one horizontal approach. Re-observe there; this never authorizes PICK.
         if (residual_px > grasp_radius + 12 or np.linalg.norm(error) - residual_px < 12
-                or np.linalg.norm(displacement) < 2.):
+                or distance < 2.):
             return None
-    return [0, target_yaw, target_reach], float(np.linalg.norm(displacement))
+    return list(target), distance
 
 
 def tracking_approach(arm, error, radius, matrix, tuning, grasp_radius):
     plan = tray_approach(arm, error, radius, matrix, tuning, grasp_radius)
-    # Distant lateral targets in the field move farther in the image per
+    # Distant lateral and lower-edge targets can move farther in the image per
     # actuator step than the origin calibration predicts. Permit a bounded
     # approach; only subsequent measured pixels can authorize a descent.
-    if plan is None and abs(error[0]) > 2 * abs(error[1]):
+    if plan is None and (abs(error[0]) > 2 * abs(error[1]) or np.linalg.norm(error) > 120):
         plan = tray_approach(arm, error, radius, .66 * np.asarray(matrix), tuning, grasp_radius)
     return plan
 
@@ -155,13 +170,7 @@ def micro_start_ok(arm):
     return -50 <= arm['z_cdeg'] <= 0 and TRAY_PARK[2] <= arm['reach_cdeg'] <= 0
 
 
-def measured_view_target(arm, pixel, reference, mapping, tuning, visited=()):
-    # Encoder residuals at the photo origin can be slightly positive.
-    if not (-50 <= arm['z_cdeg'] <= 50 and TRAY_PARK[2] <= arm['reach_cdeg'] <= 95):
-        return None
-    error = np.asarray(pixel) - reference['reference_pixel']
-    best_error = np.linalg.norm(error) - 3
-    best = None
+def calibrated_view_poses(mapping):
     for sample in mapping.get('samples', ()):
         actual, requested = sample.get('actual', {}), sample.get('requested', {})
         if len(sample.get('source_frames', ())) < 3:
@@ -171,11 +180,34 @@ def measured_view_target(arm, pixel, reference, mapping, tuning, visited=()):
         if not all(isinstance(v, (float,int)) and math.isfinite(v) for v in values):
             continue
         if (abs(actual['z_mm']) > .15 or abs(yaw-actual['yaw_deg']) > .2
-                or abs(reach-actual['reach_mm']) > .3 or not -6 <= yaw <= TRAY_PICK_MAX_YAW_DEG
-                or not -tuning.max_retraction_mm <= reach <= 0):
+                or abs(reach-actual['reach_mm']) > .3):
             continue
-        target = [0, round(yaw*300), round(reach*36000/113.1)]
-        if (tuple(target) in visited
+        yield 0, round(yaw*300), round(reach*36000/113.1)
+
+
+def usable_view_pose(target, tuning, visited):
+    _, yaw, reach = target
+    min_yaw, max_yaw = tuning.tray_yaw_limits
+    return (min_yaw * 300 <= yaw <= max_yaw * 300
+            and math.ceil(-tuning.max_retraction_mm * 36000 / 113.1) <= reach <= 0
+            and not any(abs(yaw - previous[1]) <= ARRIVAL_TOLERANCES[1]
+                        and abs(reach - previous[2]) <= ARRIVAL_TOLERANCES[2]
+                        for previous in visited))
+
+
+def view_start_ok(arm):
+    # Encoder residuals at the photo origin can be slightly positive.
+    return -50 <= arm['z_cdeg'] <= 50 and TRAY_PARK[2] <= arm['reach_cdeg'] <= 95
+
+
+def measured_view_target(arm, pixel, reference, mapping, tuning, visited=()):
+    if not view_start_ok(arm):
+        return None
+    error = np.asarray(pixel) - reference['reference_pixel']
+    best_error = np.linalg.norm(error) - 3
+    best = None
+    for target in calibrated_view_poses(mapping):
+        if (not usable_view_pose(target, tuning, visited)
                 or abs(target[1]-arm['yaw_cdeg']) > tuning.max_yaw_step_deg*300
                 or abs(target[2]-arm['reach_cdeg'])*113.1/36000 > tuning.max_step_mm):
             continue
@@ -183,11 +215,14 @@ def measured_view_target(arm, pixel, reference, mapping, tuning, visited=()):
         delta = local_motion_mm(arm,end,reference['origin_radius_mm'])
         remaining = np.linalg.norm(error-np.linalg.solve(mapping['matrix'], delta))
         if remaining < best_error:
-            best_error, best = remaining, (target, float(np.linalg.norm(delta)))
+            best_error, best = remaining, (list(target), float(np.linalg.norm(delta)))
     return best
 
 
-def measured_edge_view(arm, pixel, reference, mapping, tuning, visited):
+def edge_view_target(arm, pixel, reference, mapping, tuning, visited):
+    """Use the partial rim hint to move the camera toward a clearer view."""
+    if not view_start_ok(arm):
+        return None
     width, height = reference['resolution']
     lower = np.array([.38 * width, .31 * height])
     upper = np.array([.62 * width, .69 * height])
@@ -196,31 +231,25 @@ def measured_edge_view(arm, pixel, reference, mapping, tuning, visited):
     initial_residual = np.linalg.norm(desired)
     if initial_residual < 18:
         return None
-    # These full ALIGN targets reached ALIGNED with fresh top faces in the
-    # 16:39 and 17:22 raw-station runs. Units are motor centidegrees.
-    poses = ((0, -328, -5379), (0, -380, -6499),
-             (0, -1205, -5377), (0, 1677, -6743))
-    best = None
-    best_score = (math.inf, math.inf)
-    for target in poses:
-        _, yaw, reach = target
-        if (target in visited
-                or -reach * 113.1 / 36000 > tuning.max_retraction_mm):
+    matrix = np.asarray(mapping['matrix'])
+    reference_radius = reference['origin_radius_mm']
+    # Aim for the nearest point of the inner window. Try a damped move first
+    # because the origin calibration can overestimate motion near an edge.
+    for gain in (.8, 1.):
+        radial, tangent = matrix @ (gain * desired)
+        target = tray_photo_target(arm, radial, tangent, reference_radius, tuning)
+        if target is None or not usable_view_pose(target, tuning, visited):
             continue
-        delta = local_motion_mm(arm, dict(yaw_cdeg=yaw, reach_cdeg=reach),
-                                reference['origin_radius_mm'])
-        shift = np.linalg.solve(mapping['matrix'], delta)
-        if abs(shift[0]) > 24 and shift[0] * (point[0] - width / 2) < 0:
-            continue
-        predicted = point - shift
-        remaining = np.linalg.norm(predicted - np.clip(predicted, lower, upper))
-        if remaining > initial_residual - 12:
-            continue
+        end = dict(yaw_cdeg=target[1], reach_cdeg=target[2])
+        delta = local_motion_mm(arm, end, reference_radius)
         distance = float(np.linalg.norm(delta))
-        score = (max(0., remaining - 8), distance)
-        if score < best_score:
-            best_score, best = score, (list(target), distance)
-    return best
+        if distance < 2.:
+            continue
+        predicted = point - np.linalg.solve(matrix, delta)
+        remaining = np.linalg.norm(predicted - np.clip(predicted, lower, upper))
+        if remaining <= initial_residual - 12:
+            return list(target), distance
+    return None
 
 
 class ViewpointNeeded(Exception):
@@ -262,7 +291,8 @@ def tray_correction(arm, error, reference_radius, matrix, tuning, grasp_radius, 
     if fraction < 1:
         target = [0, round(arm['yaw_cdeg'] + dyaw * fraction),
                   round(arm['reach_cdeg'] + dreach * fraction)]
-        target[1] = int(np.clip(target[1], -1800, 300 * TRAY_PICK_MAX_YAW_DEG))
+        min_yaw, max_yaw = tuning.tray_yaw_limits
+        target[1] = int(np.clip(target[1], 300 * min_yaw, 300 * max_yaw))
         target[2] = int(np.clip(target[2], math.ceil(-tuning.max_retraction_mm * 36000 / 113.1), 0))
         distance *= fraction
     return target, distance, coarse
@@ -316,10 +346,10 @@ class ArmTrial:
         return a
 
     @staticmethod
-    def envelope(a, max_yaw_deg=6., *, max_forward_mm=.4):
+    def envelope(a, max_yaw_deg=6., *, min_yaw_deg=-6., max_forward_mm=.4):
         if (not -100.4 <= a['z_cdeg']/900 <= .2
                 or not -60.6 <= a['reach_cdeg']*113.1/36000 <= max_forward_mm
-                or not -6.3 <= a['yaw_cdeg']/300 <= max_yaw_deg + .3):
+                or not min_yaw_deg - .3 <= a['yaw_cdeg']/300 <= max_yaw_deg + .3):
             raise RuntimeError('arm left trial stroke/clearance envelope')
 
     def wait_arm(self, wanted, transitional, *, target=None, vertical_from=None,
@@ -465,6 +495,8 @@ class ThreeColorTrial(ArmTrial):
         defaults = TrialTuning(tolerance_px=32., settle_s=0.) if real_tray else TrialTuning()
         super().__init__(client, output, tuning or defaults, clock=clock, sleep=sleep)
         self.real_tray = real_tray is True
+        if self.tuning.wide_tray_yaw and not self.real_tray:
+            raise ValueError('wide yaw requires real tray mode')
         allowed_drops = REAL_TRAY_PICK_DROPS_MM if self.real_tray else (DEFAULT_PICK_DROP_MM,)
         if pick_drop_mm is None and not self.real_tray:
             pick_drop_mm = DEFAULT_PICK_DROP_MM
@@ -534,8 +566,8 @@ class ThreeColorTrial(ArmTrial):
         raise TimeoutError('manual-key wait expired; no sequence started')
 
     def envelope(self, arm, *, max_forward_mm=.4):
-        super().envelope(arm, TRAY_PICK_MAX_YAW_DEG if self.real_tray else 6.,
-                         max_forward_mm=max_forward_mm)
+        min_yaw, max_yaw = self.tuning.tray_yaw_limits if self.real_tray else (-6., 6.)
+        super().envelope(arm, max_yaw, min_yaw_deg=min_yaw, max_forward_mm=max_forward_mm)
 
     def check_firmware_mode(self, arm):
         if not arm['standalone_test_mode']:
@@ -798,8 +830,8 @@ class ThreeColorTrial(ArmTrial):
                     self.sample_failed_observation(state, reason)
                 hint = state.get('material_view_hint') or {}
                 xy = hint.get('pixel') or []
-                if (self.real_tray and len(self.view_targets) < 3 and not materials
-                        and reason in ('top_face_not_confirmed','clipped_region_no_complete_rim')
+                if (self.real_tray and len(self.view_targets) < 4 and not materials
+                        and reason in RIM_HINT_STATUSES
                         and hint.get('color_id') == self.color and hint.get('source_sequence') == seq
                         and len(xy) == 2 and np.isfinite(xy).all()):
                     if view_points and stamp-view_points[-1][0] > .5:
@@ -819,7 +851,8 @@ class ThreeColorTrial(ArmTrial):
             else:
                 view_points.clear()
                 failed_frames = 0
-                if samples and stamp - samples[-1][0] > .7:
+                max_gap = .75 if self.real_tray else .7
+                if samples and stamp - samples[-1][0] > max_gap:
                     samples.clear()
                 track = materials[0].get('track_id')
                 reason = 'waiting for consistent fresh top-face positions'
@@ -828,15 +861,12 @@ class ThreeColorTrial(ArmTrial):
                     raise RuntimeError('nonfinite top face')
                 radius = tray_grasp_radius(materials[0].get('top_face_axes'), self.tuning.tolerance_px)
                 if samples and track != samples[-1][3]:
-                    _, previous, _, previous_track, previous_radius = samples[-1]
-                    reference = np.asarray(self.reference['reference_pixel'])
-                    nearby_in_grasp = (
+                    _, previous, _, previous_track, _ = samples[-1]
+                    nearby_same_color = (
                         self.real_tray and track is not None and previous_track is not None
-                        and np.linalg.norm(point - reference) <= radius
-                        and np.linalg.norm(previous - reference) <= previous_radius
                         and np.linalg.norm(np.subtract(point, previous)) <= TRAY_GRASP_JITTER_PX
                     )
-                    if not nearby_in_grasp:
+                    if not nearby_same_color:
                         samples.clear()
                 samples.append((stamp, point, seq, track, radius))
                 if confirmation_window_ready(samples, count, self.tuning.confirm_span_s):
@@ -844,23 +874,32 @@ class ThreeColorTrial(ArmTrial):
                     radius = min(s[4] for s in samples)
                     errors = np.asarray(points) - self.reference['reference_pixel']
                     in_grasp = bool(np.all(np.linalg.norm(errors, axis=1) <= radius))
-                    jitter = TRAY_GRASP_JITTER_PX if self.real_tray and in_grasp and track is not None else 3
+                    track_changed = any(sample[3] != track for sample in samples)
+                    jitter = (TRAY_GRASP_JITTER_PX
+                              if self.real_tray and track is not None and (in_grasp or track_changed)
+                              else 3)
                     frames = [dict(sequence=s[2], acquired=s[0]) for s in samples]
                     dynamics = observation_dynamics(points, frames)
+                    if track_changed:
+                        dynamics['stationary_for_mapping'] = False
+                    speed = float(np.linalg.norm(dynamics['velocity_px_s']))
                     spread = np.ptp(points, axis=0).max()
                     # A slowly rotating, uniquely tracked piece need not stand
                     # still for an approach. Descent still needs measured frames
                     # inside the grasp window, with the tighter jitter check.
                     tracking = (self.real_tray and not in_grasp and track is not None
-                                and spread <= 12 and dynamics['velocity_reliable']
-                                and np.linalg.norm(dynamics['velocity_px_s']) <= 30)
+                                and spread <= TRAY_GRASP_JITTER_PX and dynamics['velocity_reliable'])
                     if spread <= jitter or tracking:
                         if self.real_tray and self.first_target_seen is None:
                             self.first_target_seen = samples[0][0]
                         # The actuator needs seconds to reach the piece. A
                         # steady traversal of the grasp window cannot authorize it.
-                        if self.real_tray and in_grasp and dynamics['velocity_reliable']:
+                        if self.real_tray and in_grasp and speed > TRAY_STILL_SPEED_PX_S:
                             reason = 'target moving inside grasp window'
+                            self.sleep(.05)
+                            continue
+                        if self.real_tray and speed > TRAY_MAX_TRACKING_SPEED_PX_S:
+                            reason = f'target_moving:{speed:.1f}px/s'
                             self.sleep(.05)
                             continue
                         self.last_usable_state = state
@@ -927,9 +966,9 @@ class ThreeColorTrial(ArmTrial):
                     raise RuntimeError('arm left observation state')
                 plan = None
                 if not self.micro_only:
-                    plan = measured_edge_view(a, hint.pixel, self.reference, self.mapping,
-                                              self.tuning, self.view_targets)
-                coarse_view = plan is not None
+                    plan = edge_view_target(a, hint.pixel, self.reference, self.mapping,
+                                            self.tuning, self.view_targets)
+                computed_view = plan is not None
                 if plan is None:
                     plan = measured_view_target(a, hint.pixel, self.reference, self.mapping,
                                                 self.tuning, visited=self.view_targets)
@@ -944,12 +983,13 @@ class ThreeColorTrial(ArmTrial):
                     total += distance
                     adjustments += 1
                     self.record('rim_view_change', color_id=self.color, target_cdeg=target,
-                                selection_pixel=hint.pixel, combined_move=coarse_view)
+                                selection_pixel=hint.pixel, combined_move=computed_view,
+                                view_source='computed' if computed_view else 'calibration_sample')
                     self.align_to(target, before=a)
                 else:
                     self.last_unreachable_view_hint = hint.pixel
                     self.record('waiting_for_complete_rim', color_id=self.color, motion_sent=False,
-                                selection_pixel=hint.pixel, reason='no_available_measured_view')
+                                selection_pixel=hint.pixel, reason='no_available_viewpoint')
                 anchor, stagnant, need_acquire = None, 0, True
                 continue
             except ObservationUnavailable as e:
@@ -1045,6 +1085,7 @@ class ThreeColorTrial(ArmTrial):
             total += distance
             adjustments += 1
             self.align_to(target, before=a)
+            self.last_unreachable_view_hint = None
 
     def cycle(self):
         aligned, obs, error = self.align_color()
@@ -1144,6 +1185,8 @@ def main():
     parser.add_argument('--settle-s',type=float)
     parser.add_argument('--micro-only', action='store_true',
                         help='bound visual correction commands to micro steps, including far targets')
+    parser.add_argument('--wide-tray-yaw', action='store_true',
+                        help='real tray: allow -12..+22deg after checking physical clearance')
     parser.add_argument('--save-aligned-frame', action='store_true', help='save a debug JPEG before each pick')
     parser.add_argument('--max-step-mm',type=float,default=3.5)
     parser.add_argument('--max-yaw-step-deg',type=float,default=.8)
@@ -1155,13 +1198,15 @@ def main():
     order = parse_order(args.order)
     if not args.real_tray and args.pick_drop_mm not in (None, DEFAULT_PICK_DROP_MM):
         parser.error('simulation mode requires a 100 mm stroke')
+    if args.wide_tray_yaw and not args.real_tray:
+        parser.error('--wide-tray-yaw requires --real-tray')
     if args.tolerance_px is None:
         args.tolerance_px = 32. if args.real_tray else 8.
     if args.settle_s is None:
         args.settle_s = 0. if args.real_tray else .1
     tuning = TrialTuning(**{name:getattr(args,name) for name in (
         'tolerance_px','confirm_frames','confirm_span_s','settle_s',
-        'max_step_mm','max_yaw_step_deg','max_retraction_mm','alignment_budget_s')})
+        'max_step_mm','max_yaw_step_deg','max_retraction_mm','alignment_budget_s','wide_tray_yaw')})
     args.output.mkdir(parents=True, exist_ok=False)
     reference, mapping = (json.loads(p.read_text()) for p in (args.reference, args.mapping))
     def snapshot():
