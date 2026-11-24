@@ -28,7 +28,7 @@ class HSVMaterialDetector:
         self.max_area_ratio = max_area_ratio
         self.profile['shape'].update(min_area_ratio=min_area_ratio, max_area_ratio=max_area_ratio)
 
-    def detect(self, frame, *, diagnostics=None):
+    def detect(self, frame, *, diagnostics=None, requested_color=None):
         if diagnostics is not None:
             diagnostics.clear()
         if frame is None or frame.size == 0:
@@ -43,7 +43,11 @@ class HSVMaterialDetector:
         kernel = np.ones((kernel_size, kernel_size), np.uint8)
         close_kernel = np.ones((kernel_size*2-1, kernel_size*2-1), np.uint8)
         found = []
+        # Blue and cyan share one segmentation mask and are split by _blue_regions.
+        band_id = 3 if requested_color == 6 else requested_color
         for color_id, bands in ranges.items():
+            if band_id is not None and color_id != band_id:
+                continue
             mask = np.zeros((height, width), np.uint8)
             for low, high in bands:
                 mask |= cv2.inRange(hsv, np.array(low), np.array(high))
@@ -57,6 +61,8 @@ class HSVMaterialDetector:
             regions = (self._blue_regions(frame, hsv, mask, contours) if color_id == 3
                        else [(color_id, contour) for contour in contours])
             for output_color, contour in regions:
+                if requested_color is not None and output_color != requested_color:
+                    continue
                 contour_area = cv2.contourArea(contour)
                 if not self.min_area_ratio*area <= contour_area <= self.max_area_ratio*area:
                     continue
@@ -84,8 +90,17 @@ class HSVMaterialDetector:
                     point_kind = 'contour_area_centroid'
                 extra = {}
                 if self.center_method == 'top_face':
-                    from ..top_face import locate_top_face
+                    from ..top_face import axial_rim, locate_top_face
                     face, reason = locate_top_face(frame, contour)
+                    # A fit to the whole coloured silhouette can land on the wall.
+                    if requested_color in (2, 3) and reason != 'top_face_ambiguous' and (
+                            face is None or (max(face.axis_a, face.axis_b) > 1.23*min(face.axis_a, face.axis_b)
+                            and math.hypot(face.center_x-cx, face.center_y-cy) < .1*min(w,h))):
+                        rim = axial_rim(frame, contour)
+                        if rim is not None:
+                            face, reason = rim, 'top_face_ellipse_confirmed'
+                        elif face is not None:
+                            face, reason = None, 'top_face_not_confirmed'
                     extra = dict(selection_center_x=cx, selection_center_y=cy,
                                  localization_valid=face is not None, localization_status=reason)
                     point_kind = 'top_face_ellipse_center'

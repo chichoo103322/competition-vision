@@ -20,7 +20,7 @@ class MaterialRegionDetector:
         self.detector = detector
         self.roi = tuple(roi)
 
-    def detect(self, frame):
+    def detect(self, frame, **detector_options):
         if frame is None or frame.size == 0:
             return []
         x, y, width, height = self.roi
@@ -28,7 +28,7 @@ class MaterialRegionDetector:
         if x + width > image_width or y + height > image_height:
             raise ValueError(f"物料识别区域 {self.roi} 超出实际画面 {image_width}×{image_height}")
         crop = frame[y:y + height, x:x + width]
-        found = self.detector.detect(crop)
+        found = self.detector.detect(crop, **detector_options)
         # 边界外中心不能成为可执行定位结果。
         return ordered_materials([
             replace(item, center_x=item.center_x + x, center_y=item.center_y + y,
@@ -68,7 +68,7 @@ def center_material(materials, window, frame_size, ambiguity_px=12.):
     return ordered_materials([candidates[0][1]])
 
 
-def search_material(materials, window, frame_size, color_id):
+def search_material_result(materials, window, frame_size, color_id):
     """Raw-station search: one requested-color object anywhere in the configured window.
 
     Select before top-face validation. Two same-color objects are ambiguous,
@@ -76,6 +76,15 @@ def search_material(materials, window, frame_size, color_id):
     """
     if type(color_id) is not int or not 1 <= color_id <= 6:
         raise ValueError('business color must be 1..6')
-    candidates = [m for _, m in _window_candidates(materials, window, frame_size)
-                  if m.color_id == color_id]
-    return ordered_materials(candidates) if len(candidates) == 1 else []
+    matching = [m for m in materials if m.color_id == color_id]
+    candidates = _window_candidates(matching, window, frame_size)
+    if not candidates:
+        return [], 'requested_color_outside_window' if matching else 'requested_color_not_seen'
+    if len(candidates) > 1:
+        return [], 'multiple_requested_color_objects'
+    material = candidates[0][1]
+    return ordered_materials([material]), material.localization_status
+
+
+def search_material(materials, window, frame_size, color_id):
+    return search_material_result(materials, window, frame_size, color_id)[0]

@@ -10,6 +10,14 @@ def age_ms(now, acquired_at, sequence):
     return round((now - acquired_at) * 1000, 1)
 
 
+def confirmation_window_ready(samples, min_frames, min_span):
+    """Keep the shortest consecutive suffix that meets both count and duration."""
+    latest = samples[-1][0]
+    while len(samples) > min_frames and latest - samples[1][0] >= min_span - 1e-9:
+        samples.popleft()
+    return len(samples) >= min_frames and latest - samples[0][0] >= min_span - 1e-9
+
+
 @dataclass
 class Observation:
     sequence: int = 0

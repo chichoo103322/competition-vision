@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 from urllib.parse import urlsplit
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -21,6 +22,7 @@ import numpy as np
 from .camera import Camera
 from .config import CameraConfig, VisionConfig, load_config
 from .hsv_profile import load_profile, profile_hash
+from .detectors.hsv_material_detector import HSVMaterialDetector
 from .diagnostics import DiagnosticRecorder
 from .observation import Observation, age_ms
 from .pipeline import VisionPipeline
@@ -29,7 +31,7 @@ from .rotation_gate import RotationGate
 from .material_tracking import MaterialStability, MaterialTracker
 from .task_confirmation import TaskCodeConfirmation, parse_competition_task
 from .preview_page import FRAME_CLIENT_JS
-from .material_region import MaterialRegionDetector, ordered_materials, center_material, search_material
+from .material_region import MaterialRegionDetector, ordered_materials, center_material, search_material_result
 from .protocol import (
     COLOR,
     CMD_RESCAN,
@@ -103,6 +105,8 @@ class FrameStreamer:
                 or material_target_window is None):
             raise ValueError('material color search requires business color 1..6 and an explicit search window')
         self.material_search_color = material_search_color
+        self._rim_view_hint = None
+        self._material_sample_frames = deque(maxlen=3)
         self.capture_timeout = capture_timeout
         self.result_timeout = result_timeout
         self.qr_timeout = qr_timeout
@@ -256,6 +260,13 @@ class FrameStreamer:
         state.update(session_id=self.session_id, generation=self._qr_generation, capture_epoch=self._capture_epoch,
                      coordinate_frame='camera_image', coordinate_units='pixels')
         return state
+
+    def material_sample(self, key):
+        with self._lock:
+            for sample_key, frame in self._material_sample_frames:
+                if key == sample_key:
+                    return frame
+        return None
 
     def get_material_snapshot(self):
         """Atomic effective results plus source metadata; never refresh cached timestamps."""
@@ -494,6 +505,7 @@ class FrameStreamer:
                     "source_width": self._latest_raw.shape[1] if self._latest_raw is not None else 0,
                     "source_height": self._latest_raw.shape[0] if self._latest_raw is not None else 0,
                 },
+                "material_view_hint": self._rim_view_hint if material_observation['valid'] else None,
                 "material_target_window": self.material_target_window,
                 "material_localization_status": self._material_localization_status if material_observation['valid'] else 'unavailable',
                 "material_selection": ("unique_color_in_search_window" if self.material_search_color is not None
@@ -637,6 +649,7 @@ class FrameStreamer:
                 generation = self._qr_generation
                 epoch = self._capture_epoch
                 floor = self._mode_source_floor
+                requested_color = self.material_search_color
                 enabled = {'materials': self.enable_materials, 'rings': self.enable_rings,
                            'qr': self.enable_qr and (self._latest_qr is not None or time.monotonic()-self._qr_session_started_at < self.qr_timeout)}
                 capture_valid = self._capture_state_locked(time.monotonic())['valid']
@@ -652,7 +665,12 @@ class FrameStreamer:
             for kind in ('materials', 'rings'):
                 if enabled[kind]:
                     detector = self._pipeline.material_detector if kind == 'materials' else self._pipeline.ring_detector
-                    futures[kind] = self._executor.submit(detector.detect, frame)
+                    options = {}
+                    if kind == 'materials' and requested_color is not None:
+                        base = detector.detector if isinstance(detector, MaterialRegionDetector) else detector
+                        if isinstance(base, HSVMaterialDetector):
+                            options['requested_color'] = requested_color
+                    futures[kind] = self._executor.submit(detector.detect, frame, **options)
             if enabled['qr']:
                 qr_source, qr_acquired, qr_wall = sequence, acquired_at, wall_time
                 try:
@@ -686,7 +704,8 @@ class FrameStreamer:
                     pending.append(future)
                 except Exception as exc:
                     error = f'{type(exc).__name__}: {exc}'
-                published = self._finish_detection(kind, result, sequence, acquired_at, wall_time, generation, epoch, error)
+                published = self._finish_detection(kind, result, sequence, acquired_at, wall_time, generation, epoch, error,
+                                                   source_frame=frame)
                 if kind == 'materials':
                     material_error = error
                     material_published = published
@@ -722,7 +741,7 @@ class FrameStreamer:
             else:
                 next_detect = time.monotonic()
 
-    def _finish_detection(self, kind, result, source, acquired, wall, generation, epoch, error=None):
+    def _finish_detection(self, kind, result, source, acquired, wall, generation, epoch, error=None, *, source_frame=None):
         with self._lock:
             now = time.monotonic()
             if generation != self._qr_generation or epoch != self._capture_epoch or not self._capture_state_locked(now)['valid']:
@@ -735,22 +754,36 @@ class FrameStreamer:
             if error and (observation.errors == 1 or observation.errors % 30 == 0):
                 LOGGER.error('%s detection failed: %s', kind, error)
             if kind == 'materials':
+                search_status = None
                 if self.material_target_window is not None and not error:
                     try:
                         size = (self._latest_raw.shape[1], self._latest_raw.shape[0])
-                        effective = (search_material(effective, self.material_target_window, size,
-                                                     self.material_search_color)
-                                     if self.material_search_color is not None else
-                                     center_material(effective, self.material_target_window, size))
+                        if self.material_search_color is not None:
+                            effective, search_status = search_material_result(
+                                effective, self.material_target_window, size, self.material_search_color)
+                        else:
+                            effective = center_material(effective, self.material_target_window, size)
                     except ValueError:
                         effective = []
                         observation.error = 'invalid_material_target_window'
                         observation.errors += 1
-                self._material_localization_status = (effective[0].localization_status if len(effective)==1
-                                                      else 'no_target' if not effective else 'multiple_targets')
+                self._material_localization_status = search_status or (
+                    effective[0].localization_status if len(effective) == 1
+                    else 'no_target' if not effective else 'multiple_targets')
+                self._rim_view_hint = None
+                if (self.material_search_color is not None and len(effective) == 1
+                        and not effective[0].localization_valid and not observation.error
+                        and search_status in ('top_face_not_confirmed', 'clipped_region_no_complete_rim')):
+                    m = effective[0]
+                    if m.selection_center_x is not None and m.selection_center_y is not None:
+                        self._rim_view_hint = dict(color_id=m.color_id, source_sequence=source,
+                            pixel=[m.selection_center_x, m.selection_center_y])
                 effective = [m for m in effective if m.localization_valid]
                 self._latest_materials = self._material_tracker.update(
                     ordered_materials(effective), acquired)
+                if self.material_search_color is not None and source_frame is not None and not observation.error:
+                    key = f'{self.session_id}-{generation}-{epoch}-{source}'
+                    self._material_sample_frames.append((key, source_frame))
                 self._material_sequence = observation.sequence
                 self._material_source_sequence = source
                 self._material_acquired_at = acquired
@@ -1015,6 +1048,21 @@ class StreamHandler(BaseHTTPRequestHandler):
             self._send_stream()
         elif path == "/frame.jpg":
             self._send_frame()
+        elif path.startswith('/material-sample/') and path.endswith('.png'):
+            frame = _streamer.material_sample(path[len('/material-sample/'):-4])
+            if frame is None:
+                self.send_error(404)
+                return
+            ok, data = cv2.imencode('.png', frame, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+            if not ok:
+                self.send_error(503)
+                return
+            self.send_response(200)
+            self.send_header('Content-Type', 'image/png')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Content-Length', str(data.nbytes))
+            self.end_headers()
+            self.wfile.write(data.tobytes())
         elif path == "/state":
             self._send_state()
         else:

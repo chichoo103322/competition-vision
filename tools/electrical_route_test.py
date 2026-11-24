@@ -151,6 +151,14 @@ def validate_geometry(state, route, field_map):
             turn_rectangles += [rect for cell, rect in grid_obstacles.items() if cell not in ignored_turn_cells]
         validate_route_footprint(nominal_route, footprint, field_map['boundary_mm'], rectangles,
                                  turn_rectangles=turn_rectangles)
+        if route.get('qr_search') and (ignore_all_turn_obstacles or ignored_turn_cells):
+            # Keep the new sweep fully checked even when an older test profile
+            # carries a turn-obstacle override for its existing stations.
+            near_index = route['qr_search']['near_index']
+            prior = nominal_points[near_index-1] if near_index else nominal_initial
+            search_route = dict(initial_pose=prior,
+                                points=nominal_points[near_index:route['qr_search']['return_index']+1])
+            validate_route_footprint(search_route, footprint, field_map['boundary_mm'], rectangles)
     initial_nominal = electrical_to_nominal_pose(route['initial_pose'])
     if grid_id(initial_nominal['x_mm'] / 1000, initial_nominal['y_mm'] / 1000) != (
             4 if route['start_zone'] == 1 else 0):
@@ -228,6 +236,10 @@ def run_closed_loop(client, route, *, station_dwell_s, poll_s, timeout_s, log,
     released = set()
     last_key = None
     qr_result = None
+    qr_search = route.get('qr_search')
+    search_gates = {qr_search['near_index'], qr_search['far_index']} if qr_search else set()
+    if qr_search and qr_work is None:
+        raise ValueError('QR search requires fresh camera work')
     arm_station_result = None
 
     def check_deadline():
@@ -235,6 +247,25 @@ def run_closed_loop(client, route, *, station_dwell_s, poll_s, timeout_s, log,
             raise InterruptedError('test cancelled')
         if clock() >= deadline:
             raise TimeoutError('route test deadline exceeded')
+
+    def release_work(status):
+        ack = client.work_done(route['route_id'], status['point_index'], success=True)
+        if (ack.get('request') != 0x13 or ack.get('code') != 0 or
+                ack['route_id'] != route['route_id'] or
+                ack['point_index'] not in (status['point_index'], status['point_index'] + 1) or
+                ack['state'] in (0, 1, 5, 6) or ack['fault'] or ack['chassis_fault']):
+            raise RuntimeError('WORK_DONE ACK rejected/mismatched')
+        released.add((route['route_id'], status['point_index']))
+
+    def checked_qr(observation, point_index, source):
+        if observation.get('confirmed') is not True:
+            raise RuntimeError('QR work returned an unconfirmed task')
+        from pi_vision.task_confirmation import parse_competition_task
+        parse_competition_task(observation['raw'])
+        result = dict(observation, route_id=route['route_id'],
+                      point_index=point_index, scan_source=source)
+        log.append(dict(action='qr_task_confirmed', **result))
+        return result
 
     try:
         check_deadline()
@@ -282,6 +313,20 @@ def run_closed_loop(client, route, *, station_dwell_s, poll_s, timeout_s, log,
                                 travel_yaw_deg=point.get('travel_yaw_deg', point['yaw_deg']),
                                 expected_work_yaw_deg=expected_work_yaw(route, point)))
                 last_key = key
+            if qr_search and completed == 0:
+                point_index = status['point_index']
+                for gate in search_gates:
+                    if point_index > gate and (route['route_id'], gate) not in released:
+                        raise RuntimeError('QR search gate skipped without confirmed release')
+                if ((route['route_id'], qr_search['near_index']) in released
+                        and qr_result is None):
+                    if wait_since is not None and clock() - wait_since >= qr_work.timeout:
+                        raise TimeoutError('QR search and stationary fallback found no confirmed task')
+                    observation = qr_work.poll()
+                    check_deadline()
+                    if observation is not None:
+                        source = ('search' if wait_since is None else 'return_station')
+                        qr_result = checked_qr(observation, qr_search['return_index'], source)
             if status['state'] == 4:
                 if completed != gates or not at_target(status, route['points'][-1]):
                     raise RuntimeError('premature DONE or wrong final estimated pose')
@@ -314,6 +359,15 @@ def run_closed_loop(client, route, *, station_dwell_s, poll_s, timeout_s, log,
                 pose_error = work_pose_error(status, route, status['point_index'])
                 if pose_error:
                     raise RuntimeError(pose_error)
+                if status['point_index'] in search_gates:
+                    if new_tick:
+                        if status['point_index'] == qr_search['near_index']:
+                            qr_work.start(timeout_s=deadline-clock())
+                            log.append(dict(action='qr_search_start', point_index=status['point_index']))
+                        release_work(status)
+                        log.append(dict(action='qr_search_gate_released', point_index=status['point_index']))
+                    sleep(poll_s)
+                    continue
                 current_key = (route['route_id'], status['point_index'])
                 is_qr = qr_work is not None and segment['work_id'] == 101
                 is_arm = arm_work is not None and 102 <= segment['work_id'] <= 107
@@ -321,9 +375,11 @@ def run_closed_loop(client, route, *, station_dwell_s, poll_s, timeout_s, log,
                     wait_since = clock()
                     wait_key = current_key
                     if is_qr:
-                        qr_work.start()
+                        if not qr_search:
+                            qr_work.start()
                         log.append(dict(action='qr_station_scan_start', segment=completed + 1,
-                                        point_index=status['point_index']))
+                                        point_index=status['point_index'],
+                                        already_confirmed=qr_result is not None))
                     elif is_arm:
                         arm_station_result = None
                         arm_work.start(status, qr_result)
@@ -338,17 +394,12 @@ def run_closed_loop(client, route, *, station_dwell_s, poll_s, timeout_s, log,
                                             route, route['points'][status['point_index']])))
                 ready = False
                 if is_qr:
-                    observation = qr_work.poll()
-                    check_deadline()
-                    if observation is not None and new_tick:
-                        if observation.get('confirmed') is not True:
-                            raise RuntimeError('QR work returned an unconfirmed task')
-                        from pi_vision.task_confirmation import parse_competition_task
-                        parse_competition_task(observation['raw'])
-                        qr_result = dict(observation, route_id=route['route_id'],
-                                         point_index=status['point_index'])
-                        log.append(dict(action='qr_task_confirmed', **qr_result))
-                        ready = True
+                    if not qr_search and qr_result is None:
+                        observation = qr_work.poll()
+                        check_deadline()
+                        if observation is not None:
+                            qr_result = checked_qr(observation, status['point_index'], 'station')
+                    ready = qr_result is not None and new_tick
                 elif is_arm:
                     if arm_station_result is None:
                         arm_station_result = arm_work.poll(status)
@@ -379,13 +430,7 @@ def run_closed_loop(client, route, *, station_dwell_s, poll_s, timeout_s, log,
                 else:
                     ready = new_tick and clock() - wait_since >= station_dwell_s
                 if ready:
-                    ack = client.work_done(route['route_id'], status['point_index'], success=True)
-                    if (ack.get('request') != 0x13 or ack.get('code') != 0 or
-                            ack['route_id'] != route['route_id'] or
-                            ack['point_index'] not in (status['point_index'], status['point_index'] + 1) or
-                            ack['state'] in (0, 1, 5, 6) or ack['fault'] or ack['chassis_fault']):
-                        raise RuntimeError('WORK_DONE ACK rejected/mismatched')
-                    released.add(current_key)
+                    release_work(status)
                     completed += 1
                     log.append(dict(action='test_station_released', segment=completed,
                                     synthetic_work_done=not is_qr, point_index=status['point_index']))

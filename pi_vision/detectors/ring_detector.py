@@ -101,6 +101,7 @@ class RingDetector:
         # 用径向重叠判据（圆心距 < 0.6*(r_max1+r_max2)）把"同组环分裂"重新并回一个中心。
         clusters = self._merge_concentric_clusters(clusters)
         rings = []
+        edges = None
         for center_x, center_y, radii, max_deviation in clusters:
             if max_deviation > self.center_tolerance:
                 continue
@@ -117,7 +118,9 @@ class RingDetector:
             cx_out = center_x
             cy_out = center_y
             if self.refine_center:
-                refined = self._fit_ellipse_center(gray, center_x, center_y, max(merged_radii))
+                if edges is None:
+                    edges = cv2.Canny(gray, 50, 150)
+                refined = self._fit_ellipse_center(edges, center_x, center_y, max(merged_radii))
                 if refined is not None:
                     cx_out, cy_out = refined
             # 一组同心圆只上报一个中心坐标（含单个圆环的情况）
@@ -133,7 +136,7 @@ class RingDetector:
             )
         return self._temporal_smooth(rings)
 
-    def _fit_ellipse_center(self, gray, cx: float, cy: float, radius: float):
+    def _fit_ellipse_center(self, edges, cx: float, cy: float, radius: float):
         """在环带边缘点上拟合椭圆，返回透视下的真实环中心；不可靠则返回 None。
 
         斜俯视下圆环呈透视椭圆，霍夫正圆拟合的圆心会沿投影轴偏移；环带(0.85~1.15r)
@@ -142,13 +145,15 @@ class RingDetector:
         """
         if radius < 5:
             return None
-        edges = cv2.Canny(gray, 50, 150)
-        h, w = gray.shape
-        ys, xs = np.ogrid[:h, :w]
+        h, w = edges.shape
+        outer = 1.15 * radius
+        x0, y0 = max(0, int(np.floor(cx - outer))), max(0, int(np.floor(cy - outer)))
+        x1, y1 = min(w, int(np.ceil(cx + outer)) + 1), min(h, int(np.ceil(cy + outer)) + 1)
+        ys, xs = np.ogrid[y0:y1, x0:x1]
         d2 = (xs - cx) ** 2 + (ys - cy) ** 2
         band = (d2 <= (1.15 * radius) ** 2) & (d2 >= (0.85 * radius) ** 2)
-        pts_y, pts_x = np.where(band & (edges > 0))
-        pts = np.column_stack([pts_x, pts_y]).astype(np.float32)
+        pts_y, pts_x = np.where(band & (edges[y0:y1, x0:x1] > 0))
+        pts = np.column_stack([pts_x + x0, pts_y + y0]).astype(np.float32)
         if pts.shape[0] < 12:
             return None
         try:

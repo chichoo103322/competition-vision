@@ -96,3 +96,16 @@ def test_switching_turntable_color_invalidates_inflight_and_previous_target():
             assert stream.get_state()['materials'] == []
         finally:
             stream._executor.shutdown(wait=False)
+
+
+def test_wider_disc_search_explains_missing_ambiguous_and_outside():
+    from pi_vision.material_region import search_material_result
+    window, size = (320, 120, 640, 480), (1280, 720)
+    edge = m(2, 840, 500)
+    for objects, reason in [
+        ([m(1, 648, 359)], 'requested_color_not_seen'),
+        ([m(2, 1100, 600)], 'requested_color_outside_window'),
+        ([edge, m(2, 648, 359)], 'multiple_requested_color_objects'),
+    ]:
+        assert search_material_result(objects, window, size, 2) == ([], reason)
+    assert search_material_result([edge, m(1, 648, 359)], window, size, 2)[0] == [edge]

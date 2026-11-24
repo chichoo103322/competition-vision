@@ -172,6 +172,31 @@ def test_observer_rejects_duplicate_id_and_old_frame():
         observer.observe({1,2,3}, all_rings=True, floor=now[0], timeout=1)
 
 
+@pytest.mark.parametrize('jitter', [0, 4])
+def test_observer_uses_full_stable_interval_at_25_hz(jitter):
+    now = [0.]
+    seq = [0]
+
+    def snapshot():
+        seq[0] += 1
+        x = 200 + jitter * (seq[0] % 2)
+        return dict(session_id='test', capture=dict(valid=True, epoch=0),
+                    preview=dict(source_width=1280, source_height=720),
+                    ring_observation=dict(valid=True, capture_epoch=0, source_sequence=seq[0],
+                                          acquired_monotonic_s=now[0]),
+                    rings=[dict(position_id=1, center_x=x, center_y=350, digit_score=.9,
+                                point_kind='ring_circle_center')])
+
+    observer = RingObserver(snapshot, [1280, 720], clock=lambda: now[0],
+                            sleep=lambda dt: now.__setitem__(0, now[0]+dt))
+    if jitter:
+        with pytest.raises(TimeoutError):
+            observer.observe({1}, floor=0, timeout=.5)
+    else:
+        assert observer.observe({1}, floor=0, timeout=.5)[1].tolist() == [200, 350]
+        assert observer.confirmation_frames >= 7 and observer.span_s >= .25
+
+
 def test_calibration_only_tracks_previously_verified_unreadable_ring():
     anchors = {3: [300, 400], 2: [640, 400], 1: [980, 400]}
     rings = [dict(position_id=n, center_x=x, center_y=440, point_kind='ring_circle_center')

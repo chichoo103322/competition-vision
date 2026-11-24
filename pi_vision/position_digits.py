@@ -52,7 +52,11 @@ class DigitReader:
                     for thickness in (2, 3, 4):
                         image = np.zeros((110, 110), np.uint8)
                         cv2.putText(image, str(digit), (12, 85), font, scale, 255, thickness, cv2.LINE_8)
-                        self.templates[digit].append(normalize(image))
+                        self.add_template(digit, normalize(image))
+
+    def add_template(self, digit, mask):
+        bits = int.from_bytes(np.packbits(mask).tobytes(), 'little')
+        self.templates[digit].append((bits, bits.bit_count()))
 
     @staticmethod
     def _remove_plan_dimension_lines(binary):
@@ -99,10 +103,11 @@ class DigitReader:
         for offset in (0, 90, 180, 270):
             orientation = (self.orientation_degrees+offset) % 360
             glyph = normalize(np.rot90(component, k=-(orientation//90)).copy())
+            bits = int.from_bytes(np.packbits(glyph).tobytes(), 'little')
+            area = bits.bit_count()
             for digit, templates in self.templates.items():
-                score = max(2.*np.count_nonzero(glyph & template)/
-                            (np.count_nonzero(glyph)+np.count_nonzero(template))
-                            for template in templates)
+                score = max(2. * (bits & template).bit_count() / (area + template_area)
+                            for template, template_area in templates)
                 if score > scores[digit][0]:
                     scores[digit] = (score, orientation)
         ranked = sorted(scores, key=lambda digit: scores[digit][0], reverse=True)

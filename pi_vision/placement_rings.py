@@ -35,7 +35,7 @@ class PlacementRings:
                         canvas = Image.new('L', (96, 96))
                         ImageDraw.Draw(canvas).text((10, 4), str(digit), font=font,
                                                      fill=255, stroke_width=stroke)
-                        self.reader.templates[digit].append(normalize(cv2.threshold(np.asarray(canvas), 128, 255, cv2.THRESH_BINARY)[1]))
+                        self.reader.add_template(digit, normalize(cv2.threshold(np.asarray(canvas), 128, 255, cv2.THRESH_BINARY)[1]))
 
     def detect(self, frame):
         if (frame.shape[1], frame.shape[0]) != self.resolution:

@@ -85,3 +85,83 @@ def test_round_silhouette_with_visible_dark_side_prefers_inner_top_rim():
     assert len(candidates)==1 and candidates[0].localization_valid
     assert abs(candidates[0].center_x-155)<=2
     assert abs(candidates[0].center_y-114)<=2
+
+
+def test_similar_brightness_yellow_end_is_distinct_from_cylinder_side():
+    def yellow(sat, value):
+        return tuple(map(int, cv2.cvtColor(np.uint8([[[27, sat, value]]]), cv2.COLOR_HSV2BGR)[0,0]))
+    image = np.full((360,640,3), 185, np.uint8)
+    # Shape, position and saturation contrast from the yellow disc-edge preview.
+    side = yellow(160, 190)
+    cv2.line(image, (376,212), (414,249), side, 108)
+    cv2.circle(image, (414,249), 54, yellow(212,188), -1)
+    obj, = HSVMaterialDetector(center_method='top_face').detect(image)
+    assert obj.localization_valid
+    assert abs(obj.center_x - 414) <= 2 and abs(obj.center_y - 249) <= 2
+    assert obj.center_x - obj.selection_center_x > 10
+
+
+@pytest.mark.parametrize('rotate', [0, 1, 2, 3])
+def test_clipped_side_with_entire_top_visible(rotate):
+    # Crop only the bottom of the wall; rotate to exercise all four borders.
+    im = np.ascontiguousarray(np.rot90(scene()[:146], rotate))
+    obj, = HSVMaterialDetector(center_method='top_face').detect(im)
+    expected = [(150,95), (95,249), (249,50), (50,150)][rotate]
+    assert obj.localization_valid and np.linalg.norm(np.array([obj.center_x,obj.center_y])-expected) <= 2
+    clipped = np.ascontiguousarray(np.rot90(scene()[85:146], rotate))
+    assert not any(m.localization_valid for m in HSVMaterialDetector(center_method='top_face').detect(clipped))
+
+
+def test_failure_image_cache_matches_detection_source_and_expires_old_keys():
+    cam = Mock()
+    pipe = SimpleNamespace(qr_camera=cam, material_detector=Mock())
+    with patch('pi_vision.stream.time.monotonic', return_value=10.):
+        s = FrameStreamer(cam, pipe, enable_qr=False, enable_rings=False,
+                          material_target_window=(0,0,30,30), material_search_color=2)
+        try:
+            for seq in range(1, 5):
+                frame = np.full((30,30,3), seq, np.uint8)
+                s._latest_raw, s._raw_sequence, s._raw_acquired_at = frame, seq, 10.
+                assert s._finish_detection('materials', [], seq, 10., 100., 0, 0, source_frame=frame)
+            assert s.material_sample(f'{s.session_id}-0-0-1') is None
+            assert np.all(s.material_sample(f'{s.session_id}-0-0-2') == 2)
+            assert s.material_sample(f'{s.session_id}-1-0-2') is None
+        finally:
+            s._executor.shutdown(wait=False)
+
+
+def test_unique_unlocalized_body_hint_is_separate_from_grasp_coordinates():
+    cam = Mock()
+    pipe = SimpleNamespace(qr_camera=cam, material_detector=Mock())
+    m = Material(1,2,0,200,200,0.,90,localization_valid=False,
+                 localization_status='clipped_region_no_complete_rim',selection_center_x=201.,selection_center_y=199.)
+    with patch('pi_vision.stream.time.monotonic',return_value=10.):
+        s=FrameStreamer(cam,pipe,enable_qr=False,enable_rings=False,
+                        material_target_window=(0,0,400,300),material_search_color=2)
+        try:
+            s._latest_raw=np.zeros((300,400,3),np.uint8);s._raw_acquired_at=10.;s._raw_sequence=1
+            s._finish_detection('materials',[m],1,10.,100.,0,0)
+            state=s.get_state()
+            assert state['materials']==[] and state['material_view_hint']==dict(
+                color_id=2,source_sequence=1,pixel=[201.,199.])
+            s._finish_detection('materials',[m,replace(m,index=2)],2,10.,100.,0,0)
+            assert s.get_state()['material_view_hint'] is None
+        finally:
+            s._executor.shutdown(wait=False)
+
+
+@pytest.mark.parametrize('show_rim', [False, True])
+def test_elongated_yellow_region_requires_internal_rim_for_axial_fit(show_rim):
+    from pi_vision.top_face import axial_rim
+    image = np.full((360,640,3), 170, np.uint8)
+    side = (45,151,168)
+    cv2.line(image,(370,215),(428,216),side,104)
+    if show_rim:
+        cv2.circle(image,(428,216),52,(32,155,170),-1)
+    mask = cv2.inRange(image,(0,115,130),(65,180,190))
+    contour = max(cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)[0],key=cv2.contourArea)
+    face = axial_rim(image, contour)
+    if show_rim:
+        assert face and abs(face.center_x-428)<4 and abs(face.center_y-216)<4
+    else:
+        assert face is None

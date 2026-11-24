@@ -150,6 +150,57 @@ def compile_preview(plan, nodes, *, route_id, initial_pose, segment_yaws_deg,
     return result
 
 
+def add_qr_search(route, field_map, search_rpm):
+    """Expand test stage 1, leaving its original QR gate and all later legs intact."""
+    integer(search_rpm, 1, route['approach_rpm'], 'QR search rpm')
+    if not route.get('work_heading_mode_active') or not route.get('footprint'):
+        raise ValueError('QR search requires work-heading firmware and a measured chassis footprint')
+    if route.get('qr_search') or route.get('test_mode') != 'chassis_route_dry_work':
+        raise ValueError('QR search is only supported on an unmodified chassis test route')
+    reference = next((entry.get('y_reference_from_top_mm')
+                      for entry in field_map.get('variable_references', [])
+                      if entry['id'] == 'qr_board'), None)
+    if (not isinstance(reference, list) or len(reference) != 2 or
+            any(type(value) is not int for value in reference) or
+            not 0 < reference[0] < reference[1] < 2400):
+        raise ValueError('missing or invalid QR search band in field map')
+    low, high = reference  # After the 180° map transform this distance is electrical +Y.
+    zone = route['start_zone']
+    if zone not in (1, 2):
+        raise ValueError('QR search requires start zone 1 or 2')
+    near, far = (low, high) if zone == 1 else (high, low)
+    route = deepcopy(route)
+    first = route['segments'][0]
+    end = first['last_point_index']
+    original = route['points'][end]
+    if original['work_id'] != 101 or not low < original['y_mm'] < high:
+        raise ValueError('original QR gate must lie inside the search band')
+    if wrap_deg(expected_work_yaw(route, original)) != -180:
+        raise ValueError('QR search requires the existing work heading towards the left-side board')
+    prior = route['points'][end-1] if end else route['initial_pose']
+    # At the band ends, the nominal lane's 90° turn sweeps a rear corner
+    # into the yellow area. Move the search line 50 mm toward the board,
+    # then rejoin the original route on its centerline.
+    scan_x = original['x_mm'] - 50
+    approach = [] if prior['x_mm'] == original['x_mm'] else [dict(original, work_id=0)]
+    approach.append(dict(original, work_id=0, y_mm=near, move_rpm=search_rpm))
+    gates = [dict(original, x_mm=scan_x, y_mm=y, move_rpm=search_rpm) for y in (near, far)]
+    rejoin = dict(original, work_id=0, x_mm=scan_x, move_rpm=search_rpm)
+    replacement = [*approach, *gates, rejoin, dict(original, move_rpm=search_rpm)]
+    first_gate = end + len(approach)
+    route['points'][end:end+1] = replacement
+    count = len(replacement) - 1
+    first['last_point_index'] += count
+    for segment in route['segments'][1:]:
+        segment['first_point_index'] += count
+        segment['last_point_index'] += count
+    route['qr_search'] = dict(near_index=first_gate, far_index=first_gate+1,
+                              return_index=first['last_point_index'])
+    configure_work_heading_mode(route, True)
+    upload_payload(route)
+    return route
+
+
 def segment_for_status(route, status):
     """Local stage mapping; V1 transmits point index, not segment index."""
     if status['route_id'] != route['route_id'] or status['point_count'] != len(route['points']):
@@ -158,8 +209,12 @@ def segment_for_status(route, status):
         return dict(segment=route['segments'][-1]['segment'], route_done=True)
     for segment in route['segments']:
         if segment['first_point_index'] <= status['point_index'] <= segment['last_point_index']:
-            if status['state'] == 3 and (status['point_index'] != segment['last_point_index'] or
-                                          status['work_id'] != segment['work_id']):
+            search = route.get('qr_search') or {}
+            search_gate = segment['segment'] == 1 and status['point_index'] in (
+                search.get('near_index'), search.get('far_index'))
+            if status['state'] == 3 and ((not search_gate and
+                                          status['point_index'] != segment['last_point_index']) or
+                                         status['work_id'] != segment['work_id']):
                 raise ValueError('unexpected work gate')
             return dict(segment, route_done=False)
     raise ValueError('point index outside route')

@@ -1,5 +1,6 @@
 """Experimental color backend: identity, false positives and pipeline selection."""
 
+from dataclasses import replace
 import unittest
 from unittest.mock import patch
 
@@ -93,6 +94,20 @@ class HSVMaterialTests(unittest.TestCase):
         paint(image, (180, 200), (110, 220, 210), radius=50)
         paint(image, (270, 200), (98, 130, 240), radius=50)
         self.assertEqual([m.color_id for m in HSVMaterialDetector().detect(image)], [3, 6])
+
+    def test_requested_color_matches_full_search_with_roi_and_ambiguous_cyan(self):
+        image = background()
+        paint(image, (150, 200), (110, 220, 210), radius=50)
+        paint(image, (240, 200), (98, 130, 240), radius=50)
+        paint(image, (420, 200), (98, 130, 240), radius=50)
+        detector = MaterialRegionDetector(HSVMaterialDetector(center_method='top_face'),
+                                          (30, 20, 530, 360))
+        full = detector.detect(image)
+        self.assertEqual([m.color_id for m in full], [3, 6, 6])
+        for color in range(1, 7):
+            expected = [m for m in full if m.color_id == color]
+            self.assertEqual(detector.detect(image, requested_color=color),
+                             [replace(m, index=i+1) for i, m in enumerate(expected)])
 
     def test_large_enclosed_highlight_belongs_to_one_blue_object(self):
         image = background()

@@ -19,6 +19,7 @@ import numpy as np
 from pi_vision.camera import Camera
 from pi_vision.config import load_config
 from pi_vision.electrical_link import ElectricalClient
+from pi_vision.observation import confirmation_window_ready
 from pi_vision.placement_rings import PlacementRings
 from pi_vision.stream import FrameStreamer
 from pi_vision.task_confirmation import parse_competition_task
@@ -157,11 +158,12 @@ class RingObserver:
         self.sequence = -1
         self.acquired_at = float('-inf')
         self.span_s = None
+        self.confirmation_frames = 0
         self.jitter_px = {}
 
     def observe(self, wanted, *, all_rings=False, floor, health=lambda: None, timeout=25,
                 calibration_anchors=None):
-        samples = deque(maxlen=4)
+        samples = deque()
         deadline = self.clock()+timeout
         next_health = self.clock()
         last_state, jitter = [], None
@@ -198,16 +200,19 @@ class RingObserver:
                     unique = bool(centers)
                 if (unique and wanted <= set(centers)
                         and all(np.isfinite(centers[n]).all() for n in wanted)):
+                    if samples and stamp <= samples[-1][0]:
+                        samples.clear()
                     if samples and stamp-samples[-1][0] > .8:
                         samples.clear()
                     samples.append((stamp, {n: centers[n] for n in wanted}))
                     while samples and stamp-samples[0][0] > 2.5:
                         samples.popleft()
-                    if len(samples) >= 4 and stamp-samples[0][0] >= .25:
+                    if confirmation_window_ready(samples, 4, .25):
                         points = {n: np.array([p[n] for _, p in samples]) for n in wanted}
                         jitter = {n: float(np.ptp(path, axis=0).max()) for n, path in points.items()}
                         if max(jitter.values()) <= 2:
                             self.acquired_at = stamp
+                            self.confirmation_frames = len(samples)
                             self.span_s = stamp-samples[0][0]
                             self.jitter_px = jitter
                             return {n: np.median(path, axis=0) for n, path in points.items()}
@@ -427,7 +432,7 @@ def run_live(args, order, config, calibration):
     pipeline = SimpleNamespace(camera=camera, qr_camera=camera, material_detector=None,
                                ring_detector=PlacementRings(size))
     source = FrameStreamer(camera, pipeline, enable_materials=False, enable_qr=False,
-                           preview_enabled=True, preview_width=config.width, draw_overlay=False,
+                           preview_enabled=args.vision_only, preview_width=config.width, draw_overlay=False,
                            detect_interval=.12)
     observer = RingObserver(source.get_state, size)
     with (Path(tempfile.gettempdir())/f'robot-preview-start-{os.getuid()}.lock').open('a') as lock, ExitStack() as restore:
@@ -456,7 +461,7 @@ def run_live(args, order, config, calibration):
                     if jpeg:
                         (args.output/'camera.jpg').write_bytes(jpeg)
                 return dict(order=order, centers_px={n: p.tolist() for n, p in points.items()},
-                            confirmation_frames=4, confirmation_span_s=observer.span_s,
+                            confirmation_frames=observer.confirmation_frames, confirmation_span_s=observer.span_s,
                             jitter_px=observer.jitter_px, physical_place_completed=False, motion_sent=False)
             import serial
             with serial.Serial(args.port, 115200, timeout=.02, write_timeout=1, exclusive=True) as port:

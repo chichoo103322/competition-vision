@@ -18,7 +18,7 @@ import time
 from pi_vision import electrical_protocol as protocol
 from pi_vision.electrical_link import ElectricalClient
 from pi_vision.electrical_coordinates import direction_review, direction_review_html
-from pi_vision.electrical_routes import compile_chassis_test, configure_work_heading_mode
+from pi_vision.electrical_routes import add_qr_search, compile_chassis_test, configure_work_heading_mode
 from tools.electrical_route_test import (acquire_plan, checked_port, endpoints, http_json,
     run_closed_loop, validate_geometry, validate_profile, verify_before_start)
 
@@ -266,6 +266,11 @@ def _run_attempt(client, config, selected, emit, cancelled, backend=None, qr_wor
         profile = config['profiles'][str(selected['area'])]
         route = compile_chassis_test(state['mission_plan'], state['navigation']['nodes'],
                                     route_id=route_id, **profile)
+        search_rpm = config.get('qr_station', {}).get('search_rpm')
+        if search_rpm is not None:
+            if qr_work is None:
+                raise ValueError('QR search requires the route QR camera worker')
+            route = add_qr_search(route, field_map, search_rpm)
         if test_turn_override_enabled(config, selected['area']):
             emit(event='TEST_TURN_OBSTACLES_IGNORED', area=selected['area'], route_id=route_id)
     else:

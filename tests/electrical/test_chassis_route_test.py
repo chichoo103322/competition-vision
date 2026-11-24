@@ -603,3 +603,87 @@ def test_arm_alignment_replaces_six_dwell_gates_without_faking_grasp(outcome):
     else:
         assert result['result']=='failed' and client.stops==1
         assert [stage for stage,_ in client.releases]==[1]  # QR test dwell only; no arm fallback.
+
+
+@pytest.mark.parametrize('zone,scan_result', [(1, 'search'), (2, 'return_station'), (2, None)])
+def test_qr_sweep_returns_to_original_gate_before_releasing_stage(zone, scan_result):
+    from pi_vision.electrical_routes import add_qr_search
+
+    state, profile, field = synthetic_plan(zone)
+    profile.update(heading_deg=90, test_ignore_turn_obstacles=True, footprint=dict(
+        front_mm=143, rear_mm=143, left_mm=128.5, right_mm=167.78, margin_mm=2))
+    profile['initial_pose']['yaw_deg'] = 90
+    baseline = compile_chassis_test(state['mission_plan'], state['navigation']['nodes'],
+                                    route_id=7, **profile)
+    route = add_qr_search(baseline, field, 12)
+    validate_geometry(state, route, field)
+    near, far, original = (route['qr_search'][key]
+                           for key in ('near_index', 'far_index', 'return_index'))
+    points = route['points']
+    base_qr = baseline['segments'][0]['last_point_index']
+    assert [p['y_mm'] for p in [points[near], points[far], points[original]]] == (
+        [1100, 1300, 1200] if zone == 1 else [1300, 1100, 1200])
+    assert [p['travel_yaw_deg'] for p in points[near:original+1]] == [90, -180, -180, -180]
+    assert points[near]['x_mm'] == points[far]['x_mm'] == 300
+    assert points[original]['x_mm'] == baseline['points'][base_qr]['x_mm']
+    assert points[original+1:] == baseline['points'][base_qr+1:]
+    clock = Clock()
+
+    class SweepChassis(FakeChassis):
+        gate_indexes = [near, far] + [s['last_point_index'] for s in route['segments']]
+        passed = []
+        moving_sample = False
+
+        def status(self):
+            clock.now += .01
+            if self.state == 2:
+                if self.moving_sample:
+                    self.moving_sample = False
+                    return self.report()
+                self.index = self.gate_indexes[len(self.passed)]
+                self.work = points[self.index]['work_id']
+                self.state = 3
+            return self.report()
+
+        def work_done(self, route_id, index, *, success):
+            assert self.state == 3 and self.index == index and success is True
+            self.passed.append(index)
+            self.index += 1
+            self.work = 0
+            self.state = 4 if len(self.passed) == len(self.gate_indexes) else 2
+            self.moving_sample = True
+            return self.report()
+
+    client = SweepChassis(route, clock)
+
+    class SweepQR:
+        timeout = 1
+        started = False
+        polls_after_return = 0
+
+        def start(self, *, timeout_s):
+            assert client.state == 3 and client.index == near and not self.started
+            self.started = True
+
+        def poll(self):
+            assert self.started and near in client.passed and original not in client.passed
+            found = scan_result == 'search' and client.state == 2 and client.index == far
+            if client.state == 3 and client.index == original:
+                self.polls_after_return += 1
+                found = scan_result == 'return_station' and self.polls_after_return >= 2
+            return dict(confirmed=True, raw='231+312+321+231') if found else None
+
+        def close(self):
+            pass
+
+    result = run_closed_loop(client, route, qr_work=SweepQR(), station_dwell_s=.2,
+                             poll_s=.1, timeout_s=20, log=[], clock=clock, sleep=clock.sleep)
+    if scan_result is None:
+        assert result['result'] == 'failed'
+        assert client.passed == [near, far]
+        assert result['controller_stop_confirmed']
+    else:
+        assert result['result'] == 'done' and result['test_stations_completed'] == 8
+        assert client.passed == client.gate_indexes and not client.stops
+        assert result['qr_task_code']['scan_source'] == scan_result
+        assert result['qr_task_code']['point_index'] == original

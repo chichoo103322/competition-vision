@@ -96,7 +96,7 @@ def capture_worker(config, connection, heartbeat):
                     break
                 if command['action'] != 'scan' or session is not None:
                     raise RuntimeError('invalid or repeated QR scan command')
-                session = FreshQRSession(command['started_at'], config['timeout_s'])
+                session = FreshQRSession(command['started_at'], command.get('timeout_s', config['timeout_s']))
             read_started_at = time.monotonic()
             ok, frame, _ = camera.read()
             acquired_at = time.monotonic()
@@ -146,6 +146,7 @@ class QRStationWork:
         self.clock = clock
         self.process = self.connection = self.heartbeat = None
         self.started_at = None
+        self.scan_timeout = self.timeout
         self.result = None
         self.closed = False
 
@@ -179,20 +180,26 @@ class QRStationWork:
         last = self.heartbeat.value
         return last > 0 and 0 <= self.clock() - last < 1
 
-    def start(self):
+    def start(self, *, timeout_s=None):
         if self.started_at is not None:
             raise RuntimeError('QR scan already started for this route')
         if not self.ready():
             raise RuntimeError('QR camera not prewarmed or frames stale')
+        if timeout_s is not None and (not math.isfinite(timeout_s) or timeout_s <= 0):
+            raise ValueError('QR search timeout must be positive and finite')
         self.started_at = self.clock()
-        self.connection.send(dict(action='scan', started_at=self.started_at))
+        command = dict(action='scan', started_at=self.started_at)
+        if timeout_s is not None:
+            self.scan_timeout = timeout_s
+            command['timeout_s'] = timeout_s
+        self.connection.send(command)
 
     def poll(self):
         if self.result is not None:
             return self.result
         if self.started_at is None or self.closed:
             raise RuntimeError('QR scan not started')
-        if self.clock() >= self.started_at + self.timeout:
+        if self.clock() >= self.started_at + self.scan_timeout:
             raise TimeoutError('QR camera worker deadline exceeded; no confirmed task')
         if not self.connection.poll():
             if not self.process.is_alive():
@@ -205,7 +212,7 @@ class QRStationWork:
         raw = str(parse_competition_task(result['raw']))
         if (result.get('matching_frames', 0) < 3 or
                 result['first_read_started_at'] <= self.started_at or
-                not self.started_at < result['acquired_at'] <= result['confirmed_at'] < self.started_at + self.timeout):
+                not self.started_at < result['acquired_at'] <= result['confirmed_at'] < self.started_at + self.scan_timeout):
             raise RuntimeError('QR result failed frame freshness checks')
         self.result = dict(result, raw=raw, camera=self.camera)
         self.close()

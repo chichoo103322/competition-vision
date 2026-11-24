@@ -1,4 +1,4 @@
-"""car_code1 2 arm_work.c 的三轴协议；角度是电机轴绝对角度。"""
+"""STM32 三轴及托盘状态协议；角度是电机轴绝对角度。"""
 import struct
 from .electrical_protocol import integer, scaled
 
@@ -6,7 +6,7 @@ ARM_COMMAND, ARM_STATUS, ARM_EVENT = 0x31, 0x32, 0x83
 ARM_STATES = ('NEED_ORIGIN', 'ZEROING', 'READY', 'PREPARING', 'WAIT_VISION',
               'ALIGNING', 'ALIGNED', 'LOWERING', 'WAIT_GRIP', 'LIFTING',
               'PICKED', 'PARKING', 'READY_LEAVE', 'STOPPED', 'FAULT',
-              'DEBUG_MOVING', 'DEBUG_HOLD')
+              'DEBUG_MOVING', 'DEBUG_HOLD', 'TRAY_LOADING', 'TRAY_UNLOADING', 'PLACED')
 
 
 def arm_command_payload(route_id, point_index, work_id, command_id, opcode,
@@ -41,10 +41,19 @@ def arm_status_payload(payload):
              'z_cdeg', 'yaw_cdeg', 'reach_cdeg',
              'target_z_cdeg', 'target_yaw_cdeg', 'target_reach_cdeg', 'tick')
     result = dict(zip(names, struct.unpack('<IHHIIBBBBHHiiiiiiI', payload)))
-    if (result['state'] >= len(ARM_STATES) or result['fault'] > 4 or result['reserved'] or
-            result['flags'] & ~15 or result['active_axis'] not in (0, 1, 2, 255) or
-            result['opcode'] > 6 or result['point_index'] > 63):
+    tray_enabled = bool(result['flags'] & 16)
+    tray_uncertain = bool(result['flags'] & 32)
+    tray_count, destination_slot = result['reserved'] & 255, result['reserved'] >> 8
+    if (result['state'] >= (len(ARM_STATES) if tray_enabled else 17)
+            or result['fault'] > (5 if tray_enabled else 4) or result['flags'] & ~63
+            or result['active_axis'] not in (0, 1, 2, 255)
+            or result['opcode'] > (8 if tray_enabled else 6) or result['point_index'] > 63
+            or (tray_enabled and (tray_count > 3 or destination_slot > 3))
+            or (not tray_enabled and (tray_uncertain or result['reserved']))):
         raise ValueError('invalid ARM status fields')
+    result.update(tray_enabled=tray_enabled, tray_uncertain=tray_uncertain,
+                  tray_count=tray_count, destination_slot=destination_slot,
+                  grip_done_required=bool(result['flags'] & 4))
     result['state_name'] = ARM_STATES[result['state']]
     result['origins_valid'] = bool(result['flags'] & 1)
     result['standalone_test_mode'] = bool(result['flags'] & 8)

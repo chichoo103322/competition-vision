@@ -114,3 +114,23 @@ def test_standalone_test_begin_and_firmware_mode_flag():
         a.arm_command_payload(44, 1, 102, 1, 6)
     with pytest.raises(ValueError, match='TEST_BEGIN'):
         a.arm_command_payload(44, 0, 102, 2, 6)
+
+
+@pytest.mark.parametrize('state,fault,opcode,count,slot', [
+    (2, 0, 1, 0, 0), (17, 0, 4, 1, 0), (19, 0, 7, 2, 1), (14, 5, 4, 1, 0),
+])
+def test_v7_reports_tray_state_inventory_and_pwm_fault(state, fault, opcode, count, slot):
+    body = bytearray(arm_body())
+    body[16:24] = bytes([state, fault, 255, opcode, 61, 0, count, slot])
+    report = a.arm_status_payload(body)
+    assert report['tray_enabled'] and report['tray_uncertain'] and report['grip_done_required']
+    assert (report['state'], report['fault'], report['opcode']) == (state, fault, opcode)
+    assert (report['tray_count'], report['destination_slot']) == (count, slot)
+
+
+@pytest.mark.parametrize('count,slot,flags', [(4, 0, 16), (1, 4, 16), (0, 0, 32)])
+def test_invalid_v7_tray_fields_are_rejected(count, slot, flags):
+    body = bytearray(arm_body())
+    body[20:24] = bytes([flags, 0, count, slot])
+    with pytest.raises(ValueError, match='invalid ARM'):
+        a.arm_status_payload(body)
