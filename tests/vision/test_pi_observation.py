@@ -106,6 +106,27 @@ class StreamValidityTests(unittest.TestCase):
         self.assertEqual(state['material_observation']['status'], 'stale')
         self.assertEqual(self.stream.get_materials(), [])
 
+    def test_raw_station_track_stabilizes_after_view_jump_and_resets_on_ambiguity(self):
+        self.stream.material_target_window = (0, 0, 60, 40)
+        self.stream.set_material_search_color(2)
+
+        def sample(*xs):
+            self.now += .05
+            self.capture()
+            self.publish([Material(i, 2, 0, x, 30, 0., 89,
+                                   point_kind='top_face_ellipse_center')
+                          for i, x in enumerate(xs, 1)])
+            return self.stream.get_state()['materials']
+
+        left = sample(1)[0]
+        right = sample(59)[0]
+        self.assertNotEqual(left['track_id'], right['track_id'])
+        stable = [sample(30)[0] for _ in range(5)]
+        self.assertEqual({m['track_id'] for m in stable}, {right['track_id']})
+        self.assertEqual({m['center_x'] for m in stable}, {30})
+        self.assertEqual(sample(29, 31), [])
+        self.assertNotEqual(sample(30)[0]['track_id'], right['track_id'])
+
     def test_blocked_first_read_also_has_a_deadline(self):
         self.stream._raw_sequence = 0
         self.assertEqual(self.stream.get_state()['capture']['status'], 'waiting')

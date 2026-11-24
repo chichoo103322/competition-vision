@@ -779,8 +779,11 @@ class FrameStreamer:
                         self._rim_view_hint = dict(color_id=m.color_id, source_sequence=source,
                             pixel=[m.selection_center_x, m.selection_center_y])
                 effective = [m for m in effective if m.localization_valid]
+                if search_status == 'multiple_requested_color_objects':
+                    self._material_tracker.reset()
                 self._latest_materials = self._material_tracker.update(
-                    ordered_materials(effective), acquired)
+                    ordered_materials(effective), acquired,
+                    single_target=self.material_search_color is not None)
                 if self.material_search_color is not None and source_frame is not None and not observation.error:
                     key = f'{self.session_id}-{generation}-{epoch}-{source}'
                     self._material_sample_frames.append((key, source_frame))

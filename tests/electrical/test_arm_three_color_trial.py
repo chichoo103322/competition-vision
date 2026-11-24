@@ -385,10 +385,12 @@ def test_invalid_operator_color_order_rejected(bad):
 @pytest.mark.parametrize('fault', [
     None, 'skipped_count', 'uncertain', 'wrong_park', 'wrong_mode', 'nonempty',
     'wrong_drop', 'wrong_horizontal', 'changed_drop', 'fixed_wrong_drop',
-    'one_peak', 'repeated_peak', 'hard_peak',
+    'one_peak', 'repeated_peak', 'hard_peak', 'changed_tray_target',
 ])
 @pytest.mark.parametrize('drop_mm', [50, 80, 100])
-def test_v7_three_colors_require_confirmed_load_and_end_ready_leave(tmp_path, fault, drop_mm):
+@pytest.mark.parametrize('tray_reach', [-31830, -36605], ids=['tray_100mm', 'tray_115mm'])
+def test_v7_three_colors_require_confirmed_load_and_end_ready_leave(
+        tmp_path, fault, drop_mm, tray_reach):
     class TrayPlant(Plant):
         def __init__(self):
             super().__init__()
@@ -417,24 +419,28 @@ def test_v7_three_colors_require_confirmed_load_and_end_ready_leave(tmp_path, fa
             self.calls.append(('lift', self.color))
             count = self.arm['tray_count']
             self.arm.update(command_id=command, state_name='LIFTING', target_z_cdeg=0)
-            tray_yaw = 36000 if drop_mm in (50, 80) else 45000
+            tray_yaw = 36000 if drop_mm in (50, 80) and tray_reach == -31830 else 45000
             self.transfer_steps = [
                 dict(state_name='LIFTING', z_cdeg=-(drop_mm * 900 // 2)),
-                dict(state_name='TRAY_LOADING', active_axis=1, z_cdeg=-3, yaw_cdeg=tray_yaw + 85,
-                     reach_cdeg=-19100, target_yaw_cdeg=tray_yaw, target_reach_cdeg=-31830),
+                dict(state_name='TRAY_LOADING', active_axis=1, z_cdeg=-1, yaw_cdeg=tray_yaw + 83,
+                     reach_cdeg=-19095, target_yaw_cdeg=tray_yaw, target_reach_cdeg=tray_reach),
                 dict(state_name='TRAY_LOADING', active_axis=2, z_cdeg=-1,
-                     reach_cdeg=-31926, yaw_cdeg=tray_yaw + 28),
+                     reach_cdeg=tray_reach - 96, yaw_cdeg=tray_yaw + 28),
                 dict(state_name='TRAY_LOADING', active_axis=255, z_cdeg=0,
-                     reach_cdeg=-31830, yaw_cdeg=tray_yaw),
+                     reach_cdeg=tray_reach, yaw_cdeg=tray_yaw),
                 dict(state_name='TRAY_LOADING', tray_count=count + (2 if fault == 'skipped_count' else 1),
                      tray_uncertain=fault == 'uncertain'),
+                dict(active_axis=2, target_yaw_cdeg=0, target_reach_cdeg=-19098,
+                     reach_cdeg=tray_reach - 50),
                 dict(state_name='PICKED', yaw_cdeg=0, reach_cdeg=-15000 if fault == 'wrong_park' else -19098,
                      target_yaw_cdeg=0, target_reach_cdeg=-19098),
             ]
 
             if fault in ('one_peak', 'repeated_peak', 'hard_peak'):
-                peak = dict(reach_cdeg=-32018 if fault != 'hard_peak' else -32031)
+                peak = dict(reach_cdeg=tray_reach - (201 if fault == 'hard_peak' else 188))
                 self.transfer_steps[3:3] = [peak] * (2 if fault == 'repeated_peak' else 1)
+            if fault == 'changed_tray_target':
+                self.transfer_steps[2]['target_reach_cdeg'] = -31830 if tray_reach == -36605 else -36605
 
         def arm_status(self):
             if self.transfer_steps:
@@ -458,6 +464,7 @@ def test_v7_three_colors_require_confirmed_load_and_end_ready_leave(tmp_path, fa
             'wrong_mode': 'tray flag', 'nonempty': 'tray count',
             'wrong_drop': 'Z-only target mismatch', 'wrong_horizontal': 'horizontal target',
             'changed_drop': 'Z-only target mismatch', 'fixed_wrong_drop': 'Z-only target mismatch',
+            'changed_tray_target': 'tray reach target changed',
         }[fault]):
             runner.run([2, 3, 1], 200)
         assert not runner.results and (not plant.calls if fault in ('wrong_mode', 'nonempty')
@@ -516,6 +523,7 @@ def test_v7_key_wait_handles_short_zeroing_without_accepting_old_ready(tmp_path,
 @pytest.mark.parametrize('changed,allowed', [
     (dict(yaw_cdeg=45180), True), (dict(yaw_cdeg=45181), False),
     (dict(active_axis=2), False), (dict(target_yaw_cdeg=0), False),
+    (dict(target_reach_cdeg=-37000), False),
     (dict(reach_cdeg=-31830), False),
 ])
 def test_tray_yaw_feedback_margin_only_applies_to_outbound_at_clearance(changed, allowed):
@@ -542,6 +550,42 @@ def test_tray_reach_feedback_margin_requires_correct_axis_and_settled_yaw(change
     else:
         with pytest.raises(RuntimeError, match='tray-transfer envelope|unexpected v7 tray approach target'):
             ThreeColorTrial.check_tray_transfer_pose(feedback)
+
+
+@pytest.mark.parametrize('photo_return, peak, axis, target_reach, final_reach, error', [
+    (True, 138, 2, 0, 35, None),
+    (True, 192, 2, 0, 35, 'stroke/clearance'),
+    (True, 138, 1, 0, 35, 'stroke/clearance'),
+    (True, 138, 2, -100, 35, 'stroke/clearance'),
+    (False, 138, 2, 0, 35, 'stroke/clearance'),
+    (True, 138, 2, 0, 100, 'arrival differs'),
+])
+def test_photo_return_allows_only_bounded_transient_forward_feedback(
+        tmp_path, photo_return, peak, axis, target_reach, final_reach, error):
+    plant = Plant()
+    plant.arm.update(state_name='PICKED', route_id=200, work_id=102, command_id=4,
+                     reach_cdeg=-19098, tray_enabled=True, tray_uncertain=False,
+                     tray_count=1, grip_done_required=True)
+    runner = ThreeColorTrial(plant, plant.reference, plant.mapping, plant.snapshot,
+                             plant.select_color, tmp_path, real_tray=True,
+                             clock=lambda: plant.now, sleep=plant.sleep)
+    runner.context = (200, 0, 102)
+    runner.command = 4
+    parked = plant.arm_status()
+    feedback = iter([
+        dict(state_name='ALIGNING', active_axis=2, reach_cdeg=-1233, aligned_command_id=0),
+        dict(state_name='ALIGNING', active_axis=axis, reach_cdeg=peak,
+             target_reach_cdeg=target_reach, aligned_command_id=0),
+        dict(state_name='ALIGNED', active_axis=255, reach_cdeg=final_reach),
+    ])
+    plant.arm_status = lambda: dict(plant.arm, **next(feedback))
+
+    if error:
+        with pytest.raises(RuntimeError, match=error):
+            runner.align_to([0, 0, 0], before=parked, photo_return=photo_return)
+    else:
+        arrived = runner.align_to([0, 0, 0], before=parked, photo_return=photo_return)
+        assert arrived['reach_cdeg'] == final_reach and arrived['tray_count'] == 1
 
 
 def real_photo_trial(plant, tmp_path, error, axes=(210, 220)):
@@ -661,6 +705,41 @@ def test_consistently_moving_disc_target_can_approach_but_cannot_pick(tmp_path):
     assert not any(c[0] == 'pick' for c in p.calls)
 
 
+def test_disc_target_traversing_grasp_window_waits_for_still_frames(tmp_path):
+    p = Plant()
+    t = real_photo_trial(p, tmp_path, (0, 0))
+    snapshot = t.snapshot
+
+    def sliding():
+        state = snapshot()
+        seq = state['material_observation']['source_sequence']
+        state['materials'][0]['center_x'] += 2 * (seq - 500)
+        return state
+
+    t.snapshot = sliding
+    with pytest.raises(ObservationUnavailable, match='target moving inside grasp window'):
+        t.observe(p.now, timeout=1)
+
+
+def test_grasp_window_accepts_small_flicker_and_fresh_tracking_ids(tmp_path):
+    plant = Plant()
+    t = real_photo_trial(plant, tmp_path, (0, 0))
+    snapshot = t.snapshot
+
+    def flicker():
+        state = snapshot()
+        seq = state['material_observation']['source_sequence']
+        state['materials'][0].update(
+            center_x=652 + (10 if seq % 3 == 0 else 0), center_y=368, track_id=seq)
+        return state
+
+    t.snapshot = flicker
+    obs = t.observe(plant.now, timeout=1)
+    assert obs['in_grasp_window'] and not obs['velocity_reliable']
+    assert len({frame['sequence'] for frame in obs['source_frames']}) >= 3
+    assert {x for x, _ in obs['points']} == {652, 662}
+
+
 def test_blue_just_forward_can_approach_sideways_but_cannot_chase_past_boundary():
     import numpy as np
     from tools.arm_three_color_trial import tray_approach
@@ -723,33 +802,57 @@ def test_timed_planner_uses_short_moves_until_clearance_is_cheaper():
     assert choose((48,168))[2]
 
 
-def test_partial_rim_only_moves_to_measured_view_then_rechecks(tmp_path):
+@pytest.mark.parametrize('edge_hint, micro_only, expected', [
+    (None, False, [(1.5, -6.37)]),
+    (None, False, [(1.5, -6.37), (0, -12.73)]),
+    ([586, 571], False, [(-3.28, -53.79)]),
+    ([586, 571], False, [(-3.28, -53.79), (-3.8, -64.99)]),
+    ([586, 605], False, [(-3.8, -64.99)]),
+    ([391, 580], False, [(-12.05, -53.77)]),
+    ([912, 575], False, [(16.77, -67.43)]),
+    ([586, 571], True, [(1.5, -6.37)]),
+])
+def test_partial_rim_only_moves_to_measured_view_then_rechecks(
+        tmp_path, edge_hint, micro_only, expected):
     p = Plant()
     t = real_photo_trial(p, tmp_path, (0,0))
+    t.micro_only = micro_only
+    p.arm.update(z_cdeg=1, yaw_cdeg=-50, reach_cdeg=36)
     t.mapping['samples'] = [dict(requested=dict(yaw_deg=.5, reach_mm=-2.),
                                  actual=dict(yaw_deg=.47, reach_mm=-1.88, z_mm=0),
+                                 source_frames=[{}, {}, {}]),
+                            dict(requested=dict(yaw_deg=0, reach_mm=-4.),
+                                 actual=dict(yaw_deg=0, reach_mm=-3.88, z_mm=0),
                                  source_frames=[{}, {}, {}])]
     original = t.snapshot
-    missing = True
+    moves = 0
+    last_move_at = 0
     def partial():
+        assert p.now < 105, 'timed out waiting for the measured view change'
         state = original()
-        if missing:
+        if moves < len(expected):
             seq = state['material_observation']['source_sequence']
+            pixel = [750, 500] if moves == 0 else [665, 490]
+            if edge_hint is not None:
+                pixel = edge_hint
             state.update(materials=[], material_localization_status='clipped_region_no_complete_rim',
-                         material_view_hint=dict(color_id=2, source_sequence=seq, pixel=[750,500]))
+                         material_view_hint=dict(color_id=2, source_sequence=seq, pixel=pixel))
+        else:
+            state['materials'][0].update(center_x=648, center_y=359)
         return state
     t.snapshot = partial
     original_align = p.arm_align
     def move(*args):
-        nonlocal missing
+        nonlocal moves, last_move_at
         original_align(*args)
-        missing = False
+        moves += 1
+        last_move_at = p.now
     p.arm_align = move
     _, obs, _ = t.align_color()
     moves = [cmd for cmd in p.calls if cmd[0]=='align']
-    assert len(moves) == 1 and moves[0][4:] == (1.5, -6.37)
-    assert t.view_attempted and obs['in_grasp_window']
-    assert min(f['acquired'] for f in obs['source_frames']) > 100.5
+    assert [cmd[4:] for cmd in moves] == expected
+    assert len(t.view_targets) == len(expected) and obs['in_grasp_window']
+    assert min(f['acquired'] for f in obs['source_frames']) > last_move_at
     assert not any(cmd[0]=='pick' for cmd in p.calls)
 
 

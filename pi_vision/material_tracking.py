@@ -68,7 +68,7 @@ class MaterialTracker:
     def reset(self):
         self._tracks.clear()
 
-    def update(self, materials, acquired_at):
+    def update(self, materials, acquired_at, *, single_target=False):
         """Return this frame's detections with service-local IDs and association status."""
         if not math.isfinite(acquired_at):
             raise ValueError('acquisition time must be finite')
@@ -98,8 +98,12 @@ class MaterialTracker:
                 used_tracks.add(track_id)
 
         out = []
-        next_tracks = {track_id: track for track_id, track in active.items()
-                       if track_id not in used_tracks}
+        # Raw-station selection already rejects ambiguous same-colour frames.
+        # When a sole target is observed again, drop displaced tracks so they
+        # cannot compete with its new ID on every subsequent frame.
+        next_tracks = {} if single_target and materials else {
+            track_id: track for track_id, track in active.items() if track_id not in used_tracks
+        }
         for index, item in enumerate(materials):
             track_id = assignments.get(index)
             status = 'updated' if track_id is not None else 'new'
