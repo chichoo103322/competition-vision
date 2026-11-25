@@ -1,12 +1,14 @@
 import copy
 from dataclasses import replace
+import json
 
 import numpy as np
 import pytest
 
 from tools.arm_three_color_trial import (
-    ArmTrial, ThreeColorTrial, TrialTuning, ObservationUnavailable, correction_target,
-    edge_view_target, parse_order, tracking_approach, tray_approach, tray_correction)
+    ArmTrial, FeedbackLevel, ThreeColorTrial, TrialTuning, ObservationUnavailable,
+    correction_target, edge_view_target, micro_start_ok, parse_order, tracking_approach,
+    tray_approach, tray_correction, view_start_ok)
 
 
 class Plant:
@@ -390,11 +392,14 @@ def test_invalid_operator_color_order_rejected(bad):
     None, 'skipped_count', 'uncertain', 'wrong_park', 'wrong_mode', 'nonempty',
     'wrong_drop', 'wrong_horizontal', 'changed_drop', 'fixed_wrong_drop',
     'one_peak', 'repeated_peak', 'hard_peak', 'changed_tray_target',
+    'tray_forward_rebound', 'tray_forward_repeat',
 ])
-@pytest.mark.parametrize('drop_mm', [50, 80, 100])
+@pytest.mark.parametrize('drop_cdeg', [45000, 45950, 72000, 90000, 90950])
 @pytest.mark.parametrize('tray_reach', [-31830, -36605], ids=['tray_100mm', 'tray_115mm'])
 def test_v7_three_colors_require_confirmed_load_and_end_ready_leave(
-        tmp_path, fault, drop_mm, tray_reach):
+        tmp_path, fault, drop_cdeg, tray_reach):
+    fixed_drop_mm = round(drop_cdeg / 900) if drop_cdeg not in (45950, 90950) else 50
+
     class TrayPlant(Plant):
         def __init__(self):
             super().__init__()
@@ -404,15 +409,23 @@ def test_v7_three_colors_require_confirmed_load_and_end_ready_leave(
 
         def arm_pick(self, route, index, work, command, reference):
             super().arm_pick(route, index, work, command, reference)
-            firmware_drop_mm = (70 if fault == 'wrong_drop' else
-                                (100 if drop_mm == 80 else 80) if fault == 'fixed_wrong_drop' else drop_mm)
-            target_z = -firmware_drop_mm * 900
+            target_z = -drop_cdeg
+            if fault == 'wrong_drop':
+                target_z = -63000
+            elif fault == 'fixed_wrong_drop':
+                target_z = -45950 if fixed_drop_mm == 50 else -45000
             self.arm.update(z_cdeg=target_z, target_z_cdeg=target_z)
             if fault == 'changed_drop':
-                alternate_z = -90000 if drop_mm == 80 else -72000
+                alternate_z = -90000 if drop_cdeg == 72000 else -72000
                 self.arm.update(state_name='LOWERING', z_cdeg=-2)
                 self.transfer_steps = [
                     dict(), dict(state_name='WAIT_GRIP', z_cdeg=alternate_z, target_z_cdeg=alternate_z)
+                ]
+            elif target_z in (-45950, -90950):
+                self.arm.update(state_name='LOWERING', z_cdeg=0)
+                self.transfer_steps = [
+                    dict(), dict(z_cdeg=target_z - 250),
+                    dict(state_name='WAIT_GRIP', z_cdeg=target_z)
                 ]
             if fault == 'wrong_horizontal':
                 self.arm['target_yaw_cdeg'] += 1
@@ -423,9 +436,9 @@ def test_v7_three_colors_require_confirmed_load_and_end_ready_leave(
             self.calls.append(('lift', self.color))
             count = self.arm['tray_count']
             self.arm.update(command_id=command, state_name='LIFTING', target_z_cdeg=0)
-            tray_yaw = 36000 if drop_mm in (50, 80) and tray_reach == -31830 else 45000
+            tray_yaw = 36000 if drop_cdeg in (45000, 45950, 72000) and tray_reach == -31830 else 45000
             self.transfer_steps = [
-                dict(state_name='LIFTING', z_cdeg=-(drop_mm * 900 // 2)),
+                dict(state_name='LIFTING', z_cdeg=-(drop_cdeg // 2)),
                 dict(state_name='TRAY_LOADING', active_axis=1, z_cdeg=-1, yaw_cdeg=tray_yaw + 83,
                      reach_cdeg=-19095, target_yaw_cdeg=tray_yaw, target_reach_cdeg=tray_reach),
                 dict(state_name='TRAY_LOADING', active_axis=2, z_cdeg=-1,
@@ -445,6 +458,9 @@ def test_v7_three_colors_require_confirmed_load_and_end_ready_leave(
                 self.transfer_steps[3:3] = [peak] * (2 if fault == 'repeated_peak' else 1)
             if fault == 'changed_tray_target':
                 self.transfer_steps[2]['target_reach_cdeg'] = -31830 if tray_reach == -36605 else -36605
+            if fault in ('tray_forward_rebound', 'tray_forward_repeat'):
+                rebound = [dict(reach_cdeg=1000)] * 3 if fault == 'tray_forward_repeat' else [dict(reach_cdeg=203)]
+                self.transfer_steps[4:4] = [*rebound, dict(reach_cdeg=tray_reach)]
 
         def arm_status(self):
             if self.transfer_steps:
@@ -459,9 +475,9 @@ def test_v7_three_colors_require_confirmed_load_and_end_ready_leave(
     plant = TrayPlant()
     runner = ThreeColorTrial(plant, plant.reference, plant.mapping, plant.snapshot,
                              plant.select_color, tmp_path, real_tray=True,
-                             pick_drop_mm=drop_mm if fault == 'fixed_wrong_drop' else None,
+                             pick_drop_mm=fixed_drop_mm if fault == 'fixed_wrong_drop' else None,
                              clock=lambda: plant.now, sleep=plant.sleep)
-    if fault and fault != 'one_peak':
+    if fault and fault not in ('one_peak', 'tray_forward_rebound'):
         with pytest.raises(RuntimeError, match={
             'repeated_peak': 'tray-transfer envelope', 'hard_peak': 'tray-transfer envelope',
             'skipped_count': 'tray count', 'uncertain': 'uncertain tray', 'wrong_park': 'arrival',
@@ -469,6 +485,7 @@ def test_v7_three_colors_require_confirmed_load_and_end_ready_leave(
             'wrong_drop': 'Z-only target mismatch', 'wrong_horizontal': 'horizontal target',
             'changed_drop': 'Z-only target mismatch', 'fixed_wrong_drop': 'Z-only target mismatch',
             'changed_tray_target': 'tray reach target changed',
+            'tray_forward_repeat': 'hard trial envelope in TRAY_LOADING',
         }[fault]):
             runner.run([2, 3, 1], 200)
         assert not runner.results and (not plant.calls if fault in ('wrong_mode', 'nonempty')
@@ -478,12 +495,15 @@ def test_v7_three_colors_require_confirmed_load_and_end_ready_leave(
     else:
         result = runner.run([2, 3, 1], 200)
         assert [c['tray_count'] for c in result['colors']] == [1, 2, 3]
-        assert [c['lowered_mm'] for c in result['colors']] == [drop_mm] * 3
-        assert [c['firmware_pick_drop_mm'] for c in result['colors']] == [drop_mm] * 3
+        assert [c['lowered_mm'] for c in result['colors']] == [drop_cdeg / 900] * 3
+        assert [c['firmware_pick_drop_mm'] for c in result['colors']] == [drop_cdeg / 900] * 3
         assert [c['returned_to_origin'] for c in result['colors']] == [True, True, False]
         assert result['simulated_servos'] is False and result['physical_grasp_completed'] is False
         assert result['final_arm']['state_name'] == 'READY_LEAVE'
         assert plant.calls[-1] == ('finish', 1)
+        if fault == 'tray_forward_rebound':
+            events = [json.loads(line) for line in (tmp_path/'events.jsonl').read_text().splitlines()]
+            assert any(e['event'] == 'envelope_warning' and e['phase'] == 'TRAY_LOADING' for e in events)
 
 
 @pytest.mark.parametrize('case', ['reported_transition', 'batched_zero', 'stale_ready'])
@@ -556,16 +576,23 @@ def test_tray_reach_feedback_margin_requires_correct_axis_and_settled_yaw(change
             ThreeColorTrial.check_tray_transfer_pose(feedback)
 
 
-@pytest.mark.parametrize('photo_return, peak, axis, target_reach, final_reach, error', [
-    (True, 138, 2, 0, 35, None),
-    (True, 192, 2, 0, 35, 'stroke/clearance'),
-    (True, 138, 1, 0, 35, 'stroke/clearance'),
-    (True, 138, 2, -100, 35, 'stroke/clearance'),
-    (False, 138, 2, 0, 35, 'stroke/clearance'),
-    (True, 138, 2, 0, 100, 'arrival differs'),
+@pytest.mark.parametrize('photo_return, readings, axis, reported_target, final_reach, error', [
+    (True, [138], 2, {}, 35, None),
+    (True, [-19093, 135, 203, 190], 2, {'target_z_cdeg': -1}, 35, None),
+    (True, [203] * 6, 2, {}, 35, None),
+    (True, [1500, 1500, 200, 1500, 1500], 2, {}, 35, None),
+    (True, [(1, 1500), (1, 1500), (1, 1500)], 2, {}, 35, None),
+    (True, [1500, 1550, 1600], 2, {}, 35, 'hard trial envelope'),
+    (True, [203], 1, {}, 35, None),
+    (True, [203], 2, {'target_reach_cdeg': -100}, 35, 'photo return changed requested pose'),
+    (True, [203], 2, {'target_yaw_cdeg': 1}, 35, 'photo return changed requested pose'),
+    (True, [203], 2, {'target_z_cdeg': -136}, 35, 'photo return changed requested pose'),
+    (False, [203], 2, {}, 35, None),
+    (True, [203], 2, {'target_z_cdeg': -1}, 100, 'arrival differs'),
+    (True, [203], 2, {}, 1500, 'hard trial envelope'),
 ])
 def test_photo_return_allows_only_bounded_transient_forward_feedback(
-        tmp_path, photo_return, peak, axis, target_reach, final_reach, error):
+        tmp_path, photo_return, readings, axis, reported_target, final_reach, error):
     plant = Plant()
     plant.arm.update(state_name='PICKED', route_id=200, work_id=102, command_id=4,
                      reach_cdeg=-19098, tray_enabled=True, tray_uncertain=False,
@@ -576,11 +603,14 @@ def test_photo_return_allows_only_bounded_transient_forward_feedback(
     runner.context = (200, 0, 102)
     runner.command = 4
     parked = plant.arm_status()
+    z_feedback = -1 if reported_target.get('target_z_cdeg') == -1 else 0
     feedback = iter([
-        dict(state_name='ALIGNING', active_axis=2, reach_cdeg=-1233, aligned_command_id=0),
-        dict(state_name='ALIGNING', active_axis=axis, reach_cdeg=peak,
-             target_reach_cdeg=target_reach, aligned_command_id=0),
-        dict(state_name='ALIGNED', active_axis=255, reach_cdeg=final_reach),
+        *(dict(state_name='ALIGNING', active_axis=axis, z_cdeg=z_feedback, reach_cdeg=reading,
+               tick=tick, aligned_command_id=0, **reported_target)
+          for tick, reading in (value if isinstance(value, tuple) else (i, value)
+                                for i, value in enumerate(readings, 1))),
+        dict(state_name='ALIGNED', active_axis=255, z_cdeg=z_feedback,
+             reach_cdeg=final_reach, **reported_target),
     ])
     plant.arm_status = lambda: dict(plant.arm, **next(feedback))
 
@@ -590,6 +620,25 @@ def test_photo_return_allows_only_bounded_transient_forward_feedback(
     else:
         arrived = runner.align_to([0, 0, 0], before=parked, photo_return=photo_return)
         assert arrived['reach_cdeg'] == final_reach and arrived['tray_count'] == 1
+        events = [json.loads(line) for line in (tmp_path/'events.jsonl').read_text().splitlines()]
+        assert sum(e['event'] == 'envelope_warning' for e in events) == int(readings != [138])
+
+
+def test_photo_view_accepts_static_residual_without_calling_it_firmware_micro_motion():
+    arm = dict(z_cdeg=40, yaw_cdeg=0, reach_cdeg=203)
+    assert view_start_ok(arm)
+    assert not micro_start_ok(arm)
+    assert not view_start_ok(dict(arm, reach_cdeg=956))
+    assert not view_start_ok(dict(arm, z_cdeg=-136))
+
+
+@pytest.mark.parametrize('target', [[0, 3601, 0], [0, 0, 1], [0, 0, -19099], [-10, 0, 0]])
+def test_relaxed_feedback_cannot_relax_outgoing_photo_pose(tmp_path, target):
+    plant = Plant()
+    t = real_photo_trial(plant, tmp_path, (0, 0))
+    with pytest.raises(RuntimeError, match='photo-height command limits'):
+        t.align_to(target)
+    assert not any(call[0] == 'align' for call in plant.calls)
 
 
 def real_photo_trial(plant, tmp_path, error, axes=(210, 220)):
@@ -676,8 +725,9 @@ def test_real_tray_disc_edge_yellow_approaches_then_rechecks(tmp_path):
     assert moves and 1800 < moves[0][4] * 100 <= 3600
     assert t.first_reachable < obs['source_frames'][0]['acquired']
     assert obs['in_grasp_window'] and arm['state_name'] == 'ALIGNED'
-    with pytest.raises(RuntimeError, match='envelope'):
-        t.envelope(dict(arm, yaw_cdeg=3700))
+    assert t.motion_feedback_level(dict(arm, yaw_cdeg=3700)) == FeedbackLevel.SOFT
+    with pytest.raises(RuntimeError, match='hard trial envelope'):
+        t.envelope(dict(arm, yaw_cdeg=4351))
 
 
 def test_missing_yellow_rim_explains_wait_without_motion(tmp_path):
@@ -858,7 +908,7 @@ def test_edge_view_computes_retraction_from_pixel_and_current_pose():
         visited={(0, 10, deep[2] + 30)})
     assert stronger[2] < deep[2]
     assert edge_view_target(
-        dict(plant.arm, z_cdeg=-51), [678, 660], plant.reference, plant.mapping,
+        dict(plant.arm, z_cdeg=-136), [678, 660], plant.reference, plant.mapping,
         tuning, visited=set()) is None
 
 
@@ -889,7 +939,9 @@ def test_wide_tray_limits_allow_asymmetric_approach_after_opt_in(tmp_path, offse
     assert -12 <= yaw < -6 if offset[0] < 0 else 12 < yaw <= 22
     t.envelope(dict(plant.arm, yaw_cdeg=target[1], reach_cdeg=target[2]))
     for outside in (-3691, 6691):
-        with pytest.raises(RuntimeError, match='envelope'):
+        assert t.motion_feedback_level(dict(plant.arm, yaw_cdeg=outside)) == FeedbackLevel.SOFT
+    for outside in (-4400, 7400):
+        with pytest.raises(RuntimeError, match='hard trial envelope'):
             t.envelope(dict(plant.arm, yaw_cdeg=outside))
     step, _, coarse = tray_correction(
         plant.arm, error, 230, matrix, t.tuning, 18., allow_coarse=False)
