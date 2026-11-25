@@ -317,10 +317,14 @@ HARD_YAW_MARGIN_DEG = 2.5
 HARD_ENVELOPE_FRAMES = 3
 TRAY_TRANSFER_SOFT_FORWARD_CDEG = 127
 TRAY_TRANSFER_HARD_FORWARD_CDEG = 955
-PHOTO_VIEW_MAX_Z_CDEG = 135
+TRAY_TRANSFER_HARD_REACH_MARGIN_CDEG = 1273
+PHOTO_VIEW_MAX_Z_CDEG = 450
+SETTLE_CONFIRM_S = .6
 ARRIVAL_TOLERANCES = (180, 60, 95)
+ARRIVAL_HARD_TOLERANCES = (2700, 750, 1273)
 # Relative limits for a Z-only move are tighter than the global travel envelope.
-VERTICAL_HARD_TOLERANCES = (900, 150, 238)
+VERTICAL_HARD_TOLERANCES = (1800, 450, 636)
+STARTUP_ORIGIN_TOLERANCES = (450, 180, 300)
 ARM_AXES = ('z', 'yaw', 'reach')
 PICK_MOTOR_CDEG_PER_MM = 900
 GRASP_LIFT_CLEAR_MM = 5
@@ -348,7 +352,7 @@ class FeedbackDebounce:
         tick = arm.get('tick')
         if tick is not None and self.last_tick is not None and not terminal:
             if not 0 < (tick - self.last_tick) % (1 << 32) < (1 << 31):
-                return
+                return False
         self.last_tick = tick
         self.hard_frames = self.hard_frames + 1 if level == FeedbackLevel.HARD else 0
         if level == FeedbackLevel.HARD and (terminal or self.hard_frames >= HARD_ENVELOPE_FRAMES):
@@ -359,12 +363,24 @@ class FeedbackDebounce:
             trial.record('envelope_warning', color_id=trial.color, arm=arm, phase=phase,
                          severity=level.name.lower())
             self.warned = True
+        return level != FeedbackLevel.HARD
+
+
+def arrival_drift(arm, target):
+    return tuple(abs(arm[f'{axis}_cdeg'] - value) for axis, value in zip(ARM_AXES, target))
 
 
 def checked_arrival(arm, target):
-    if any(abs(arm[f'{axis}_cdeg'] - value) > tolerance
-           for axis, value, tolerance in zip(ARM_AXES, target, ARRIVAL_TOLERANCES)):
+    if any(drift > tolerance for drift, tolerance in zip(arrival_drift(arm, target), ARRIVAL_TOLERANCES)):
         raise RuntimeError('arrival differs from requested pose')
+
+
+def pose_feedback_level(drift, hard_tolerances=VERTICAL_HARD_TOLERANCES):
+    if any(value > maximum for value, maximum in zip(drift, hard_tolerances)):
+        return FeedbackLevel.HARD
+    if any(value > maximum for value, maximum in zip(drift, ARRIVAL_TOLERANCES)):
+        return FeedbackLevel.SOFT
+    return FeedbackLevel.OK
 
 
 def vertical_feedback_drift(arm, before, target_z):
@@ -372,6 +388,21 @@ def vertical_feedback_drift(arm, before, target_z):
     return (max(low - arm['z_cdeg'], arm['z_cdeg'] - high, 0),
             abs(arm['yaw_cdeg'] - before['yaw_cdeg']),
             abs(arm['reach_cdeg'] - before['reach_cdeg']))
+
+
+def z_only_target_feedback(arm, before, target_z):
+    # A near report can settle on the next poll. Keep the expected target
+    # locked so that the near report cannot authorize the next command.
+    z_allowance, yaw_allowance, reach_allowance = (50, 60, 95) if before.get('tray_enabled') else (0, 0, 0)
+    z_error = abs(arm['target_z_cdeg'] - target_z)
+    yaw_error = abs(arm['target_yaw_cdeg'] - before['target_yaw_cdeg'])
+    reach_error = abs(arm['target_reach_cdeg'] - before['target_reach_cdeg'])
+    if z_error > z_allowance:
+        raise RuntimeError(f'Z-only target mismatch: expected {target_z} cdeg, '
+                           f'controller reports {arm["target_z_cdeg"]} cdeg')
+    if yaw_error > yaw_allowance or reach_error > reach_allowance:
+        raise RuntimeError('Z-only motion changed horizontal target')
+    return FeedbackLevel.SOFT if z_error or yaw_error or reach_error else FeedbackLevel.OK
 
 
 class ArmTrial:
@@ -410,7 +441,11 @@ class ArmTrial:
         self.envelope(arm)
         return FeedbackLevel.OK
 
-    def vertical_feedback_level(self, arm, before, target_z, *, terminal):
+    def arrival_feedback_level(self, arm, target):
+        checked_arrival(arm, target)
+        return FeedbackLevel.OK
+
+    def vertical_feedback_level(self, arm, before, target_z):
         z_drift, yaw_drift, reach_drift = vertical_feedback_drift(arm, before, target_z)
         if yaw_drift > ARRIVAL_TOLERANCES[1] or reach_drift > ARRIVAL_TOLERANCES[2]:
             raise RuntimeError('Z-only motion changed horizontal feedback')
@@ -426,20 +461,29 @@ class ArmTrial:
         minimum_reach = None
         selected_pick_drop_cdeg = None
         feedback = FeedbackDebounce()
-        while self.clock() < deadline:
+        settling = False
+        settling_since = None
+        while settling or self.clock() < deadline:
             a = self.checked_arm()
             self.record('feedback', color_id=self.color, arm=a)
             state = a['state_name']
             terminal = state == wanted
             if not terminal and state not in transitional:
                 raise RuntimeError('unexpected state '+state)
+            if not terminal and self.clock() >= deadline:
+                break
+            target_level = FeedbackLevel.OK
             if photo_return:
                 # Same-height ALIGN can report the Z encoder snapshot as its
                 # hold target. Yaw and reach still report the commanded pose.
                 commanded_z, yaw, reach = target
+                yaw_error = abs(a['target_yaw_cdeg'] - yaw)
+                reach_error = abs(a['target_reach_cdeg'] - reach)
                 if (abs(a['target_z_cdeg'] - commanded_z) > PHOTO_VIEW_MAX_Z_CDEG
-                        or a['target_yaw_cdeg'] != yaw or a['target_reach_cdeg'] != reach):
+                        or yaw_error > ARRIVAL_TOLERANCES[1] or reach_error > ARRIVAL_TOLERANCES[2]):
                     raise RuntimeError('photo return changed requested pose')
+                if yaw_error or reach_error:
+                    target_level = FeedbackLevel.SOFT
             in_photo_return = (photo_return and state == 'ALIGNING' and a['active_axis'] == 2
                                and a['target_yaw_cdeg'] == a['target_reach_cdeg'] == 0)
             vertical_level = FeedbackLevel.OK
@@ -473,24 +517,33 @@ class ArmTrial:
                                 drop_cdeg=selected_pick_drop_cdeg,
                                 drop_mm=selected_pick_drop_cdeg / PICK_MOTOR_CDEG_PER_MM,
                                 target_z_cdeg=commanded_z)
-                if a['target_z_cdeg'] != target[0]:
-                    raise RuntimeError(f'Z-only target mismatch: expected {target[0]} cdeg, '
-                                       f'controller reports {a["target_z_cdeg"]} cdeg')
                 if a['aligned_command_id'] != vertical_from['aligned_command_id']:
                     raise RuntimeError('Z-only motion changed alignment reference')
-                if any(a[f'target_{axis}_cdeg'] != vertical_from[f'target_{axis}_cdeg']
-                       for axis in ('yaw', 'reach')):
-                    raise RuntimeError('Z-only motion changed horizontal target')
-                vertical_level = self.vertical_feedback_level(a, vertical_from, target[0], terminal=terminal)
+                target_level = z_only_target_feedback(a, vertical_from, target[0])
+                vertical_level = self.vertical_feedback_level(a, vertical_from, target[0])
             lower_z = min(target[0], vertical_from['z_cdeg']) if vertical_from is not None else None
             absolute_level = self.motion_feedback_level(a, lower_z_cdeg=lower_z, photo_return=in_photo_return)
-            feedback.check(self, a, max(absolute_level, vertical_level),
-                           phase='photo_return' if in_photo_return else state, terminal=terminal)
-            if terminal:
-                if target is not None:
-                    checked_arrival(a, target)
-                if wanted == 'ALIGNED' and a['aligned_command_id'] != self.command:
-                    raise RuntimeError('ALIGNED reference mismatch')
+            if terminal and wanted == 'ALIGNED' and a['aligned_command_id'] != self.command:
+                raise RuntimeError('ALIGNED reference mismatch')
+            arrival_level = (self.arrival_feedback_level(a, target)
+                             if terminal and target is not None else FeedbackLevel.OK)
+            pose_level = max(target_level, vertical_level, arrival_level)
+            phase = f'{state} arrival' if terminal else 'photo_return' if in_photo_return else state
+            fresh_pose = feedback.check(self, a, max(absolute_level, pose_level), phase=phase)
+            soft_settled = (
+                terminal and fresh_pose and pose_level == FeedbackLevel.SOFT
+                and settling_since is not None and self.clock() - settling_since >= SETTLE_CONFIRM_S
+            )
+            if terminal and (not fresh_pose or (pose_level != FeedbackLevel.OK and not soft_settled)):
+                if not settling:
+                    settling_since = self.clock()
+                    self.record('waiting_pose_confirmation', color_id=self.color, phase=state,
+                                target_cdeg=target, arm=a)
+                settling = True
+            elif terminal:
+                if soft_settled:
+                    self.record('arrival_soft_accepted', color_id=self.color, phase=state,
+                                target_cdeg=target, arm=a)
                 self.last_motion = dict(elapsed_s=self.clock()-start,full_avoidance=full_avoidance)
                 trace = {} if minimum_reach is None else dict(min_reach_mm=round(minimum_reach*113.1/36000, 2))
                 self.record('arrived', state=wanted, **self.last_motion, arm=a, **trace)
@@ -498,6 +551,9 @@ class ArmTrial:
                     return dict(a, pick_drop_cdeg=selected_pick_drop_cdeg,
                                 pick_drop_mm=selected_pick_drop_cdeg / PICK_MOTOR_CDEG_PER_MM)
                 return a
+            else:
+                settling = False
+                settling_since = None
             self.sleep(.12)
         raise TimeoutError('motion timeout waiting '+wanted)
 
@@ -663,15 +719,15 @@ class ThreeColorTrial(ArmTrial):
             return FeedbackLevel.SOFT
         return FeedbackLevel.OK
 
-    def vertical_feedback_level(self, arm, before, target_z, *, terminal):
-        if terminal or not self.real_tray:
-            return super().vertical_feedback_level(arm, before, target_z, terminal=terminal)
-        drift = vertical_feedback_drift(arm, before, target_z)
-        if any(value > maximum for value, maximum in zip(drift, VERTICAL_HARD_TOLERANCES)):
-            return FeedbackLevel.HARD
-        if any(value > maximum for value, maximum in zip(drift, ARRIVAL_TOLERANCES)):
-            return FeedbackLevel.SOFT
-        return FeedbackLevel.OK
+    def arrival_feedback_level(self, arm, target):
+        if not self.real_tray:
+            return super().arrival_feedback_level(arm, target)
+        return pose_feedback_level(arrival_drift(arm, target), ARRIVAL_HARD_TOLERANCES)
+
+    def vertical_feedback_level(self, arm, before, target_z):
+        if not self.real_tray:
+            return super().vertical_feedback_level(arm, before, target_z)
+        return pose_feedback_level(vertical_feedback_drift(arm, before, target_z))
 
     def align_to(self, target, *, before=None, photo_return=False):
         if self.real_tray and (target[0] != 0 or not usable_view_pose(target, self.tuning, ())):
@@ -701,14 +757,14 @@ class ThreeColorTrial(ArmTrial):
 
     @staticmethod
     def check_tray_transfer_pose(arm, *, tray_reach_target=TRAY_REACH_TARGETS[0],
-                                 allow_single_peak=False):
+                                 allow_single_peak=False, min_yaw_deg=-6.):
         _, yaw_margin, reach_margin = ARRIVAL_TOLERANCES
         yaw_limit = max(TRAY_YAW_TARGETS)
         reported_reach = arm['target_reach_cdeg']
         if reported_reach in TRAY_REACH_TARGETS:
             tray_reach_target = reported_reach
             yaw_limit = arm['target_yaw_cdeg']
-            if yaw_limit not in TRAY_YAW_TARGETS or arm['target_z_cdeg'] != TRAY_PARK[0]:
+            if yaw_limit not in TRAY_YAW_TARGETS or abs(arm['target_z_cdeg'] - TRAY_PARK[0]) > PHOTO_VIEW_MAX_Z_CDEG:
                 raise RuntimeError('unexpected v7 tray approach target')
             # Extra feedback room applies only on the moving axis and only
             # with the other horizontal axis already at the safe pose.
@@ -722,17 +778,21 @@ class ThreeColorTrial(ArmTrial):
                     reach_margin += 20
         elif arm['target_yaw_cdeg'] in TRAY_YAW_TARGETS or reported_reach < TRAY_REACH_TARGETS[0]:
             raise RuntimeError(f'unexpected v7 tray approach target: reach={reported_reach}')
+        hard_z = HARD_Z_MARGIN_MM * PICK_MOTOR_CDEG_PER_MM
+        hard_yaw_min = (min_yaw_deg - HARD_YAW_MARGIN_DEG) * 300
+        hard_yaw_max = yaw_limit + HARD_YAW_MARGIN_DEG * 300
+        hard_reach_min = tray_reach_target - TRAY_TRANSFER_HARD_REACH_MARGIN_CDEG
+        if (not -hard_z <= arm['z_cdeg'] <= hard_z
+                or not hard_yaw_min <= arm['yaw_cdeg'] <= hard_yaw_max
+                or arm['reach_cdeg'] < hard_reach_min
+                or arm['reach_cdeg'] > TRAY_TRANSFER_HARD_FORWARD_CDEG):
+            return FeedbackLevel.HARD
+        soft_yaw_min = min_yaw_deg * 300 - 90
         reach_min = tray_reach_target - reach_margin
         if (not -180 <= arm['z_cdeg'] <= 180
-                or not -1890 <= arm['yaw_cdeg'] <= yaw_limit + yaw_margin
-                or arm['reach_cdeg'] < reach_min):
-            raise RuntimeError(
-                f'arm left the v7 tray-transfer envelope: '
-                f'axis={arm["active_axis"]}, z={arm["z_cdeg"]}, yaw={arm["yaw_cdeg"]}, '
-                f'reach={arm["reach_cdeg"]}, reach_min={reach_min}')
-        if arm['reach_cdeg'] > TRAY_TRANSFER_HARD_FORWARD_CDEG:
-            return FeedbackLevel.HARD
-        if arm['reach_cdeg'] > TRAY_TRANSFER_SOFT_FORWARD_CDEG:
+                or not soft_yaw_min <= arm['yaw_cdeg'] <= yaw_limit + yaw_margin
+                or arm['reach_cdeg'] < reach_min
+                or arm['reach_cdeg'] > TRAY_TRANSFER_SOFT_FORWARD_CDEG):
             return FeedbackLevel.SOFT
         return FeedbackLevel.OK
 
@@ -756,10 +816,15 @@ class ThreeColorTrial(ArmTrial):
         count_seen = count_before
         lift_feedback = FeedbackDebounce()
         transfer_feedback = FeedbackDebounce()
-        while self.clock() < deadline:
+        park_feedback = FeedbackDebounce()
+        settling = False
+        settling_since = None
+        while settling or self.clock() < deadline:
             arm = self.checked_arm()
             state = arm['state_name']
             self.record('tray_feedback', color_id=self.color, arm=arm)
+            if state != 'PICKED' and self.clock() >= deadline:
+                break
             if arm['aligned_command_id'] != aligned_id:
                 raise RuntimeError('tray transfer alignment reference changed')
             if (lift_clear_s is None and state in ('LIFTING', 'TRAY_LOADING', 'PICKED')
@@ -772,12 +837,9 @@ class ThreeColorTrial(ArmTrial):
                             lift_mm=round((arm['z_cdeg'] - lower['z_cdeg']) / PICK_MOTOR_CDEG_PER_MM, 2))
             if state == 'LIFTING' and not loading_seen:
                 self.require_tray_count(arm, count_before)
-                if (arm['target_z_cdeg'] != lift_z
-                        or any(arm[f'target_{axis}_cdeg'] != lower[f'target_{axis}_cdeg']
-                               for axis in ('yaw', 'reach'))):
-                    raise RuntimeError('initial lift changed requested pose')
-                level = max(self.motion_feedback_level(arm, lower_z_cdeg=lower['target_z_cdeg']),
-                            self.vertical_feedback_level(arm, lower, lift_z, terminal=False))
+                level = max(z_only_target_feedback(arm, lower, lift_z),
+                            self.motion_feedback_level(arm, lower_z_cdeg=lower['target_z_cdeg']),
+                            self.vertical_feedback_level(arm, lower, lift_z))
                 lift_feedback.check(self, arm, level, phase=state)
             elif state == 'TRAY_LOADING':
                 loading_seen = True
@@ -798,10 +860,11 @@ class ThreeColorTrial(ArmTrial):
                     and previous_tray_pose['reach_cdeg'] >= nominal_min
                     and abs(previous_tray_pose['yaw_cdeg'] - arm['target_yaw_cdeg']) <= ARRIVAL_TOLERANCES[1]
                 )
-                level = self.check_tray_transfer_pose(arm, tray_reach_target=reach_limit,
-                                                     allow_single_peak=first_crossing)
+                level = self.check_tray_transfer_pose(
+                    arm, tray_reach_target=reach_limit, allow_single_peak=first_crossing,
+                    min_yaw_deg=self.tuning.tray_yaw_limits[0])
                 transfer_feedback.check(self, arm, level, phase=state)
-                if arm['reach_cdeg'] < nominal_min:
+                if arm['reach_cdeg'] < nominal_min and previous_tray_pose is not None:
                     self.record('tray_reach_recheck', previous_reach_cdeg=previous_tray_pose['reach_cdeg'],
                                 reach_cdeg=arm['reach_cdeg'])
                 previous_tray_pose = arm
@@ -811,8 +874,22 @@ class ThreeColorTrial(ArmTrial):
                 count_seen = count
             elif state == 'PICKED':
                 self.require_tray_count(arm, count_before + 1)
-                checked_arrival(arm, TRAY_PARK)
-                return lower, arm
+                level = self.arrival_feedback_level(arm, TRAY_PARK)
+                fresh = park_feedback.check(self, arm, level, phase='tray park arrival')
+                soft_settled = (
+                    fresh and level == FeedbackLevel.SOFT
+                    and settling_since is not None and self.clock() - settling_since >= SETTLE_CONFIRM_S
+                )
+                if fresh and (level == FeedbackLevel.OK or soft_settled):
+                    if soft_settled:
+                        self.record('arrival_soft_accepted', color_id=self.color, phase=state,
+                                    target_cdeg=TRAY_PARK, arm=arm)
+                    return lower, arm
+                if not settling:
+                    settling_since = self.clock()
+                    self.record('waiting_pose_confirmation', color_id=self.color, phase=state,
+                                target_cdeg=TRAY_PARK, arm=arm)
+                settling = True
             else:
                 raise RuntimeError('unexpected state during tray transfer: '+state)
             self.sleep(.12)
@@ -896,11 +973,18 @@ class ThreeColorTrial(ArmTrial):
         failed_frames = 0
         count = self.tuning.confirm_frames
         samples = deque()
+        height_warned = False
         while self.clock() < deadline:
             if self.clock()-last_status > .5:
                 a = self.checked_arm()
-                if a['state_name'] not in ('WAIT_VISION', 'ALIGNED') or abs(a['z_cdeg'])/900 > .15:
+                z_err_mm = abs(a['z_cdeg']) / PICK_MOTOR_CDEG_PER_MM
+                max_z_err_mm = HARD_Z_MARGIN_MM if self.real_tray else .15
+                if a['state_name'] not in ('WAIT_VISION', 'ALIGNED') or z_err_mm > max_z_err_mm:
                     raise RuntimeError('arm no longer stopped at observation height')
+                if self.real_tray and z_err_mm > .15 and not height_warned:
+                    height_warned = True
+                    self.record('envelope_warning', color_id=self.color, arm=a,
+                                phase='observe_height', severity='soft')
                 last_status = self.clock()
             try:
                 state = self.snapshot()
@@ -1250,10 +1334,15 @@ class ThreeColorTrial(ArmTrial):
         if self.real_tray:
             self.require_tray_count(a, 0)
         chassis = self.client.status()
+        origin_limits = STARTUP_ORIGIN_TOLERANCES if self.real_tray else (50, 50, 50)
         if (a['state_name'] != 'READY' or not a['origins_valid'] or not a['standalone_test_mode']
-                or a['fault'] or any(abs(a[k]) > 50 for k in ('z_cdeg','yaw_cdeg','reach_cdeg'))
+                or a['fault']
+                or any(abs(a[k]) > lim for k, lim in zip(('z_cdeg','yaw_cdeg','reach_cdeg'), origin_limits))
                 or chassis['state_name'] != 'EMPTY' or chassis['fault']):
             raise RuntimeError('fresh manual origin / standalone READY / EMPTY chassis required')
+        if self.real_tray and any(abs(a[k]) > 50 for k in ('z_cdeg','yaw_cdeg','reach_cdeg')):
+            self.record('envelope_warning', color_id=self.color, arm=a,
+                        phase='startup_origin', severity='soft')
         self.context = (test_id, 0, 102)
         self.started = True
         self.record('sequence_started', order=order, order_source='user_confirmed_test_order',

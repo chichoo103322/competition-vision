@@ -392,7 +392,7 @@ def test_invalid_operator_color_order_rejected(bad):
     None, 'skipped_count', 'uncertain', 'wrong_park', 'wrong_mode', 'nonempty',
     'wrong_drop', 'wrong_horizontal', 'changed_drop', 'fixed_wrong_drop',
     'one_peak', 'repeated_peak', 'hard_peak', 'changed_tray_target',
-    'tray_forward_rebound', 'tray_forward_repeat',
+    'tray_forward_rebound', 'tray_forward_repeat', 'pose_recheck',
 ])
 @pytest.mark.parametrize('drop_cdeg', [45000, 45950, 72000, 90000, 90950])
 @pytest.mark.parametrize('tray_reach', [-31830, -36605], ids=['tray_100mm', 'tray_115mm'])
@@ -428,7 +428,14 @@ def test_v7_three_colors_require_confirmed_load_and_end_ready_leave(
                     dict(state_name='WAIT_GRIP', z_cdeg=target_z)
                 ]
             if fault == 'wrong_horizontal':
-                self.arm['target_yaw_cdeg'] += 1
+                self.arm['target_yaw_cdeg'] += 61
+            if fault == 'pose_recheck':
+                yaw = self.arm['target_yaw_cdeg']
+                self.transfer_steps.extend([
+                    dict(state_name='WAIT_GRIP', z_cdeg=target_z, target_yaw_cdeg=yaw + 1),
+                    dict(target_yaw_cdeg=yaw),
+                ])
+                self.arm.update(state_name='LOWERING', z_cdeg=0)
 
         def arm_grip_done(self, route, index, work, command, reference):
             assert self.arm['state_name'] == 'WAIT_GRIP'
@@ -454,13 +461,17 @@ def test_v7_three_colors_require_confirmed_load_and_end_ready_leave(
             ]
 
             if fault in ('one_peak', 'repeated_peak', 'hard_peak'):
-                peak = dict(reach_cdeg=tray_reach - (201 if fault == 'hard_peak' else 188))
-                self.transfer_steps[3:3] = [peak] * (2 if fault == 'repeated_peak' else 1)
+                peak = dict(reach_cdeg=tray_reach - (1500 if fault == 'hard_peak' else 188))
+                repeat = 3 if fault == 'hard_peak' else 2 if fault == 'repeated_peak' else 1
+                self.transfer_steps[3:3] = [peak] * repeat
             if fault == 'changed_tray_target':
                 self.transfer_steps[2]['target_reach_cdeg'] = -31830 if tray_reach == -36605 else -36605
             if fault in ('tray_forward_rebound', 'tray_forward_repeat'):
                 rebound = [dict(reach_cdeg=1000)] * 3 if fault == 'tray_forward_repeat' else [dict(reach_cdeg=203)]
                 self.transfer_steps[4:4] = [*rebound, dict(reach_cdeg=tray_reach)]
+            if fault == 'pose_recheck':
+                self.transfer_steps[-1]['reach_cdeg'] = -18998
+                self.transfer_steps.append(dict(reach_cdeg=-19098))
 
         def arm_status(self):
             if self.transfer_steps:
@@ -477,9 +488,9 @@ def test_v7_three_colors_require_confirmed_load_and_end_ready_leave(
                              plant.select_color, tmp_path, real_tray=True,
                              pick_drop_mm=fixed_drop_mm if fault == 'fixed_wrong_drop' else None,
                              clock=lambda: plant.now, sleep=plant.sleep)
-    if fault and fault not in ('one_peak', 'tray_forward_rebound'):
+    if fault and fault not in ('one_peak', 'repeated_peak', 'tray_forward_rebound', 'pose_recheck'):
         with pytest.raises(RuntimeError, match={
-            'repeated_peak': 'tray-transfer envelope', 'hard_peak': 'tray-transfer envelope',
+            'hard_peak': 'hard trial envelope in TRAY_LOADING',
             'skipped_count': 'tray count', 'uncertain': 'uncertain tray', 'wrong_park': 'arrival',
             'wrong_mode': 'tray flag', 'nonempty': 'tray count',
             'wrong_drop': 'Z-only target mismatch', 'wrong_horizontal': 'horizontal target',
@@ -501,9 +512,12 @@ def test_v7_three_colors_require_confirmed_load_and_end_ready_leave(
         assert result['simulated_servos'] is False and result['physical_grasp_completed'] is False
         assert result['final_arm']['state_name'] == 'READY_LEAVE'
         assert plant.calls[-1] == ('finish', 1)
-        if fault == 'tray_forward_rebound':
+        if fault in ('tray_forward_rebound', 'repeated_peak'):
             events = [json.loads(line) for line in (tmp_path/'events.jsonl').read_text().splitlines()]
             assert any(e['event'] == 'envelope_warning' and e['phase'] == 'TRAY_LOADING' for e in events)
+        if fault == 'pose_recheck':
+            events = [json.loads(line) for line in (tmp_path/'events.jsonl').read_text().splitlines()]
+            assert sum(e['event'] == 'waiting_pose_confirmation' and e['phase'] == 'PICKED' for e in events) == 3
 
 
 @pytest.mark.parametrize('case', ['reported_transition', 'batched_zero', 'stale_ready'])
@@ -544,36 +558,44 @@ def test_v7_key_wait_handles_short_zeroing_without_accepting_old_ready(tmp_path,
     assert plant.calls == []
 
 
-@pytest.mark.parametrize('changed,allowed', [
-    (dict(yaw_cdeg=45180), True), (dict(yaw_cdeg=45181), False),
-    (dict(active_axis=2), False), (dict(target_yaw_cdeg=0), False),
-    (dict(target_reach_cdeg=-37000), False),
-    (dict(reach_cdeg=-31830), False),
+@pytest.mark.parametrize('changed,expected', [
+    (dict(yaw_cdeg=45180), FeedbackLevel.OK),
+    (dict(yaw_cdeg=45181), FeedbackLevel.SOFT),
+    (dict(yaw_cdeg=45751), FeedbackLevel.HARD),
+    (dict(active_axis=2), FeedbackLevel.SOFT),
+    (dict(target_yaw_cdeg=0), 'error'),
+    (dict(target_reach_cdeg=-37000), 'error'),
+    (dict(reach_cdeg=-31830), FeedbackLevel.SOFT),
 ])
-def test_tray_yaw_feedback_margin_only_applies_to_outbound_at_clearance(changed, allowed):
+def test_tray_yaw_feedback_margin_only_applies_to_outbound_at_clearance(changed, expected):
     feedback = dict(active_axis=1, z_cdeg=-3, yaw_cdeg=45085, reach_cdeg=-19100,
                     target_z_cdeg=0, target_yaw_cdeg=45000, target_reach_cdeg=-31830)
     feedback.update(changed)
-    if allowed:
-        ThreeColorTrial.check_tray_transfer_pose(feedback)
-    else:
-        with pytest.raises(RuntimeError, match='tray-transfer envelope|unexpected v7 tray approach target'):
+    if expected == 'error':
+        with pytest.raises(RuntimeError, match='unexpected v7 tray approach target'):
             ThreeColorTrial.check_tray_transfer_pose(feedback)
+    else:
+        assert ThreeColorTrial.check_tray_transfer_pose(feedback) == expected
 
-@pytest.mark.parametrize('changed,allowed', [
-    ({}, True), (dict(reach_cdeg=-32010), True), (dict(reach_cdeg=-32011), False),
-    (dict(active_axis=1), False), (dict(yaw_cdeg=35939), False),
-    (dict(target_reach_cdeg=-19098), False), (dict(target_yaw_cdeg=42000), False),
+@pytest.mark.parametrize('changed,expected', [
+    ({}, FeedbackLevel.OK),
+    (dict(reach_cdeg=-32010), FeedbackLevel.OK),
+    (dict(reach_cdeg=-32011), FeedbackLevel.SOFT),
+    (dict(reach_cdeg=-33104), FeedbackLevel.HARD),
+    (dict(active_axis=1), FeedbackLevel.SOFT),
+    (dict(yaw_cdeg=35939), FeedbackLevel.SOFT),
+    (dict(target_reach_cdeg=-19098), 'error'),
+    (dict(target_yaw_cdeg=42000), 'error'),
 ])
-def test_tray_reach_feedback_margin_requires_correct_axis_and_settled_yaw(changed, allowed):
+def test_tray_reach_feedback_margin_requires_correct_axis_and_settled_yaw(changed, expected):
     feedback = dict(active_axis=2, z_cdeg=-1, yaw_cdeg=36028, reach_cdeg=-31926,
                     target_z_cdeg=0, target_yaw_cdeg=36000, target_reach_cdeg=-31830)
     feedback.update(changed)
-    if allowed:
-        ThreeColorTrial.check_tray_transfer_pose(feedback)
-    else:
-        with pytest.raises(RuntimeError, match='tray-transfer envelope|unexpected v7 tray approach target'):
+    if expected == 'error':
+        with pytest.raises(RuntimeError, match='unexpected v7 tray approach target'):
             ThreeColorTrial.check_tray_transfer_pose(feedback)
+    else:
+        assert ThreeColorTrial.check_tray_transfer_pose(feedback) == expected
 
 
 @pytest.mark.parametrize('photo_return, readings, axis, reported_target, final_reach, error', [
@@ -585,11 +607,12 @@ def test_tray_reach_feedback_margin_requires_correct_axis_and_settled_yaw(change
     (True, [1500, 1550, 1600], 2, {}, 35, 'hard trial envelope'),
     (True, [203], 1, {}, 35, None),
     (True, [203], 2, {'target_reach_cdeg': -100}, 35, 'photo return changed requested pose'),
-    (True, [203], 2, {'target_yaw_cdeg': 1}, 35, 'photo return changed requested pose'),
-    (True, [203], 2, {'target_z_cdeg': -136}, 35, 'photo return changed requested pose'),
+    (True, [203], 2, {'target_yaw_cdeg': 61}, 35, 'photo return changed requested pose'),
+    (True, [203], 2, {'target_z_cdeg': -451}, 35, 'photo return changed requested pose'),
     (False, [203], 2, {}, 35, None),
-    (True, [203], 2, {'target_z_cdeg': -1}, 100, 'arrival differs'),
-    (True, [203], 2, {}, 1500, 'hard trial envelope'),
+    (True, [203], 2, {'target_z_cdeg': -1}, [100, 35], None),
+    (True, [203], 2, {}, [1500, 1500, 35], None),
+    (True, [203], 2, {}, [1500, 1500, 1500], 'hard trial envelope'),
 ])
 def test_photo_return_allows_only_bounded_transient_forward_feedback(
         tmp_path, photo_return, readings, axis, reported_target, final_reach, error):
@@ -604,13 +627,14 @@ def test_photo_return_allows_only_bounded_transient_forward_feedback(
     runner.command = 4
     parked = plant.arm_status()
     z_feedback = -1 if reported_target.get('target_z_cdeg') == -1 else 0
+    arrivals = final_reach if isinstance(final_reach, list) else [final_reach]
     feedback = iter([
         *(dict(state_name='ALIGNING', active_axis=axis, z_cdeg=z_feedback, reach_cdeg=reading,
                tick=tick, aligned_command_id=0, **reported_target)
           for tick, reading in (value if isinstance(value, tuple) else (i, value)
                                 for i, value in enumerate(readings, 1))),
-        dict(state_name='ALIGNED', active_axis=255, z_cdeg=z_feedback,
-             reach_cdeg=final_reach, **reported_target),
+        *(dict(state_name='ALIGNED', active_axis=255, z_cdeg=z_feedback,
+               reach_cdeg=reading, **reported_target) for reading in arrivals),
     ])
     plant.arm_status = lambda: dict(plant.arm, **next(feedback))
 
@@ -619,9 +643,32 @@ def test_photo_return_allows_only_bounded_transient_forward_feedback(
             runner.align_to([0, 0, 0], before=parked, photo_return=photo_return)
     else:
         arrived = runner.align_to([0, 0, 0], before=parked, photo_return=photo_return)
-        assert arrived['reach_cdeg'] == final_reach and arrived['tray_count'] == 1
+        assert arrived['reach_cdeg'] == arrivals[-1] and arrived['tray_count'] == 1
         events = [json.loads(line) for line in (tmp_path/'events.jsonl').read_text().splitlines()]
         assert sum(e['event'] == 'envelope_warning' for e in events) == int(readings != [138])
+
+
+@pytest.mark.parametrize('controller_fault', [False, True])
+def test_terminal_close_pose_waits_past_motion_deadline_for_fresh_confirmation(tmp_path, controller_fault):
+    plant = Plant()
+    t = real_photo_trial(plant, tmp_path, (0, 0))
+    plant.arm.update(state_name='ALIGNED', aligned_command_id=t.command, reach_cdeg=100)
+    reports = iter([
+        dict(tick=1, target_yaw_cdeg=1),
+        dict(tick=1, reach_cdeg=30),
+        dict(tick=2, reach_cdeg=100),
+        dict(tick=3, reach_cdeg=30, fault=2 if controller_fault else 0),
+    ])
+    plant.arm_status = lambda: dict(plant.arm, **next(reports))
+    start = plant.now
+    if controller_fault:
+        with pytest.raises(RuntimeError, match='origin/mode/fault'):
+            t.wait_arm('ALIGNED', ('ALIGNING',), target=[0, 0, 0], photo_return=True, timeout=.1)
+    else:
+        arrived = t.wait_arm('ALIGNED', ('ALIGNING',), target=[0, 0, 0], photo_return=True, timeout=.1)
+        assert arrived['tick'] == 3
+    assert plant.now - start > .1
+    assert not any(call[0] in ('align', 'pick', 'stop') for call in plant.calls)
 
 
 def test_photo_view_accepts_static_residual_without_calling_it_firmware_micro_motion():
@@ -629,7 +676,7 @@ def test_photo_view_accepts_static_residual_without_calling_it_firmware_micro_mo
     assert view_start_ok(arm)
     assert not micro_start_ok(arm)
     assert not view_start_ok(dict(arm, reach_cdeg=956))
-    assert not view_start_ok(dict(arm, z_cdeg=-136))
+    assert not view_start_ok(dict(arm, z_cdeg=-451))
 
 
 @pytest.mark.parametrize('target', [[0, 3601, 0], [0, 0, 1], [0, 0, -19099], [-10, 0, 0]])
@@ -908,7 +955,7 @@ def test_edge_view_computes_retraction_from_pixel_and_current_pose():
         visited={(0, 10, deep[2] + 30)})
     assert stronger[2] < deep[2]
     assert edge_view_target(
-        dict(plant.arm, z_cdeg=-136), [678, 660], plant.reference, plant.mapping,
+        dict(plant.arm, z_cdeg=-451), [678, 660], plant.reference, plant.mapping,
         tuning, visited=set()) is None
 
 
@@ -1052,3 +1099,38 @@ def test_micro_only_far_target_is_bounded_even_if_start_is_outside_corridor():
         pose,_,coarse = tray_correction(arm,np.array([283,24]),230,p.mapping['matrix'],
                                         TrialTuning(),32,allow_coarse=False)
         assert not coarse and 0 < pose[1] <= 241 and -1115 <= pose[2] <= 0
+
+
+def test_wide_tray_yaw_left_pick_does_not_fail_tray_transfer_pose():
+    feedback = dict(active_axis=2, z_cdeg=-10, yaw_cdeg=-3600, reach_cdeg=-19098,
+                    target_z_cdeg=0, target_yaw_cdeg=36000, target_reach_cdeg=-31830)
+    assert ThreeColorTrial.check_tray_transfer_pose(feedback, min_yaw_deg=-12.) == FeedbackLevel.OK
+    assert ThreeColorTrial.check_tray_transfer_pose(dict(feedback, yaw_cdeg=-3800), min_yaw_deg=-12.) == FeedbackLevel.SOFT
+    assert ThreeColorTrial.check_tray_transfer_pose(dict(feedback, yaw_cdeg=-4400), min_yaw_deg=-12.) == FeedbackLevel.HARD
+
+
+def test_static_soft_arrival_residual_accepts_without_hanging_or_stopping(tmp_path):
+    plant = Plant()
+    t = real_photo_trial(plant, tmp_path, (0, 0))
+    tick = 0
+    def settled_with_residual():
+        nonlocal tick
+        tick += 1
+        return dict(plant.arm, state_name='ALIGNED', aligned_command_id=t.command,
+                    reach_cdeg=200, tick=tick)
+    plant.arm_status = settled_with_residual
+    arrived = t.wait_arm('ALIGNED', ('ALIGNING',), target=[0, 0, 0], photo_return=True, timeout=2)
+    assert arrived['reach_cdeg'] == 200
+    events = [json.loads(line) for line in (tmp_path / 'events.jsonl').read_text().splitlines()]
+    assert any(e['event'] == 'arrival_soft_accepted' for e in events)
+    assert not any(c[0] == 'stop' for c in plant.calls)
+
+
+def test_observe_tolerates_small_z_residual_in_real_tray_mode(tmp_path):
+    plant = Plant()
+    t = real_photo_trial(plant, tmp_path, (0, 0))
+    plant.arm.update(z_cdeg=250)
+    obs = t.observe(plant.now, timeout=2)
+    assert obs['in_grasp_window']
+    events = [json.loads(line) for line in (tmp_path / 'events.jsonl').read_text().splitlines()]
+    assert any(e['event'] == 'envelope_warning' and e['phase'] == 'observe_height' for e in events)
