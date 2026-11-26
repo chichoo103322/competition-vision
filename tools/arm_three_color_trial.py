@@ -560,7 +560,7 @@ class ArmTrial:
                         return dict(a, pick_drop_cdeg=selected_pick_drop_cdeg,
                                     pick_drop_mm=selected_pick_drop_cdeg / PICK_MOTOR_CDEG_PER_MM)
                     return a
-                self.sleep(.05)
+                self.sleep(.02)
                 continue
             lower_z = min(target[0], vertical_from['z_cdeg']) if vertical_from is not None else None
             absolute_level = self.motion_feedback_level(a, lower_z_cdeg=lower_z, photo_return=in_photo_return)
@@ -596,7 +596,7 @@ class ArmTrial:
             self.sleep(.12)
         raise TimeoutError('motion timeout waiting '+wanted)
 
-    def align_to(self, target, *, before=None, photo_return=False):
+    def align_to(self, target, *, before=None, photo_return=False, preselect_color=None):
         self.command += 1
         details = {}
         if before is not None:
@@ -615,6 +615,15 @@ class ArmTrial:
         except Rejected:
             self.command -= 1
             raise
+        if preselect_color is not None and getattr(self, 'real_tray', False):
+            # 回拍照原点途中提前切好下一个颜色，视觉同步预热，到点即抓。
+            try:
+                self.select_color(preselect_color)
+                self._preselected_color = preselect_color
+                self._preselect_floor = self.clock()
+                self.record('preselect_color', next_color_id=preselect_color)
+            except (HTTPError, URLError, OSError):
+                self._preselected_color = None
         return self.wait_arm('ALIGNED', ('ALIGNING',), target=target, photo_return=photo_return)
 
     def lower_for_pick(self, aligned, *, drop_mm=DEFAULT_PICK_DROP_MM):
@@ -787,11 +796,12 @@ class ThreeColorTrial(ArmTrial):
             return super().vertical_feedback_level(arm, before, target_z)
         return FeedbackLevel.OK
 
-    def align_to(self, target, *, before=None, photo_return=False):
+    def align_to(self, target, *, before=None, photo_return=False, preselect_color=None):
         if (self.real_tray and not self.tuning.follow_controller_limits
                 and (target[0] != 0 or not usable_view_pose(target, self.tuning, ()))):
             raise RuntimeError('ALIGN target outside the photo-height command limits')
-        return super().align_to(target, before=before, photo_return=photo_return)
+        return super().align_to(target, before=before, photo_return=photo_return,
+                                preselect_color=preselect_color)
 
     def check_firmware_mode(self, arm):
         if not arm['standalone_test_mode']:
@@ -1009,7 +1019,7 @@ class ThreeColorTrial(ArmTrial):
                 self.record('arrived', state='WAIT_GRIP', **self.last_motion, arm=a)
                 return dict(a, pick_drop_cdeg=selected_pick_drop_cdeg,
                             pick_drop_mm=selected_pick_drop_cdeg / PICK_MOTOR_CDEG_PER_MM), grasped
-            self.sleep(.05)
+            self.sleep(.02)
         raise TimeoutError('motion timeout waiting WAIT_GRIP')
 
     def abort_empty_grasp(self, aligned, lower):
@@ -1063,7 +1073,7 @@ class ThreeColorTrial(ArmTrial):
                 self.record('arrived', state='WAIT_GRIP', **self.last_motion, arm=a)
                 return dict(a, pick_drop_cdeg=drop_cdeg,
                             pick_drop_mm=drop_cdeg / PICK_MOTOR_CDEG_PER_MM), grasped
-            self.sleep(.05)
+            self.sleep(.02)
         raise TimeoutError('motion timeout waiting WAIT_GRIP')
 
     def align_pick_and_load(self, target, *, before, timeout=90):
@@ -1116,7 +1126,7 @@ class ThreeColorTrial(ArmTrial):
                 return lower, arm
             else:
                 raise RuntimeError('unexpected state during align_pick tray transfer: ' + state)
-            self.sleep(.05 if state in ('ALIGNING', 'WAIT_GRIP') else .12)
+            self.sleep(.02)
         raise TimeoutError('STM32 did not confirm PICKED after ALIGN_PICK')
 
     def finish_tray_load(self, aligned, lower, pick_started):
@@ -1158,7 +1168,7 @@ class ThreeColorTrial(ArmTrial):
                 return lower, arm
             else:
                 raise RuntimeError('unexpected state during tray transfer: '+state)
-            self.sleep(.12)
+            self.sleep(.02)
         raise TimeoutError('STM32 did not confirm PICKED after v7 tray transfer')
 
     def load_tray(self, aligned):
@@ -1199,11 +1209,17 @@ class ThreeColorTrial(ArmTrial):
         self.last_usable_state = None
         self.failure_samples = 0
         self.next_failure_sample = self.clock()
+        preselected = getattr(self, '_preselected_color', None) == color
+        self._preselected_color = None
         while True:
             self.checked_arm()
             try:
-                self.select_color(color)
-                self.color_floor = self.clock()
+                if preselected:
+                    self.color_floor = getattr(self, '_preselect_floor', self.clock())
+                    preselected = False
+                else:
+                    self.select_color(color)
+                    self.color_floor = self.clock()
                 state = self.snapshot()
                 self.camera_identity(state)
                 break
@@ -1305,16 +1321,33 @@ class ThreeColorTrial(ArmTrial):
                         and len(xy) == 2 and np.isfinite(xy).all()):
                     if view_points and stamp-view_points[-1][0] > .5:
                         view_points.clear()
-                    view_points.append((stamp,xy))
+                    view_points.append((stamp, xy, seq))
                     if (count == 1 and len(view_points) >= 1) or confirmation_window_ready(view_points, count, span_s):
                         points = [item[1] for item in view_points]
-                        if np.ptp(points,axis=0).max() <= 5:
+                        max_ptp = TRAY_GRASP_JITTER_PX if self.direct_pick_after_align else 5
+                        if np.ptp(points, axis=0).max() <= max_ptp:
                             pixel = np.median(points, axis=0)
-                            previous = self.last_unreachable_view_hint
-                            if previous is None or np.linalg.norm(pixel - previous) >= 12:
+                            if self.direct_pick_after_align:
+                                # 大夹爪直接用唯一色块质心兜底一步到位，省去 1~2 秒额外换视角重拍。
                                 if self.first_target_seen is None:
                                     self.first_target_seen = view_points[0][0]
-                                raise ViewpointNeeded(pixel.tolist())
+                                frames = [dict(sequence=item[2], acquired=item[0]) for item in view_points]
+                                dynamics = observation_dynamics(points, frames)
+                                speed = float(np.linalg.norm(dynamics['velocity_px_s']))
+                                if speed <= TRAY_MAX_TRACKING_SPEED_PX_S:
+                                    radius = min(self.tuning.tolerance_px, 45.)
+                                    errors = np.asarray(points) - self.reference['reference_pixel']
+                                    in_grasp = bool(np.all(np.linalg.norm(errors, axis=1) <= radius))
+                                    self.last_usable_state = state
+                                    return dict(pixel=pixel.tolist(), track_id=None,
+                                                points=points, source_frames=frames, grasp_radius_px=radius,
+                                                in_grasp_window=in_grasp, centroid_fallback=True, **dynamics)
+                            else:
+                                previous = self.last_unreachable_view_hint
+                                if previous is None or np.linalg.norm(pixel - previous) >= 12:
+                                    if self.first_target_seen is None:
+                                        self.first_target_seen = view_points[0][0]
+                                    raise ViewpointNeeded(pixel.tolist())
                 else:
                     view_points.clear()
             else:
@@ -1598,7 +1631,7 @@ class ThreeColorTrial(ArmTrial):
                     self.save_frame(self.output/f'{self.color}_aligned.jpg')
                 return arrived, observation, (error.tolist() if accepted else [0., 0.])
 
-    def cycle(self):
+    def cycle(self, next_color=None):
         if self.real_tray:
             empty_claw_retries = 0
             while True:
@@ -1666,7 +1699,8 @@ class ThreeColorTrial(ArmTrial):
                     lower, parked = self.load_tray(aligned)
                 returned_to_origin = len(self.results) < 2
                 if returned_to_origin:
-                    photo = self.align_to([0, 0, 0], before=parked, photo_return=True)
+                    photo = self.align_to([0, 0, 0], before=parked, photo_return=True,
+                                          preselect_color=next_color)
                     self.require_tray_count(photo, parked['tray_count'])
                 result.update(controller_tray_load_completed=True, tray_count=parked['tray_count'],
                               firmware_pick_drop_mm=lower['pick_drop_mm'],
@@ -1708,9 +1742,10 @@ class ThreeColorTrial(ArmTrial):
                     expected_pick_drop_mm=self.pick_drop_mm, tuning=asdict(self.tuning))
         self.client.arm_test_begin(test_id, 102)
         self.wait_arm('WAIT_VISION', ('PREPARING',), target=[0, 0, 0])
-        for color in order:
+        for index, color in enumerate(order):
             self.set_color(color)
-            self.cycle()
+            next_color = order[index + 1] if index + 1 < len(order) else None
+            self.cycle(next_color=next_color)
         if self.real_tray:
             self.command += 1
             self.client.arm_finish(*self.context, self.command)
