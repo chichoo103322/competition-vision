@@ -887,23 +887,38 @@ class ThreeColorTrial(ArmTrial):
             mode = 'grasp_patch'
             while self.clock() < deadline:
                 try:
-                    sample = self.patch_snapshot(x, y, radius, deadline-self.clock())
+                    sample = self.patch_snapshot(x, y, radius, max(.05, deadline-self.clock()))
                 except (HTTPException, OSError, ValueError):
                     sample = None
                 if sample:
-                    if (sample['session_id'], sample['generation'], sample['capture_epoch'], sample['color_id']) != (
-                            self.camera_session, self.generation, self.capture_epoch, self.color):
-                        raise RuntimeError('grasp patch camera or selected color changed')
-                    if (sample['sequence'] > self.last_sequence and floor < sample['acquired'] <= self.clock() <= deadline):
-                        self.last_sequence, self.last_acquired = sample['sequence'], sample['acquired']
-                        floor = sample['acquired']
-                        samples.append(sample)
-                        if sample['area_px'] >= min_area:
-                            outcome = 'present'
-                            break
-                        if len(samples) == 2:
-                            outcome = 'absent'
-                            break
+                    if sample.get('source') == 'frame_jpg':
+                        mode = 'frame_jpg_any_color'
+                        deadline = max(deadline, started + max(timeout_s, .55))
+                        frame_id = sample.get('frame_id', 0)
+                        last_fid = getattr(self, '_last_frame_patch_id', 0)
+                        if frame_id > last_fid and sample['acquired'] > started - .25:
+                            self._last_frame_patch_id = frame_id
+                            samples.append(sample)
+                            if sample['area_px'] >= min_area:
+                                outcome = 'present'
+                                break
+                            if len(samples) == 2:
+                                outcome = 'absent'
+                                break
+                    else:
+                        if (sample['session_id'], sample['generation'], sample['capture_epoch'], sample['color_id']) != (
+                                self.camera_session, self.generation, self.capture_epoch, self.color):
+                            raise RuntimeError('grasp patch camera or selected color changed')
+                        if (sample['sequence'] > self.last_sequence and floor < sample['acquired'] <= self.clock() <= deadline):
+                            self.last_sequence, self.last_acquired = sample['sequence'], sample['acquired']
+                            floor = sample['acquired']
+                            samples.append(sample)
+                            if sample['area_px'] >= min_area:
+                                outcome = 'present'
+                                break
+                            if len(samples) == 2:
+                                outcome = 'absent'
+                                break
                 self.sleep(min(.01, max(0., deadline-self.clock())))
         else:
             # 视觉服务尚未升级 /grasp-patch 时回退到 /state：只要画面识别到目标颜色即判定未空爪，不做中心距离拦截。
@@ -928,8 +943,8 @@ class ThreeColorTrial(ArmTrial):
                     floor = stamp
                     materials = state.get('materials') or []
                     hint = state.get('material_view_hint') or {}
-                    has_material = any(m.get('color_id') == self.color for m in materials)
-                    has_hint = hint.get('color_id') == self.color and hint.get('source_sequence') == seq
+                    has_material = bool(materials)
+                    has_hint = bool(hint.get('color_id')) and hint.get('source_sequence') == seq
                     hit = has_material or has_hint
                     samples.append(dict(
                         sequence=seq, acquired=stamp, hit=hit,
@@ -1764,8 +1779,8 @@ def main():
                         help='max empty-claw retries per color when --empty-claw-check is enabled')
     parser.add_argument('--mid-drop-check-mm', type=float, default=60.,
                         help='descent depth in mm (~6 cm) at which to snap 1 frame for mid-drop empty-claw check')
-    parser.add_argument('--grasp-check-radius-px', type=float, default=640.,
-                        help='radius in source pixels for HSV color presence during descent (default 640 covers full frame)')
+    parser.add_argument('--grasp-check-radius-px', type=float, default=450.,
+                        help='radius in source pixels for any-color HSV presence during descent (default 450)')
     parser.add_argument('--grasp-close-wait-s', type=float, default=.55,
                         help='seconds to wait after WAIT_GRIP before sampling frames for empty-claw check')
     parser.add_argument('--save-aligned-frame', action='store_true', help='save a debug JPEG before each pick')
@@ -1815,11 +1830,41 @@ def main():
         path.write_bytes(data)
     import serial
     def patch_snapshot(x, y, radius, timeout):
-        with urlopen(f'http://127.0.0.1:8090/grasp-patch/{x}/{y}/{radius}', timeout=timeout) as reply:
+        with urlopen(f'http://127.0.0.1:8090/grasp-patch/{x}/{y}/{radius}/any', timeout=timeout) as reply:
             return json.load(reply)
-    active_patch_snapshot = (patch_snapshot
-                             if args.empty_claw_check and snapshot().get('grasp_color_patch_supported')
-                             else None)
+    def frame_any_color_snapshot(x, y, radius, timeout):
+        import cv2
+        with urlopen('http://127.0.0.1:8090/frame.jpg', timeout=timeout) as reply:
+            frame_id = int(reply.headers.get('X-Frame-Id', '0'))
+            age_ms = float(reply.headers.get('X-Capture-Age-Ms', '0'))
+            data = reply.read()
+        img = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if img is None or img.size == 0:
+            return None
+        src_w, src_h = reference['resolution']
+        h, w = img.shape[:2]
+        sx, sy = w / src_w, h / src_h
+        cx = max(0, min(w - 1, round(x * sx)))
+        cy = max(0, min(h - 1, round(y * sy)))
+        r = max(1, min(max(h, w), round(radius * min(sx, sy))))
+        left, top = max(0, cx - r), max(0, cy - r)
+        crop = img[top:cy + r + 1, left:cx + r + 1]
+        hsv = cv2.cvtColor(cv2.GaussianBlur(crop, (5, 5), 0), cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, (0, 50, 35), (179, 255, 255))
+        circle = np.zeros_like(mask)
+        cv2.circle(circle, (cx - left, cy - top), r, 255, -1)
+        mask &= circle
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        _, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        area_px = round(int(stats[1:, cv2.CC_STAT_AREA].max(initial=0)) / (sx * sy))
+        return dict(source='frame_jpg', frame_id=frame_id,
+                    acquired=time.monotonic() - age_ms / 1000.0,
+                    any_color=True, area_px=area_px)
+    active_patch_snapshot = None
+    if args.empty_claw_check:
+        state_caps = snapshot()
+        active_patch_snapshot = (patch_snapshot if state_caps.get('grasp_any_color_patch_supported')
+                                 else frame_any_color_snapshot)
     with (Path(tempfile.gettempdir())/f'robot-preview-start-{os.getuid()}.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         subprocess.run(['systemctl','--user','stop','chassis-button.service'], check=True)

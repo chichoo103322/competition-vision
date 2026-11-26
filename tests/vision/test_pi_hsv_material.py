@@ -40,6 +40,18 @@ class HSVMaterialTests(unittest.TestCase):
             self.assertGreater(detector.grasp_patch_area(frame, 200, 200, 180, color), 255)
             self.assertLess(detector.grasp_patch_area(frame, 200, 200, 180, other), 255)
 
+    def test_grasp_patch_any_color_detects_shadowed_material_and_ignores_neutral_turntable(self):
+        detector = HSVMaterialDetector()
+        neutral = np.full((400, 600, 3), 120, np.uint8)  # gray turntable
+        shadow = np.full((400, 600, 3), 40, np.uint8)    # dark neutral shadow
+        self.assertEqual(detector.grasp_patch_area(neutral, 300, 200, 180, None), 0)
+        self.assertEqual(detector.grasp_patch_area(shadow, 300, 200, 180, None), 0)
+        # Heavily shadowed yellow (V=55 < strict yellow V_min=100) still passes any-color check.
+        frame = neutral.copy()
+        paint(frame, (300, 200), (26, 120, 55), radius=40)
+        self.assertEqual(detector.grasp_patch_area(frame, 300, 200, 180, 2), 0)
+        self.assertGreater(detector.grasp_patch_area(frame, 300, 200, 180, None), 1000)
+
     def test_six_distinct_colors_including_black_and_lightblue(self):
         image = background()
         colors = [(0, 240, 220), (27, 220, 220), (115, 240, 220),

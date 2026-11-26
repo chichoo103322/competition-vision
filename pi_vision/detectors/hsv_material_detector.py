@@ -28,18 +28,27 @@ class HSVMaterialDetector:
         self.max_area_ratio = max_area_ratio
         self.profile['shape'].update(min_area_ratio=min_area_ratio, max_area_ratio=max_area_ratio)
 
-    def grasp_patch_area(self, frame, x, y, radius, color):
-        """Largest connected patch of the requested color inside the claw circle, in source pixels."""
+    def grasp_patch_area(self, frame, x, y, radius, color=None):
+        """Largest connected color patch inside the claw circle, in source pixels.
+
+        When color is None/0, accepts any chromatic material color with shadow-tolerant
+        HSV thresholds (S>=50, V>=35) so close-up arm shadows do not cause false empty-claw.
+        """
         h, w = frame.shape[:2]
         if not (0 <= x < w and 0 <= y < h and 1 <= radius <= max(h, w)):
             raise ValueError('invalid claw observation circle')
         left, top = max(0, x-radius), max(0, y-radius)
         crop = frame[top:y+radius+1, left:x+radius+1]
         hsv = cv2.cvtColor(cv2.GaussianBlur(crop, (5, 5), 0), cv2.COLOR_BGR2HSV)
-        band = 3 if color == 6 else color
-        mask = np.zeros(hsv.shape[:2], np.uint8)
-        for low, high in self.profile['bands'][band]:
-            mask |= cv2.inRange(hsv, tuple(low), tuple(high))
+        if color is None or color == 0:
+            # 不区分具体颜色，只要有任意彩色色块即可；放宽亮度/饱和度下限以抗近景阴影。
+            mask = cv2.inRange(hsv, (0, 50, 35), (179, 255, 255))
+            band = None
+        else:
+            band = 3 if color == 6 else color
+            mask = np.zeros(hsv.shape[:2], np.uint8)
+            for low, high in self.profile['bands'][band]:
+                mask |= cv2.inRange(hsv, tuple(low), tuple(high))
         circle = np.zeros_like(mask)
         cv2.circle(circle, (x-left, y-top), radius, 255, -1)
         mask &= circle
