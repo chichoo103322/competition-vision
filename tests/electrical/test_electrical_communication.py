@@ -5,7 +5,8 @@ import struct
 import pytest
 
 from pi_vision import electrical_protocol as p
-from pi_vision.electrical_link import ElectricalClient, Rejected
+from pi_vision import arm_protocol as arm
+from pi_vision.electrical_link import ArmStatusMissing, ElectricalClient, Rejected
 from pi_vision.electrical_routes import STATIONS, compile_preview, segment_for_status
 
 
@@ -42,6 +43,42 @@ def client(handler):
     clock = Clock()
     transport = Transport(clock, handler)
     return ElectricalClient(transport, clock=clock), transport, clock
+
+
+@pytest.mark.parametrize('responses, expected_error', [
+    (('valid',), None),
+    (('missing', 'valid'), None),
+    (('invalid', 'valid'), None),
+    (('missing', 'missing'), 'No ARM event frame received'),
+    (('invalid', 'invalid'), r'Rejected 2 ARM report\(s\).*fault=6'),
+])
+def test_arm_status_waits_after_ack_and_only_retries_the_read_only_query(responses, expected_error):
+    remaining = iter(responses)
+
+    def handle(packet):
+        kind, sequence, _ = p.Decoder().feed(packet)[0]
+        assert kind == arm.ARM_STATUS
+        ack = p.frame(p.ACK, sequence, report(request=kind))
+        response = next(remaining)
+        if response == 'missing':
+            return ack
+        fault = 6 if response == 'invalid' else 0
+        payload = struct.pack('<IHHIIBBBBHHiiiiiiI', 7, 0, 102, 5, 3,
+                              17, fault, 2, 4, 29, 0, 0, 42648, -36959,
+                              0, 42600, -39788, 28836)
+        return ack + p.frame(arm.ARM_EVENT, 77, payload)
+
+    c, transport, _ = client(handle)
+    if expected_error:
+        with pytest.raises(ArmStatusMissing, match=expected_error):
+            c.arm_status()
+        assert c.arm_generation == 0
+    else:
+        result = c.arm_status()
+        assert (result['state_name'], result['reach_cdeg'], result['tick']) == ('TRAY_LOADING', -36959, 28836)
+    assert len(transport.writes) == len(responses)
+    sequences = [p.Decoder().feed(packet)[0][1] for packet in transport.writes]
+    assert len(set(sequences)) == len(sequences)
 
 
 def test_crc_and_wire_golden_status_frame():

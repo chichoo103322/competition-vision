@@ -15,12 +15,19 @@ from .electrical_coordinates import direction_review, ELECTRICAL_FRAME
 from .electrical_routes import configure_work_heading_mode, expected_work_yaw, work_pose_error
 
 
+ARM_REPORT_GRACE_S = .2
+
+
 class Rejected(RuntimeError):
     def __init__(self, status):
         self.status = status
         code = status['code']
         label = p.RESULTS[code] if code < len(p.RESULTS) else str(code)
         super().__init__(f'STM32 rejected request: {label}')
+
+
+class ArmStatusMissing(TimeoutError):
+    """ARM_STATUS was acknowledged but no valid ARM_EVENT followed."""
 
 
 class AreaSuperseded(RuntimeError):
@@ -35,6 +42,8 @@ class ElectricalClient:
         self.sequence = secrets.randbelow(65536)
         self.arm_events = deque(maxlen=256)
         self.arm_generation = 0
+        self.arm_decode_errors = 0
+        self.last_arm_decode_error = None
         self.events = deque(maxlen=256)
         self._pending = deque()
         self._status = None
@@ -59,11 +68,13 @@ class ElectricalClient:
         packet = p.frame(kind, self.sequence, payload)
         rejected_acks = 0
         last_decode_error = None
+        required_arm_generation = self.arm_generation if kind == arm.ARM_STATUS else None
         try:
             for _ in range(retries):
                 if self.transport.write(packet) != len(packet):
                     raise IOError('short UART write; outcome unknown')
                 deadline = self.clock() + timeout
+                arm_status_ack = None
                 while self.clock() < deadline:
                     packet_reply = self._receive(deadline)
                     if packet_reply is None:
@@ -71,6 +82,8 @@ class ElectricalClient:
                     typ, seq, body = packet_reply
                     if typ == arm.ARM_EVENT:
                         self._record_arm(body)
+                        if arm_status_ack is not None and self.arm_generation > required_arm_generation:
+                            return arm_status_ack
                         continue
                     if typ == p.START_AREA:
                         self._record_area(body)
@@ -92,7 +105,13 @@ class ElectricalClient:
                         if status['code']:
                             raise Rejected(status)
                         if reply_kind == p.ACK:
-                            return status
+                            if required_arm_generation is None or self.arm_generation > required_arm_generation:
+                                return status
+                            # Some firmware replies deliver the ACK before the ARM_EVENT.
+                            arm_status_ack = status
+                            deadline = min(deadline, self.clock() + ARM_REPORT_GRACE_S)
+                if arm_status_ack is not None:
+                    return arm_status_ack
             detail = (f' Received {rejected_acks} matching ACK(s) rejected by decoding: {last_decode_error}.'
                       if rejected_acks else '')
             raise TimeoutError('No matching reply; command outcome unknown. Query STATUS.' + detail)
@@ -112,17 +131,25 @@ class ElectricalClient:
     def _record_arm(self, body):
         try:
             report = arm.arm_status_payload(body)
-        except ValueError:
+        except ValueError as exc:
+            self.arm_decode_errors += 1
+            self.last_arm_decode_error = str(exc)
             return
         self.arm_generation += 1
         self.arm_events.append(dict(report, received_monotonic_s=self.clock()))
 
     def arm_status(self):
         generation = self.arm_generation
-        self._exchange(arm.ARM_STATUS)
-        if self.arm_generation == generation:
-            raise TimeoutError('fresh ARM status missing; do not infer motion completion from ACK')
-        return dict(self.arm_events[-1])
+        decode_errors = self.arm_decode_errors
+        # A lost status event is recoverable by another read-only query.
+        for _ in range(2):
+            self._exchange(arm.ARM_STATUS)
+            if self.arm_generation > generation:
+                return dict(self.arm_events[-1])
+        rejected = self.arm_decode_errors - decode_errors
+        detail = (f' Rejected {rejected} ARM report(s): {self.last_arm_decode_error}.'
+                  if rejected else ' No ARM event frame received.')
+        raise ArmStatusMissing('fresh ARM status missing after two ACKs.' + detail)
 
     def arm_command(self, route_id, point_index, work_id, command_id, opcode,
                     z_deg=0, yaw_deg=0, reach_deg=0, reference_id=0):
@@ -148,6 +175,10 @@ class ElectricalClient:
 
     def arm_grip_done(self, route_id, point_index, work_id, command_id, aligned_command_id):
         return self.arm_command(route_id, point_index, work_id, command_id, 4,
+                                reference_id=aligned_command_id)
+
+    def arm_grip_abort(self, route_id, point_index, work_id, command_id, aligned_command_id):
+        return self.arm_command(route_id, point_index, work_id, command_id, 9,
                                 reference_id=aligned_command_id)
 
     def arm_finish(self, route_id, point_index, work_id, command_id):

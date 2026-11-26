@@ -18,7 +18,7 @@ from urllib.error import HTTPError, URLError
 import numpy as np
 
 from pi_vision.observation import confirmation_window_ready
-from pi_vision.electrical_link import ElectricalClient
+from pi_vision.electrical_link import ArmStatusMissing, ElectricalClient, Rejected
 from pi_vision.arm_visual_servo import AdaptivePixelMap, observation_dynamics, local_motion_mm
 from tools.turntable_work import COLORS
 
@@ -43,11 +43,15 @@ class TrialTuning:
     max_total_correction_mm: float = 90.
     alignment_budget_s: float = 180.
     wide_tray_yaw: bool = False
+    follow_controller_limits: bool = False
 
     def __post_init__(self):
         # Stay inside the firmware's ALIGN micro-motion corridor: 1deg/4mm,
         # front 60mm of travel. Raw feedback/actuator arrival checks stay strict.
-        ranges = dict(tolerance_px=(0,32), confirm_span_s=(.2,2), settle_s=(0,2),
+        min_span = 0. if self.follow_controller_limits else .2
+        min_frames = 1 if self.follow_controller_limits else 3
+        max_tol = 120. if self.follow_controller_limits else 32.
+        ranges = dict(tolerance_px=(0,max_tol), confirm_span_s=(min_span,2), settle_s=(0,2),
             max_step_mm=(0,3.8), max_yaw_step_deg=(0,.9),
             max_retraction_mm=(0,60), max_total_correction_mm=(0,120),
             alignment_budget_s=(0,600))
@@ -55,9 +59,9 @@ class TrialTuning:
             value = getattr(self,name)
             if (isinstance(value,bool) or not isinstance(value,(int,float))
                     or not math.isfinite(value) or not lo <= value <= hi
-                    or (lo==0 and value==0 and name!='settle_s')):
+                    or (lo==0 and value==0 and name not in ('settle_s', 'confirm_span_s'))):
                 raise ValueError('invalid trial tuning: '+name)
-        if type(self.confirm_frames) is not int or not 3 <= self.confirm_frames <= 15:
+        if type(self.confirm_frames) is not int or not min_frames <= self.confirm_frames <= 15:
             raise ValueError('at least three distinct source frames required')
         if type(self.max_adjustments) is not int or not 1 <= self.max_adjustments <= 64:
             raise ValueError('invalid maximum adjustment count')
@@ -112,11 +116,13 @@ def tray_grasp_radius(axes, cap):
     if not isinstance(axes, (tuple, list)) or len(axes) != 2 or not all(
             isinstance(x, (int, float)) and math.isfinite(x) and x > 0 for x in axes):
         return min(cap, 8.)
-    return min(cap, min(axes) * .25)
+    ratio = .45 if cap > 32 else .25
+    return min(cap, min(axes) * ratio)
 
 
 TRAY_GRASP_JITTER_PX = 12
 TRAY_STILL_SPEED_PX_S = 5.
+TRAY_FAST_STILL_SPEED_PX_S = 20.
 TRAY_MAX_TRACKING_SPEED_PX_S = 25.
 RIM_HINT_STATUSES = ('top_face_not_confirmed', 'clipped_region_no_complete_rim')
 
@@ -130,6 +136,8 @@ def tray_photo_target(arm, radial, tangent, reference_radius, tuning):
         return None
     desired_yaw = yaw + math.degrees(math.atan2(tangent, radius + radial))
     desired_reach = math.hypot(radius + radial, tangent) - reference_radius
+    if tuning.follow_controller_limits:
+        return 0, round(desired_yaw * 300), round(desired_reach * 36000 / 113.1)
     target_yaw = round(np.clip(desired_yaw, *tuning.tray_yaw_limits) * 300)
     target_reach = max(math.ceil(-tuning.max_retraction_mm * 36000 / 113.1),
                        min(0, round(desired_reach * 36000 / 113.1)))
@@ -189,12 +197,15 @@ def calibrated_view_poses(mapping):
 
 def usable_view_pose(target, tuning, visited):
     _, yaw, reach = target
+    not_visited = not any(abs(yaw - previous[1]) <= ARRIVAL_TOLERANCES[1]
+                          and abs(reach - previous[2]) <= ARRIVAL_TOLERANCES[2]
+                          for previous in visited)
+    if tuning.follow_controller_limits:
+        return not_visited
     min_yaw, max_yaw = tuning.tray_yaw_limits
     return (min_yaw * 300 <= yaw <= max_yaw * 300
             and math.ceil(-tuning.max_retraction_mm * 36000 / 113.1) <= reach <= 0
-            and not any(abs(yaw - previous[1]) <= ARRIVAL_TOLERANCES[1]
-                        and abs(reach - previous[2]) <= ARRIVAL_TOLERANCES[2]
-                        for previous in visited))
+            and not_visited)
 
 
 def view_start_ok(arm):
@@ -204,7 +215,7 @@ def view_start_ok(arm):
 
 
 def measured_view_target(arm, pixel, reference, mapping, tuning, visited=()):
-    if not view_start_ok(arm):
+    if not tuning.follow_controller_limits and not view_start_ok(arm):
         return None
     error = np.asarray(pixel) - reference['reference_pixel']
     best_error = np.linalg.norm(error) - 3
@@ -224,7 +235,7 @@ def measured_view_target(arm, pixel, reference, mapping, tuning, visited=()):
 
 def edge_view_target(arm, pixel, reference, mapping, tuning, visited):
     """Use the partial rim hint to move the camera toward a clearer view."""
-    if not view_start_ok(arm):
+    if not tuning.follow_controller_limits and not view_start_ok(arm):
         return None
     width, height = reference['resolution']
     lower = np.array([.38 * width, .31 * height])
@@ -266,6 +277,9 @@ def tray_correction(arm, error, reference_radius, matrix, tuning, grasp_radius, 
     if plan is None:
         raise TargetOutsideWorkspace('grasp window outside the reachable workspace')
     target, distance = plan
+    if tuning.follow_controller_limits and allow_coarse:
+        # STM32 原料区支持扇区内直接一步到位，不再切成 0.8°/3.5mm 碎步。
+        return target, distance, False
     dyaw = target[1] - arm['yaw_cdeg']
     dreach = target[2] - arm['reach_cdeg']
     steps = max(distance / tuning.max_step_mm,
@@ -294,18 +308,30 @@ def tray_correction(arm, error, reference_radius, matrix, tuning, grasp_radius, 
     if fraction < 1:
         target = [0, round(arm['yaw_cdeg'] + dyaw * fraction),
                   round(arm['reach_cdeg'] + dreach * fraction)]
-        min_yaw, max_yaw = tuning.tray_yaw_limits
-        target[1] = int(np.clip(target[1], 300 * min_yaw, 300 * max_yaw))
-        target[2] = int(np.clip(target[2], math.ceil(-tuning.max_retraction_mm * 36000 / 113.1), 0))
+        if not tuning.follow_controller_limits:
+            min_yaw, max_yaw = tuning.tray_yaw_limits
+            target[1] = int(np.clip(target[1], 300 * min_yaw, 300 * max_yaw))
+            target[2] = int(np.clip(target[2], math.ceil(-tuning.max_retraction_mm * 36000 / 113.1), 0))
         distance *= fraction
     return target, distance, coarse
 
 
-# Motor centidegrees from car_code1 7 arm_config.h and confirmed field settings.
+# Motor centidegrees from the controller headers and reported field settings.
 TRAY_PARK = (0, 0, -19098)
-TRAY_REACH_TARGETS = (-31830, -36605)  # 100 mm and 115 mm
-# STM32 reports 120° on the current car and 150° in the supplied v7 source.
-TRAY_YAW_TARGETS = (36000, 45000)
+# Safe tray approach range: yaw 110..165 deg, reach -140..-90 mm.
+# Accepts field tuning (e.g. 120/142/147/150 deg and 100/115/125/130 mm) without stopping.
+TRAY_YAW_RANGE_CDEG = (33000, 49500)
+TRAY_REACH_RANGE_CDEG = (-44562, -28647)
+
+
+def is_tray_approach_target(yaw_cdeg, reach_cdeg):
+    return (TRAY_YAW_RANGE_CDEG[0] <= yaw_cdeg <= TRAY_YAW_RANGE_CDEG[1]
+            and TRAY_REACH_RANGE_CDEG[0] <= reach_cdeg <= TRAY_REACH_RANGE_CDEG[1])
+
+
+def is_tray_park_target(yaw_cdeg, reach_cdeg):
+    return (abs(yaw_cdeg - TRAY_PARK[1]) <= ARRIVAL_TOLERANCES[1]
+            and abs(reach_cdeg - TRAY_PARK[2]) <= ARRIVAL_TOLERANCES[2])
 TRAY_YAW_APPROACH_FEEDBACK_MARGIN = 180
 TRAY_REACH_APPROACH_FEEDBACK_MARGIN = 180
 PHOTO_RETURN_FORWARD_MARGIN_MM = 0.6
@@ -320,6 +346,7 @@ TRAY_TRANSFER_HARD_FORWARD_CDEG = 955
 TRAY_TRANSFER_HARD_REACH_MARGIN_CDEG = 1273
 PHOTO_VIEW_MAX_Z_CDEG = 450
 SETTLE_CONFIRM_S = .6
+ARM_STATUS_RECOVERY_S = 2.
 ARRIVAL_TOLERANCES = (180, 60, 95)
 ARRIVAL_HARD_TOLERANCES = (2700, 750, 1273)
 # Relative limits for a Z-only move are tighter than the global travel envelope.
@@ -330,8 +357,8 @@ PICK_MOTOR_CDEG_PER_MM = 900
 GRASP_LIFT_CLEAR_MM = 5
 DEFAULT_PICK_DROP_MM = 100
 REAL_TRAY_PICK_DROPS_MM = (50, 80, DEFAULT_PICK_DROP_MM)
-# 45950 cdeg was reported on the car. 90950 adds 50 mm to that stroke.
-REAL_TRAY_PICK_DROPS_CDEG = (45000, 45950, 72000, 90000, 90950)
+# 45950 cdeg was reported on the car. 77450 (+35 mm) and 90950 (+50 mm) extend that stroke.
+REAL_TRAY_PICK_DROPS_CDEG = (45000, 45950, 72000, 77450, 90000, 90950)
 
 
 class FeedbackLevel(IntEnum):
@@ -460,6 +487,7 @@ class ArmTrial:
         full_avoidance = False
         minimum_reach = None
         selected_pick_drop_cdeg = None
+        trust_controller = bool(getattr(self, 'real_tray', False))
         feedback = FeedbackDebounce()
         settling = False
         settling_since = None
@@ -473,9 +501,7 @@ class ArmTrial:
             if not terminal and self.clock() >= deadline:
                 break
             target_level = FeedbackLevel.OK
-            if photo_return:
-                # Same-height ALIGN can report the Z encoder snapshot as its
-                # hold target. Yaw and reach still report the commanded pose.
+            if photo_return and not trust_controller:
                 commanded_z, yaw, reach = target
                 yaw_error = abs(a['target_yaw_cdeg'] - yaw)
                 reach_error = abs(a['target_reach_cdeg'] - reach)
@@ -497,21 +523,21 @@ class ArmTrial:
             if vertical_from is not None:
                 if pick_drop_cdeg_options is not None and selected_pick_drop_cdeg is None:
                     commanded_z = a['target_z_cdeg']
-                    expected_lift_refs = [vertical_from['z_cdeg']]
-                    if abs(vertical_from['target_z_cdeg'] - vertical_from['z_cdeg']) <= 180:
-                        expected_lift_refs.append(vertical_from['target_z_cdeg'])
-                    # The firmware snapshots the Z encoder on PICK. Small
-                    # encoder changes between reports must not change the
-                    # selected stroke profile or the absolute travel envelope.
-                    tolerance = 50 if vertical_from.get('tray_enabled') else 0
-                    for drop_cdeg in pick_drop_cdeg_options:
-                        lift_ref = commanded_z + drop_cdeg
-                        if any(abs(lift_ref - ref) <= tolerance for ref in expected_lift_refs):
-                            selected_pick_drop_cdeg = drop_cdeg
-                            break
-                    if selected_pick_drop_cdeg is None:
-                        raise RuntimeError(f'Z-only target mismatch: controller reports {commanded_z} cdeg, '
-                                           f'allowed pick strokes {pick_drop_cdeg_options} cdeg')
+                    if trust_controller:
+                        # Follow whatever pick stroke STM32 is configured with; never stop on stroke tuning.
+                        selected_pick_drop_cdeg = max(0, vertical_from['z_cdeg'] - commanded_z)
+                    else:
+                        expected_lift_refs = [vertical_from['z_cdeg']]
+                        if abs(vertical_from['target_z_cdeg'] - vertical_from['z_cdeg']) <= 180:
+                            expected_lift_refs.append(vertical_from['target_z_cdeg'])
+                        for drop_cdeg in pick_drop_cdeg_options:
+                            lift_ref = commanded_z + drop_cdeg
+                            if any(lift_ref == ref for ref in expected_lift_refs):
+                                selected_pick_drop_cdeg = drop_cdeg
+                                break
+                        if selected_pick_drop_cdeg is None:
+                            raise RuntimeError(f'Z-only target mismatch: controller reports {commanded_z} cdeg, '
+                                               f'allowed pick strokes {pick_drop_cdeg_options} cdeg')
                     target = [commanded_z, *target[1:]]
                     self.record('pick_stroke_confirmed', color_id=self.color, command=self.command,
                                 drop_cdeg=selected_pick_drop_cdeg,
@@ -519,12 +545,24 @@ class ArmTrial:
                                 target_z_cdeg=commanded_z)
                 if a['aligned_command_id'] != vertical_from['aligned_command_id']:
                     raise RuntimeError('Z-only motion changed alignment reference')
-                target_level = z_only_target_feedback(a, vertical_from, target[0])
-                vertical_level = self.vertical_feedback_level(a, vertical_from, target[0])
-            lower_z = min(target[0], vertical_from['z_cdeg']) if vertical_from is not None else None
-            absolute_level = self.motion_feedback_level(a, lower_z_cdeg=lower_z, photo_return=in_photo_return)
+                if not trust_controller:
+                    target_level = z_only_target_feedback(a, vertical_from, target[0])
+                    vertical_level = self.vertical_feedback_level(a, vertical_from, target[0])
             if terminal and wanted == 'ALIGNED' and a['aligned_command_id'] != self.command:
                 raise RuntimeError('ALIGNED reference mismatch')
+            if trust_controller:
+                if terminal:
+                    self.last_motion = dict(elapsed_s=self.clock()-start, full_avoidance=full_avoidance)
+                    trace = {} if minimum_reach is None else dict(min_reach_mm=round(minimum_reach*113.1/36000, 2))
+                    self.record('arrived', state=wanted, **self.last_motion, arm=a, **trace)
+                    if selected_pick_drop_cdeg is not None:
+                        return dict(a, pick_drop_cdeg=selected_pick_drop_cdeg,
+                                    pick_drop_mm=selected_pick_drop_cdeg / PICK_MOTOR_CDEG_PER_MM)
+                    return a
+                self.sleep(.05)
+                continue
+            lower_z = min(target[0], vertical_from['z_cdeg']) if vertical_from is not None else None
+            absolute_level = self.motion_feedback_level(a, lower_z_cdeg=lower_z, photo_return=in_photo_return)
             arrival_level = (self.arrival_feedback_level(a, target)
                              if terminal and target is not None else FeedbackLevel.OK)
             pose_level = max(target_level, vertical_level, arrival_level)
@@ -571,7 +609,11 @@ class ArmTrial:
             details = dict(start_cdeg=[before[k+'_cdeg'] for k in ARM_AXES],
                            predicted_clearance_reasons=reasons)
         self.record('align_request', color_id=self.color, command=self.command, target_cdeg=target, **details)
-        self.client.arm_align(*self.context, self.command, *(v/100 for v in target))
+        try:
+            self.client.arm_align(*self.context, self.command, *(v/100 for v in target))
+        except Rejected:
+            self.command -= 1
+            raise
         return self.wait_arm('ALIGNED', ('ALIGNING',), target=target, photo_return=photo_return)
 
     def lower_for_pick(self, aligned, *, drop_mm=DEFAULT_PICK_DROP_MM):
@@ -614,7 +656,11 @@ class ArmTrial:
 class ThreeColorTrial(ArmTrial):
     def __init__(self, client, reference, mapping, snapshot, select_color, output, *,
                  simulate_servos=False, real_tray=False, pick_drop_mm=None,
-                 clock=time.monotonic, sleep=time.sleep, save_frame=None, save_failure=None, tuning=None, micro_only=False):
+                 clock=time.monotonic, sleep=time.sleep, save_frame=None, save_failure=None, tuning=None, micro_only=False,
+                 empty_claw_check=False, max_empty_claw_retries=3,
+                 mid_drop_check_mm=60., grasp_check_radius_px=640., grasp_close_wait_s=.55,
+                 grasp_check_frames=3, grasp_check_min_hits=2, grasp_check_timeout_s=2.5,
+                 direct_pick_after_align=False, patch_snapshot=None):
         if (simulate_servos is True) == (real_tray is True):
             raise ValueError('choose exactly one of --simulate-servos and --real-tray')
         for k in ('camera_source', 'hsv_profile_sha256', 'resolution', 'origin_radius_mm'):
@@ -623,11 +669,14 @@ class ThreeColorTrial(ArmTrial):
         matrix = np.asarray(mapping['matrix'], dtype=float)
         if matrix.shape != (2, 2) or not np.isfinite(matrix).all():
             raise ValueError('finite 2x2 mapping required')
-        defaults = TrialTuning(tolerance_px=32., settle_s=0.) if real_tray else TrialTuning()
+        defaults = (TrialTuning(tolerance_px=32., settle_s=0., follow_controller_limits=True)
+                    if real_tray else TrialTuning())
         super().__init__(client, output, tuning or defaults, clock=clock, sleep=sleep)
         self.real_tray = real_tray is True
         if self.tuning.wide_tray_yaw and not self.real_tray:
             raise ValueError('wide yaw requires real tray mode')
+        if empty_claw_check and not self.real_tray:
+            raise ValueError('empty-claw check requires real tray mode')
         allowed_drops = REAL_TRAY_PICK_DROPS_MM if self.real_tray else (DEFAULT_PICK_DROP_MM,)
         if pick_drop_mm is None and not self.real_tray:
             pick_drop_mm = DEFAULT_PICK_DROP_MM
@@ -639,6 +688,18 @@ class ThreeColorTrial(ArmTrial):
         self.save_frame = save_frame
         self.save_failure = save_failure
         self.micro_only = micro_only
+        self.empty_claw_check = bool(empty_claw_check)
+        self.max_empty_claw_retries = int(max_empty_claw_retries)
+        self.mid_drop_check_mm = float(mid_drop_check_mm)
+        self.grasp_check_radius_px = float(grasp_check_radius_px)
+        self.patch_snapshot = patch_snapshot
+        if empty_claw_check and not 1 <= self.grasp_check_radius_px <= max(reference['resolution']):
+            raise ValueError('empty-claw check requires a valid radius')
+        self.grasp_close_wait_s = float(grasp_close_wait_s)
+        self.grasp_check_frames = int(grasp_check_frames)
+        self.grasp_check_min_hits = int(grasp_check_min_hits)
+        self.grasp_check_timeout_s = float(grasp_check_timeout_s)
+        self.direct_pick_after_align = bool(direct_pick_after_align)
         self.camera_session = self.capture_epoch = self.generation = None
         self.last_sequence, self.last_acquired = 0, float('-inf')
 
@@ -697,40 +758,27 @@ class ThreeColorTrial(ArmTrial):
         raise TimeoutError('manual-key wait expired; no sequence started')
 
     def envelope(self, arm):
-        level = self.motion_feedback_level(arm)
-        FeedbackDebounce().check(self, arm, level, phase=arm['state_name'], terminal=True)
+        if not self.real_tray:
+            super().envelope(arm)
 
     def motion_feedback_level(self, arm, *, lower_z_cdeg=None, photo_return=False):
         if not self.real_tray:
             super().envelope(arm)
-            return FeedbackLevel.OK
-        min_yaw, max_yaw = self.tuning.tray_yaw_limits
-        z_min_mm = min(-DEFAULT_PICK_DROP_MM, (lower_z_cdeg or 0) / PICK_MOTOR_CDEG_PER_MM)
-        z_mm = arm['z_cdeg'] / PICK_MOTOR_CDEG_PER_MM
-        reach_mm = arm['reach_cdeg'] * 113.1 / 36000
-        yaw_deg = arm['yaw_cdeg'] / 300
-        if (not z_min_mm - HARD_Z_MARGIN_MM <= z_mm <= HARD_Z_MARGIN_MM
-                or not -HARD_RETRACTION_MM <= reach_mm <= HARD_FORWARD_MARGIN_MM
-                or not min_yaw - HARD_YAW_MARGIN_DEG <= yaw_deg <= max_yaw + HARD_YAW_MARGIN_DEG):
-            return FeedbackLevel.HARD
-        forward = PHOTO_RETURN_FORWARD_MARGIN_MM if photo_return else SOFT_FORWARD_MARGIN_MM
-        if (not z_min_mm - .4 <= z_mm <= .2 or not -60.6 <= reach_mm <= forward
-                or not min_yaw - .3 <= yaw_deg <= max_yaw + .3):
-            return FeedbackLevel.SOFT
         return FeedbackLevel.OK
 
     def arrival_feedback_level(self, arm, target):
         if not self.real_tray:
             return super().arrival_feedback_level(arm, target)
-        return pose_feedback_level(arrival_drift(arm, target), ARRIVAL_HARD_TOLERANCES)
+        return FeedbackLevel.OK
 
     def vertical_feedback_level(self, arm, before, target_z):
         if not self.real_tray:
             return super().vertical_feedback_level(arm, before, target_z)
-        return pose_feedback_level(vertical_feedback_drift(arm, before, target_z))
+        return FeedbackLevel.OK
 
     def align_to(self, target, *, before=None, photo_return=False):
-        if self.real_tray and (target[0] != 0 or not usable_view_pose(target, self.tuning, ())):
+        if (self.real_tray and not self.tuning.follow_controller_limits
+                and (target[0] != 0 or not usable_view_pose(target, self.tuning, ()))):
             raise RuntimeError('ALIGN target outside the photo-height command limits')
         return super().align_to(target, before=before, photo_return=photo_return)
 
@@ -746,9 +794,26 @@ class ThreeColorTrial(ArmTrial):
                 raise RuntimeError('STM32 firmware does not advertise the GRIP_DONE handoff')
 
     def checked_arm(self, expected_command=None):
-        arm = super().checked_arm(expected_command)
-        self.check_firmware_mode(arm)
-        return arm
+        recovery_deadline = None
+        while True:
+            try:
+                arm = super().checked_arm(expected_command)
+            except ArmStatusMissing as exc:
+                if not self.real_tray:
+                    raise
+                now = self.clock()
+                if recovery_deadline is None:
+                    recovery_deadline = now + ARM_STATUS_RECOVERY_S
+                    self.record('waiting_arm_status', color_id=self.color, command=self.command,
+                                error=str(exc), motion_sent=False)
+                elif now >= recovery_deadline:
+                    raise
+                self.sleep(.12)
+                continue
+            self.check_firmware_mode(arm)
+            if recovery_deadline is not None:
+                self.record('arm_status_recovered', color_id=self.color, command=self.command, arm=arm)
+            return arm
 
     @staticmethod
     def require_tray_count(arm, expected):
@@ -756,16 +821,17 @@ class ThreeColorTrial(ArmTrial):
             raise RuntimeError(f'STM32 tray count {arm.get("tray_count")} differs from expected {expected}')
 
     @staticmethod
-    def check_tray_transfer_pose(arm, *, tray_reach_target=TRAY_REACH_TARGETS[0],
+    def check_tray_transfer_pose(arm, *, tray_approach_target=None,
                                  allow_single_peak=False, min_yaw_deg=-6.):
         _, yaw_margin, reach_margin = ARRIVAL_TOLERANCES
-        yaw_limit = max(TRAY_YAW_TARGETS)
+        yaw_limit, tray_reach_target = tray_approach_target or (TRAY_YAW_RANGE_CDEG[1], TRAY_REACH_RANGE_CDEG[0])
+        reported_yaw = arm['target_yaw_cdeg']
         reported_reach = arm['target_reach_cdeg']
-        if reported_reach in TRAY_REACH_TARGETS:
-            tray_reach_target = reported_reach
-            yaw_limit = arm['target_yaw_cdeg']
-            if yaw_limit not in TRAY_YAW_TARGETS or abs(arm['target_z_cdeg'] - TRAY_PARK[0]) > PHOTO_VIEW_MAX_Z_CDEG:
+        if is_tray_approach_target(reported_yaw, reported_reach):
+            if abs(arm['target_z_cdeg'] - TRAY_PARK[0]) > PHOTO_VIEW_MAX_Z_CDEG:
                 raise RuntimeError('unexpected v7 tray approach target')
+            tray_reach_target = reported_reach
+            yaw_limit = reported_yaw
             # Extra feedback room applies only on the moving axis and only
             # with the other horizontal axis already at the safe pose.
             if (arm['active_axis'] == 1 and
@@ -776,8 +842,8 @@ class ThreeColorTrial(ArmTrial):
                 if allow_single_peak:
                     # One extra encoder sample up to 20 cdeg (~0.063 mm).
                     reach_margin += 20
-        elif arm['target_yaw_cdeg'] in TRAY_YAW_TARGETS or reported_reach < TRAY_REACH_TARGETS[0]:
-            raise RuntimeError(f'unexpected v7 tray approach target: reach={reported_reach}')
+        elif not is_tray_park_target(reported_yaw, reported_reach):
+            raise RuntimeError(f'unexpected v7 tray approach target: yaw={reported_yaw}, reach={reported_reach}')
         hard_z = HARD_Z_MARGIN_MM * PICK_MOTOR_CDEG_PER_MM
         hard_yaw_min = (min_yaw_deg - HARD_YAW_MARGIN_DEG) * 300
         hard_yaw_max = yaw_limit + HARD_YAW_MARGIN_DEG * 300
@@ -796,14 +862,150 @@ class ThreeColorTrial(ArmTrial):
             return FeedbackLevel.SOFT
         return FeedbackLevel.OK
 
-    def load_tray(self, aligned):
+    def check_object_present_fast(self, z_cdeg, *, stage='mid_drop_6cm', timeout_s=.20):
+        """One positive raw frame passes immediately. Require two different frames for a miss."""
+        started = self.clock()
+        floor = max(started, self.last_acquired)
+        samples = []
+        outcome = 'unconfirmed'
+        radius = round(self.grasp_check_radius_px)
+        if self.patch_snapshot is not None:
+            deadline = started + timeout_s
+            x, y = (round(v) for v in self.reference['reference_pixel'])
+            min_area = max(16, min(250, round(.0025 * math.pi * radius**2)))
+            mode = 'grasp_patch'
+            while self.clock() < deadline:
+                try:
+                    sample = self.patch_snapshot(x, y, radius, deadline-self.clock())
+                except (HTTPException, OSError, ValueError):
+                    sample = None
+                if sample:
+                    if (sample['session_id'], sample['generation'], sample['capture_epoch'], sample['color_id']) != (
+                            self.camera_session, self.generation, self.capture_epoch, self.color):
+                        raise RuntimeError('grasp patch camera or selected color changed')
+                    if (sample['sequence'] > self.last_sequence and floor < sample['acquired'] <= self.clock() <= deadline):
+                        self.last_sequence, self.last_acquired = sample['sequence'], sample['acquired']
+                        floor = sample['acquired']
+                        samples.append(sample)
+                        if sample['area_px'] >= min_area:
+                            outcome = 'present'
+                            break
+                        if len(samples) == 2:
+                            outcome = 'absent'
+                            break
+                self.sleep(min(.01, max(0., deadline-self.clock())))
+        else:
+            # 视觉服务尚未升级 /grasp-patch 时回退到 /state：只要画面识别到目标颜色即判定未空爪，不做中心距离拦截。
+            deadline = started + max(timeout_s, .50)
+            min_area = 0
+            mode = 'state_color_fallback'
+            while self.clock() < deadline:
+                try:
+                    state = self.snapshot()
+                    self.camera_identity(state)
+                except (HTTPException, ObservationUnavailable, URLError, OSError, json.JSONDecodeError):
+                    self.sleep(min(.02, max(0., deadline-self.clock())))
+                    continue
+                obs = state.get('material_observation') or {}
+                seq, stamp = obs.get('source_sequence'), obs.get('acquired_monotonic_s')
+                if (obs.get('valid') and obs.get('generation') == self.generation
+                        and obs.get('capture_epoch') == self.capture_epoch
+                        and isinstance(stamp, (int, float))
+                        and seq is not None and seq > self.last_sequence
+                        and floor < stamp <= self.clock() <= deadline):
+                    self.last_sequence, self.last_acquired = seq, stamp
+                    floor = stamp
+                    materials = state.get('materials') or []
+                    hint = state.get('material_view_hint') or {}
+                    has_material = any(m.get('color_id') == self.color for m in materials)
+                    has_hint = hint.get('color_id') == self.color and hint.get('source_sequence') == seq
+                    hit = has_material or has_hint
+                    samples.append(dict(
+                        sequence=seq, acquired=stamp, hit=hit,
+                        source='material' if has_material else 'view_hint' if has_hint else 'none',
+                        status=state.get('material_localization_status'),
+                    ))
+                    if hit:
+                        outcome = 'present'
+                        break
+                    if len(samples) == 2:
+                        outcome = 'absent'
+                        break
+                self.sleep(min(.02, max(0., deadline-self.clock())))
+        event = {'present': 'target_color_present', 'absent': 'empty_claw_detected',
+                 'unconfirmed': 'grasp_check_unconfirmed'}[outcome]
+        self.record(event, color_id=self.color, stage=stage, mode=mode, samples=samples,
+                    min_area_px=min_area, radius_px=radius, z_cdeg=z_cdeg,
+                    elapsed_s=round(self.clock() - started, 3))
+        return outcome == 'present'
+
+    def lower_with_mid_drop_check(self, aligned, *, timeout=40):
+        """下降中用局部色块复核目标，错过检查深度时在 WAIT_GRIP 补查。"""
+        aligned_id = aligned['aligned_command_id']
+        if aligned_id != self.command:
+            raise RuntimeError('cannot PICK without latest verified alignment')
+        self.command += 1
+        self.record('pick_request', color_id=self.color, reference_id=aligned_id,
+                    command=self.command, expected_drop_mm=self.pick_drop_mm)
+        self.client.arm_pick(*self.context, self.command, aligned_id)
+        start = self.clock()
+        deadline = start + timeout
+        check_drop_cdeg = self.mid_drop_check_mm * PICK_MOTOR_CDEG_PER_MM
+        checked = False
+        grasped = True
+        selected_pick_drop_cdeg = None
+        while self.clock() < deadline:
+            a = self.checked_arm()
+            self.record('feedback', color_id=self.color, arm=a)
+            state = a['state_name']
+            if state not in ('LOWERING', 'WAIT_GRIP'):
+                raise RuntimeError('unexpected state ' + state)
+            if selected_pick_drop_cdeg is None:
+                selected_pick_drop_cdeg = max(0, aligned['z_cdeg'] - a['target_z_cdeg'])
+                self.record('pick_stroke_confirmed', color_id=self.color, command=self.command,
+                            drop_cdeg=selected_pick_drop_cdeg,
+                            drop_mm=selected_pick_drop_cdeg / PICK_MOTOR_CDEG_PER_MM,
+                            target_z_cdeg=a['target_z_cdeg'])
+            if a['aligned_command_id'] != aligned_id:
+                raise RuntimeError('Z-only motion changed alignment reference')
+            descended = aligned['z_cdeg'] - a['z_cdeg']
+            if not checked and state == 'LOWERING' and descended >= check_drop_cdeg:
+                checked = True
+                grasped = self.check_object_present_fast(a['z_cdeg'], stage='mid_drop_6cm')
+                if not grasped:
+                    return dict(a, pick_drop_cdeg=selected_pick_drop_cdeg,
+                                pick_drop_mm=selected_pick_drop_cdeg / PICK_MOTOR_CDEG_PER_MM), False
+            if state == 'WAIT_GRIP':
+                if not checked:
+                    checked = True
+                    grasped = self.check_object_present_fast(a['z_cdeg'], stage='wait_grip_fallback')
+                self.last_motion = dict(elapsed_s=self.clock() - start, full_avoidance=False)
+                self.record('arrived', state='WAIT_GRIP', **self.last_motion, arm=a)
+                return dict(a, pick_drop_cdeg=selected_pick_drop_cdeg,
+                            pick_drop_mm=selected_pick_drop_cdeg / PICK_MOTOR_CDEG_PER_MM), grasped
+            self.sleep(.05)
+        raise TimeoutError('motion timeout waiting WAIT_GRIP')
+
+    def abort_empty_grasp(self, aligned, lower):
+        """空爪时发 GRIP_ABORT(opcode=9)：松爪/跳过闭爪、抬回拍照高度、回原点，不入盘不加计数。"""
         count_before = len(self.results)
-        self.require_tray_count(aligned, count_before)
-        pick_started = self.clock()
-        lower = self.lower_for_pick(aligned, drop_mm=self.pick_drop_mm)
+        aligned_id = aligned['aligned_command_id']
+        self.command += 1
+        self.client.arm_grip_abort(*self.context, self.command, aligned_id)
+        self.record('grip_abort_requested', color_id=self.color, command=self.command,
+                    reference_id=aligned_id, expected_tray_count=count_before,
+                    aborted_from_state=lower.get('state_name'))
+        lifted = self.wait_arm('WAIT_VISION', ('LOWERING', 'LIFTING'), timeout=40)
+        self.require_tray_count(lifted, count_before)
+        photo = self.align_to([0, 0, 0], before=lifted, photo_return=True)
+        self.require_tray_count(photo, count_before)
+        self.record('empty_claw_aborted', color_id=self.color, arm=photo, tray_count=count_before)
+        return photo
+
+    def finish_tray_load(self, aligned, lower, pick_started):
+        count_before = len(self.results)
         self.require_tray_count(lower, count_before)
         aligned_id = aligned['aligned_command_id']
-        lift_z = lower['target_z_cdeg'] + lower['pick_drop_cdeg']
         self.command += 1
         self.client.arm_grip_done(*self.context, self.command, aligned_id)
         self.record('lift_and_load_requested', color_id=self.color,
@@ -811,20 +1013,11 @@ class ThreeColorTrial(ArmTrial):
         deadline = self.clock() + 90
         loading_seen = False
         lift_clear_s = None
-        tray_reach_target = None
-        previous_tray_pose = None
         count_seen = count_before
-        lift_feedback = FeedbackDebounce()
-        transfer_feedback = FeedbackDebounce()
-        park_feedback = FeedbackDebounce()
-        settling = False
-        settling_since = None
-        while settling or self.clock() < deadline:
+        while self.clock() < deadline:
             arm = self.checked_arm()
             state = arm['state_name']
             self.record('tray_feedback', color_id=self.color, arm=arm)
-            if state != 'PICKED' and self.clock() >= deadline:
-                break
             if arm['aligned_command_id'] != aligned_id:
                 raise RuntimeError('tray transfer alignment reference changed')
             if (lift_clear_s is None and state in ('LIFTING', 'TRAY_LOADING', 'PICKED')
@@ -837,63 +1030,26 @@ class ThreeColorTrial(ArmTrial):
                             lift_mm=round((arm['z_cdeg'] - lower['z_cdeg']) / PICK_MOTOR_CDEG_PER_MM, 2))
             if state == 'LIFTING' and not loading_seen:
                 self.require_tray_count(arm, count_before)
-                level = max(z_only_target_feedback(arm, lower, lift_z),
-                            self.motion_feedback_level(arm, lower_z_cdeg=lower['target_z_cdeg']),
-                            self.vertical_feedback_level(arm, lower, lift_z))
-                lift_feedback.check(self, arm, level, phase=state)
             elif state == 'TRAY_LOADING':
                 loading_seen = True
-                reported_reach = arm['target_reach_cdeg']
-                if reported_reach in TRAY_REACH_TARGETS:
-                    if tray_reach_target is not None and reported_reach != tray_reach_target:
-                        raise RuntimeError('v7 tray reach target changed during transfer')
-                    tray_reach_target = reported_reach
-                # The return command targets park while the arm can still be at the tray.
-                reach_limit = tray_reach_target or TRAY_REACH_TARGETS[0]
-                nominal_min = reach_limit - TRAY_REACH_APPROACH_FEEDBACK_MARGIN
-                # A second low sample or a larger excursion fails immediately.
-                first_crossing = (
-                    arm['active_axis'] == 2 and reported_reach == tray_reach_target
-                    and previous_tray_pose is not None and previous_tray_pose['active_axis'] == 2
-                    and previous_tray_pose['target_reach_cdeg'] == reported_reach
-                    and previous_tray_pose['target_yaw_cdeg'] == arm['target_yaw_cdeg']
-                    and previous_tray_pose['reach_cdeg'] >= nominal_min
-                    and abs(previous_tray_pose['yaw_cdeg'] - arm['target_yaw_cdeg']) <= ARRIVAL_TOLERANCES[1]
-                )
-                level = self.check_tray_transfer_pose(
-                    arm, tray_reach_target=reach_limit, allow_single_peak=first_crossing,
-                    min_yaw_deg=self.tuning.tray_yaw_limits[0])
-                transfer_feedback.check(self, arm, level, phase=state)
-                if arm['reach_cdeg'] < nominal_min and previous_tray_pose is not None:
-                    self.record('tray_reach_recheck', previous_reach_cdeg=previous_tray_pose['reach_cdeg'],
-                                reach_cdeg=arm['reach_cdeg'])
-                previous_tray_pose = arm
                 count = arm['tray_count']
                 if not count_seen <= count <= count_before + 1:
                     raise RuntimeError('tray count regressed or incremented more than once')
                 count_seen = count
             elif state == 'PICKED':
                 self.require_tray_count(arm, count_before + 1)
-                level = self.arrival_feedback_level(arm, TRAY_PARK)
-                fresh = park_feedback.check(self, arm, level, phase='tray park arrival')
-                soft_settled = (
-                    fresh and level == FeedbackLevel.SOFT
-                    and settling_since is not None and self.clock() - settling_since >= SETTLE_CONFIRM_S
-                )
-                if fresh and (level == FeedbackLevel.OK or soft_settled):
-                    if soft_settled:
-                        self.record('arrival_soft_accepted', color_id=self.color, phase=state,
-                                    target_cdeg=TRAY_PARK, arm=arm)
-                    return lower, arm
-                if not settling:
-                    settling_since = self.clock()
-                    self.record('waiting_pose_confirmation', color_id=self.color, phase=state,
-                                target_cdeg=TRAY_PARK, arm=arm)
-                settling = True
+                return lower, arm
             else:
                 raise RuntimeError('unexpected state during tray transfer: '+state)
             self.sleep(.12)
         raise TimeoutError('STM32 did not confirm PICKED after v7 tray transfer')
+
+    def load_tray(self, aligned):
+        count_before = len(self.results)
+        self.require_tray_count(aligned, count_before)
+        pick_started = self.clock()
+        lower = self.lower_for_pick(aligned, drop_mm=self.pick_drop_mm)
+        return self.finish_tray_load(aligned, lower, pick_started)
 
     def camera_identity(self, state):
         now = self.clock()
@@ -964,27 +1120,23 @@ class ThreeColorTrial(ArmTrial):
                     search_window=state.get('material_target_window'), materials=state.get('materials'),
                     view_hint=state.get('material_view_hint'))
 
-    def observe(self, floor, timeout=180):
+    def observe(self, floor, timeout=180, *, required_frames=None, required_span_s=None):
         floor = max(floor, self.color_floor, self.last_acquired)
         deadline, last_status = self.clock()+timeout, float('-inf')
         reason = 'no fresh source frame'
         view_points = deque()
         unconfirmed_since = self.clock()
         failed_frames = 0
-        count = self.tuning.confirm_frames
+        count = self.tuning.confirm_frames if required_frames is None else required_frames
+        span_s = self.tuning.confirm_span_s if required_span_s is None else required_span_s
+        status_period = 2.0 if self.real_tray else .5
+        poll_sleep = .02 if self.real_tray else .05
         samples = deque()
-        height_warned = False
         while self.clock() < deadline:
-            if self.clock()-last_status > .5:
+            if self.clock()-last_status > status_period:
                 a = self.checked_arm()
-                z_err_mm = abs(a['z_cdeg']) / PICK_MOTOR_CDEG_PER_MM
-                max_z_err_mm = HARD_Z_MARGIN_MM if self.real_tray else .15
-                if a['state_name'] not in ('WAIT_VISION', 'ALIGNED') or z_err_mm > max_z_err_mm:
+                if a['state_name'] not in ('WAIT_VISION', 'ALIGNED') or (not self.real_tray and abs(a['z_cdeg'])/900 > .15):
                     raise RuntimeError('arm no longer stopped at observation height')
-                if self.real_tray and z_err_mm > .15 and not height_warned:
-                    height_warned = True
-                    self.record('envelope_warning', color_id=self.color, arm=a,
-                                phase='observe_height', severity='soft')
                 last_status = self.clock()
             try:
                 state = self.snapshot()
@@ -996,14 +1148,14 @@ class ThreeColorTrial(ArmTrial):
                 failed_frames = 0
                 view_points.clear()
                 samples.clear()
-                self.sleep(.1)
+                self.sleep(.05 if self.real_tray else .1)
                 continue
             except (ObservationUnavailable,URLError,OSError,json.JSONDecodeError):
                 reason = 'fresh camera or material observation unavailable'
                 failed_frames = 0
                 view_points.clear()
                 samples.clear()
-                self.sleep(.1)
+                self.sleep(.05 if self.real_tray else .1)
                 continue
             obs = state['material_observation']
             seq, stamp = obs.get('source_sequence'), obs.get('acquired_monotonic_s')
@@ -1014,10 +1166,10 @@ class ThreeColorTrial(ArmTrial):
                 failed_frames = 0
                 view_points.clear()
                 samples.clear()
-                self.sleep(.1)
+                self.sleep(.05 if self.real_tray else .1)
                 continue
             if seq <= self.last_sequence or stamp <= max(floor, self.last_acquired):
-                self.sleep(.05)
+                self.sleep(poll_sleep)
                 continue
             self.last_sequence, self.last_acquired = seq, stamp
             materials = state.get('materials', [])
@@ -1037,7 +1189,7 @@ class ThreeColorTrial(ArmTrial):
                     if view_points and stamp-view_points[-1][0] > .5:
                         view_points.clear()
                     view_points.append((stamp,xy))
-                    if confirmation_window_ready(view_points, count, self.tuning.confirm_span_s):
+                    if (count == 1 and len(view_points) >= 1) or confirmation_window_ready(view_points, count, span_s):
                         points = [item[1] for item in view_points]
                         if np.ptp(points,axis=0).max() <= 5:
                             pixel = np.median(points, axis=0)
@@ -1069,7 +1221,7 @@ class ThreeColorTrial(ArmTrial):
                     if not nearby_same_color:
                         samples.clear()
                 samples.append((stamp, point, seq, track, radius))
-                if confirmation_window_ready(samples, count, self.tuning.confirm_span_s):
+                if (count == 1 and len(samples) >= 1) or confirmation_window_ready(samples, count, span_s):
                     points = [sample[1] for sample in samples]
                     radius = min(s[4] for s in samples)
                     errors = np.asarray(points) - self.reference['reference_pixel']
@@ -1094,21 +1246,23 @@ class ThreeColorTrial(ArmTrial):
                             self.first_target_seen = samples[0][0]
                         # The actuator needs seconds to reach the piece. A
                         # steady traversal of the grasp window cannot authorize it.
-                        if self.real_tray and in_grasp and speed > TRAY_STILL_SPEED_PX_S:
+                        still_limit = (TRAY_FAST_STILL_SPEED_PX_S
+                                       if self.direct_pick_after_align else TRAY_STILL_SPEED_PX_S)
+                        if self.real_tray and in_grasp and speed > still_limit:
                             reason = 'target moving inside grasp window'
-                            self.sleep(.05)
+                            self.sleep(poll_sleep)
                             continue
                         if self.real_tray and speed > TRAY_MAX_TRACKING_SPEED_PX_S:
                             reason = f'target_moving:{speed:.1f}px/s'
-                            self.sleep(.05)
+                            self.sleep(poll_sleep)
                             continue
                         self.last_usable_state = state
                         return dict(pixel=np.median(points, axis=0).tolist(), track_id=track,
                                     points=points, source_frames=frames, grasp_radius_px=radius,
                                     in_grasp_window=in_grasp, **dynamics)
-                if self.clock() - unconfirmed_since >= max(1., self.tuning.confirm_span_s + .3):
+                if self.clock() - unconfirmed_since >= max(1., span_s + .3):
                     self.sample_failed_observation(state, reason)
-            self.sleep(.05)
+            self.sleep(poll_sleep)
         raise ObservationUnavailable(f'{COLORS[self.color]}: {reason}')
 
     def wait_reachable_target(self, timeout=180):
@@ -1154,11 +1308,13 @@ class ThreeColorTrial(ArmTrial):
         anchor, stagnant, total, adjustments = None, 0, 0., 0
         need_acquire, active_since, hold_reason = True, None, None
         coarse_used = False
+        follow_controller = self.real_tray and self.tuning.follow_controller_limits
         observation_timeout = 2 if self.real_tray else 8
         while True:
             try:
                 observation = (self.wait_reachable_target(timeout=observation_timeout) if need_acquire else
-                    self.observe(self.clock()+self.tuning.settle_s,timeout=observation_timeout))
+                    self.observe(self.clock()+self.tuning.settle_s, timeout=observation_timeout,
+                                 **({'required_frames': 1, 'required_span_s': 0.} if follow_controller else {})))
             except ViewpointNeeded as hint:
                 a = self.checked_arm()
                 self.envelope(a)
@@ -1172,9 +1328,12 @@ class ThreeColorTrial(ArmTrial):
                 if plan is None:
                     plan = measured_view_target(a, hint.pixel, self.reference, self.mapping,
                                                 self.tuning, visited=self.view_targets)
-                if (plan and adjustments < self.tuning.max_adjustments
-                        and total+plan[1] <= self.tuning.max_total_correction_mm
-                        and (active_since is None or self.clock()-active_since < self.tuning.alignment_budget_s)):
+                within_budget = follow_controller or (
+                    adjustments < self.tuning.max_adjustments
+                    and total + plan[1] <= self.tuning.max_total_correction_mm
+                    and (active_since is None or self.clock() - active_since < self.tuning.alignment_budget_s)
+                ) if plan else False
+                if plan and within_budget:
                     if active_since is None:
                         active_since = self.clock()
                     target, distance = plan
@@ -1185,7 +1344,11 @@ class ThreeColorTrial(ArmTrial):
                     self.record('rim_view_change', color_id=self.color, target_cdeg=target,
                                 selection_pixel=hint.pixel, combined_move=computed_view,
                                 view_source='computed' if computed_view else 'calibration_sample')
-                    self.align_to(target, before=a)
+                    try:
+                        self.align_to(target, before=a)
+                    except Rejected as exc:
+                        self.record('controller_rejected_align', color_id=self.color,
+                                    target_cdeg=target, error=str(exc), motion_sent=False)
                 else:
                     self.last_unreachable_view_hint = hint.pixel
                     self.record('waiting_for_complete_rim', color_id=self.color, motion_sent=False,
@@ -1242,7 +1405,8 @@ class ThreeColorTrial(ArmTrial):
                 target = [0, 0, 0] if self.real_tray else [0, a['yaw_cdeg'], min(0, a['reach_cdeg'])]
                 distance = 0.
             else:
-                exhausted = (adjustments>=self.tuning.max_adjustments or
+                exhausted = False if follow_controller else (
+                    adjustments>=self.tuning.max_adjustments or
                     total>=self.tuning.max_total_correction_mm or (active_since is not None
                     and self.clock()-active_since>=self.tuning.alignment_budget_s))
                 if exhausted:
@@ -1271,7 +1435,7 @@ class ThreeColorTrial(ArmTrial):
                         pixel=observation['pixel'],reason=str(e),motion_sent=False)
                     anchor, need_acquire = None, True
                     continue
-                if total+distance>self.tuning.max_total_correction_mm:
+                if not follow_controller and total+distance>self.tuning.max_total_correction_mm:
                     total=self.tuning.max_total_correction_mm
                     anchor=None
                     continue
@@ -1285,38 +1449,81 @@ class ThreeColorTrial(ArmTrial):
             anchor = (observation,a,error.copy())
             total += distance
             adjustments += 1
-            self.align_to(target, before=a)
+            try:
+                arrived = self.align_to(target, before=a)
+            except Rejected as exc:
+                self.record('controller_rejected_align', color_id=self.color,
+                            target_cdeg=target, error=str(exc), motion_sent=False)
+                if a['reach_cdeg'] < TRAY_PARK[2] and target[1] != a['yaw_cdeg']:
+                    # 电控在 reach < -60mm 时拒绝带 yaw 的 ALIGN；先单动 reach 回到安全区。
+                    safe_reach = [0, a['yaw_cdeg'], max(TRAY_PARK[2], min(0, target[2]))]
+                    try:
+                        self.align_to(safe_reach, before=a)
+                    except Rejected as recovery_exc:
+                        self.record('controller_rejected_align', color_id=self.color,
+                                    target_cdeg=safe_reach, error=str(recovery_exc), motion_sent=False)
+                anchor, stagnant, need_acquire = None, 0, True
+                continue
             self.last_unreachable_view_hint = None
+            if (self.real_tray and self.direct_pick_after_align
+                    and (accepted or not self.micro_only)):
+                # 大夹爪一步到位后不再二次拍照确认，直接返回触发 PICK。
+                if self.save_frame:
+                    self.save_frame(self.output/f'{self.color}_aligned.jpg')
+                return arrived, observation, (error.tolist() if accepted else [0., 0.])
 
     def cycle(self):
-        aligned, obs, error = self.align_color()
-        result = dict(color_id=self.color, color_name=COLORS[self.color],
-                      aligned_pixel=obs['pixel'], error_px=error,
-                      physical_grasp_completed=False, physical_place_completed=False)
         if self.real_tray:
-            now = self.clock()
-            result.update(color_to_first_usable_s=round(self.first_usable-self.color_started, 3),
-                          usable_to_pick_ready_s=round(now-self.first_usable, 3),
-                          color_to_first_reachable_s=round(self.first_reachable-self.color_started, 3),
-                          color_to_pick_ready_s=round(now - self.color_started, 3),
-                          reachable_to_pick_ready_s=round(now - self.first_reachable, 3),
-                          grasp_radius_px=obs['grasp_radius_px'])
-            self.record('pick_ready', color_id=self.color, error_px=error,
-                        color_to_first_usable_s=result['color_to_first_usable_s'],
-                        usable_to_pick_ready_s=result['usable_to_pick_ready_s'],
-                        color_to_pick_ready_s=result['color_to_pick_ready_s'],
-                        reachable_to_pick_ready_s=result['reachable_to_pick_ready_s'],
-                        grasp_radius_px=obs['grasp_radius_px'])
-            lower, parked = self.load_tray(aligned)
-            returned_to_origin = len(self.results) < 2
-            if returned_to_origin:
-                photo = self.align_to([0, 0, 0], before=parked, photo_return=True)
-                self.require_tray_count(photo, parked['tray_count'])
-            result.update(controller_tray_load_completed=True, tray_count=parked['tray_count'],
-                          firmware_pick_drop_mm=lower['pick_drop_mm'],
-                          simulated_grip=False, simulated_tray=False,
-                          returned_to_origin=returned_to_origin)
+            empty_claw_retries = 0
+            while True:
+                aligned, obs, error = self.align_color()
+                now = self.clock()
+                result = dict(color_id=self.color, color_name=COLORS[self.color],
+                              aligned_pixel=obs['pixel'], error_px=error,
+                              physical_grasp_completed=False, physical_place_completed=False,
+                              color_to_first_usable_s=round(self.first_usable-self.color_started, 3),
+                              usable_to_pick_ready_s=round(now-self.first_usable, 3),
+                              color_to_first_reachable_s=round(self.first_reachable-self.color_started, 3),
+                              color_to_pick_ready_s=round(now - self.color_started, 3),
+                              reachable_to_pick_ready_s=round(now - self.first_reachable, 3),
+                              grasp_radius_px=obs['grasp_radius_px'])
+                self.record('pick_ready', color_id=self.color, error_px=error,
+                            color_to_first_usable_s=result['color_to_first_usable_s'],
+                            usable_to_pick_ready_s=result['usable_to_pick_ready_s'],
+                            color_to_pick_ready_s=result['color_to_pick_ready_s'],
+                            reachable_to_pick_ready_s=result['reachable_to_pick_ready_s'],
+                            grasp_radius_px=obs['grasp_radius_px'])
+                if self.empty_claw_check:
+                    count_before = len(self.results)
+                    self.require_tray_count(aligned, count_before)
+                    pick_started = self.clock()
+                    lower, grasped = self.lower_with_mid_drop_check(aligned)
+                    if not grasped:
+                        empty_claw_retries += 1
+                        self.abort_empty_grasp(aligned, lower)
+                        if empty_claw_retries > self.max_empty_claw_retries:
+                            raise RuntimeError(f'target color unconfirmed after {self.max_empty_claw_retries} retries')
+                        self.view_targets = set()
+                        self.last_unreachable_view_hint = None
+                        continue
+                    lower, parked = self.finish_tray_load(aligned, lower, pick_started)
+                else:
+                    lower, parked = self.load_tray(aligned)
+                returned_to_origin = len(self.results) < 2
+                if returned_to_origin:
+                    photo = self.align_to([0, 0, 0], before=parked, photo_return=True)
+                    self.require_tray_count(photo, parked['tray_count'])
+                result.update(controller_tray_load_completed=True, tray_count=parked['tray_count'],
+                              firmware_pick_drop_mm=lower['pick_drop_mm'],
+                              simulated_grip=False, simulated_tray=False,
+                              returned_to_origin=returned_to_origin,
+                              empty_claw_retries=empty_claw_retries)
+                break
         else:
+            aligned, obs, error = self.align_color()
+            result = dict(color_id=self.color, color_name=COLORS[self.color],
+                          aligned_pixel=obs['pixel'], error_px=error,
+                          physical_grasp_completed=False, physical_place_completed=False)
             lower, lifted = self.lower_and_lift(aligned)
             self.align_to([0, 0, 0])
             self.record('simulated_tray_transfer', color_id=self.color, simulated=True,
@@ -1334,15 +1541,11 @@ class ThreeColorTrial(ArmTrial):
         if self.real_tray:
             self.require_tray_count(a, 0)
         chassis = self.client.status()
-        origin_limits = STARTUP_ORIGIN_TOLERANCES if self.real_tray else (50, 50, 50)
         if (a['state_name'] != 'READY' or not a['origins_valid'] or not a['standalone_test_mode']
                 or a['fault']
-                or any(abs(a[k]) > lim for k, lim in zip(('z_cdeg','yaw_cdeg','reach_cdeg'), origin_limits))
+                or (not self.real_tray and any(abs(a[k]) > 50 for k in ('z_cdeg','yaw_cdeg','reach_cdeg')))
                 or chassis['state_name'] != 'EMPTY' or chassis['fault']):
             raise RuntimeError('fresh manual origin / standalone READY / EMPTY chassis required')
-        if self.real_tray and any(abs(a[k]) > 50 for k in ('z_cdeg','yaw_cdeg','reach_cdeg')):
-            self.record('envelope_warning', color_id=self.color, arm=a,
-                        phase='startup_origin', severity='soft')
         self.context = (test_id, 0, 102)
         self.started = True
         self.record('sequence_started', order=order, order_source='user_confirmed_test_order',
@@ -1371,6 +1574,22 @@ class ThreeColorTrial(ArmTrial):
         return result
 
 
+def run_trial(trial, order):
+    try:
+        trial.wait_for_manual_ready()
+        return trial.run(order, int(time.time()))
+    except BaseException as exc:
+        trial.record('failed', error=str(exc), completed_colors=trial.results, stop_sent=False)
+        if trial.started and (not trial.real_tray or isinstance(exc, KeyboardInterrupt)):
+            try:
+                ack = trial.client.stop(0)
+                trial.record('stop_acknowledged', controller=ack)
+                trial.record('after_stop', arm=trial.client.arm_status())
+            except Exception as stop_error:
+                trial.record('stop_unconfirmed', error=str(stop_error))
+        raise
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--port', required=True)
@@ -1386,13 +1605,25 @@ def main():
                         help='optional fixed stroke; real tray checks the STM32 report automatically by default')
     parser.add_argument('--tolerance-px',type=float,
         help='real tray: top-face offset cap (default 32 px); simulation: per-axis tolerance (default 8 px)')
-    parser.add_argument('--confirm-frames',type=int,default=3)
-    parser.add_argument('--confirm-span-s',type=float,default=.2)
+    parser.add_argument('--confirm-frames',type=int,default=None)
+    parser.add_argument('--confirm-span-s',type=float,default=None)
     parser.add_argument('--settle-s',type=float)
     parser.add_argument('--micro-only', action='store_true',
                         help='bound visual correction commands to micro steps, including far targets')
     parser.add_argument('--wide-tray-yaw', action='store_true',
                         help='real tray: allow -12..+22deg after checking physical clearance')
+    parser.add_argument('--no-direct-pick', action='store_true',
+                        help='real tray: re-observe after one-shot ALIGN instead of picking immediately')
+    parser.add_argument('--empty-claw-check', action='store_true',
+                        help='real tray: check a local HSV patch during descent, retry on GRIP_ABORT')
+    parser.add_argument('--max-empty-claw-retries', type=int, default=3,
+                        help='max empty-claw retries per color when --empty-claw-check is enabled')
+    parser.add_argument('--mid-drop-check-mm', type=float, default=60.,
+                        help='descent depth in mm (~6 cm) at which to snap 1 frame for mid-drop empty-claw check')
+    parser.add_argument('--grasp-check-radius-px', type=float, default=640.,
+                        help='radius in source pixels for HSV color presence during descent (default 640 covers full frame)')
+    parser.add_argument('--grasp-close-wait-s', type=float, default=.55,
+                        help='seconds to wait after WAIT_GRIP before sampling frames for empty-claw check')
     parser.add_argument('--save-aligned-frame', action='store_true', help='save a debug JPEG before each pick')
     parser.add_argument('--max-step-mm',type=float,default=3.5)
     parser.add_argument('--max-yaw-step-deg',type=float,default=.8)
@@ -1406,11 +1637,17 @@ def main():
         parser.error('simulation mode requires a 100 mm stroke')
     if args.wide_tray_yaw and not args.real_tray:
         parser.error('--wide-tray-yaw requires --real-tray')
+    if args.empty_claw_check and not args.real_tray:
+        parser.error('--empty-claw-check requires --real-tray')
     if args.tolerance_px is None:
-        args.tolerance_px = 32. if args.real_tray else 8.
+        args.tolerance_px = 60. if args.real_tray else 8.
+    if args.confirm_frames is None:
+        args.confirm_frames = 2 if args.real_tray else 3
+    if args.confirm_span_s is None:
+        args.confirm_span_s = 0. if args.real_tray else .2
     if args.settle_s is None:
         args.settle_s = 0. if args.real_tray else .1
-    tuning = TrialTuning(**{name:getattr(args,name) for name in (
+    tuning = TrialTuning(follow_controller_limits=args.real_tray, **{name:getattr(args,name) for name in (
         'tolerance_px','confirm_frames','confirm_span_s','settle_s',
         'max_step_mm','max_yaw_step_deg','max_retraction_mm','alignment_budget_s','wide_tray_yaw')})
     args.output.mkdir(parents=True, exist_ok=False)
@@ -1433,6 +1670,12 @@ def main():
             raise ValueError('material sample is not a PNG')
         path.write_bytes(data)
     import serial
+    def patch_snapshot(x, y, radius, timeout):
+        with urlopen(f'http://127.0.0.1:8090/grasp-patch/{x}/{y}/{radius}', timeout=timeout) as reply:
+            return json.load(reply)
+    active_patch_snapshot = (patch_snapshot
+                             if args.empty_claw_check and snapshot().get('grasp_color_patch_supported')
+                             else None)
     with (Path(tempfile.gettempdir())/f'robot-preview-start-{os.getuid()}.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         subprocess.run(['systemctl','--user','stop','chassis-button.service'], check=True)
@@ -1440,20 +1683,16 @@ def main():
             trial = ThreeColorTrial(ElectricalClient(port), reference, mapping, snapshot, select_color,
                 args.output, simulate_servos=args.simulate_servos, real_tray=args.real_tray,
                 pick_drop_mm=args.pick_drop_mm, tuning=tuning, micro_only=args.micro_only,
+                empty_claw_check=args.empty_claw_check,
+                patch_snapshot=active_patch_snapshot,
+                max_empty_claw_retries=args.max_empty_claw_retries,
+                mid_drop_check_mm=args.mid_drop_check_mm,
+                grasp_check_radius_px=args.grasp_check_radius_px,
+                grasp_close_wait_s=args.grasp_close_wait_s,
+                direct_pick_after_align=args.real_tray and not args.no_direct_pick,
                 save_failure=save_failure if args.real_tray else None,
                 save_frame=save_frame if args.save_aligned_frame or args.simulate_servos else None)
-            try:
-                trial.wait_for_manual_ready()
-                trial.run(order, int(time.time()))
-            except BaseException as e:
-                trial.record('failed', error=str(e), completed_colors=trial.results)
-                if trial.started:
-                    try:
-                        trial.client.stop(0)
-                        trial.record('after_stop', arm=trial.client.arm_status())
-                    except Exception as stop_error:
-                        trial.record('stop_unconfirmed', error=str(stop_error))
-                raise
+            run_trial(trial, order)
 
 
 if __name__ == '__main__':

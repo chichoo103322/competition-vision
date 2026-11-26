@@ -27,15 +27,25 @@ def test_invalid_motor_pose_refused(kwargs):
         a.arm_command_payload(7,2,102,10,2,**kwargs)
 
 
-@pytest.mark.parametrize('mutate', ['length','reserved','state','axis','flags'])
+@pytest.mark.parametrize('mutate', ['length','reserved','state','axis'])
 def test_bad_reports_refused(mutate):
     body=bytearray(arm_body())
     if mutate=='length': body.pop()
     if mutate=='reserved': body[22]=1
     if mutate=='state': body[16]=99
     if mutate=='axis': body[18]=3
-    if mutate=='flags': body[20]=128
     with pytest.raises(ValueError): a.arm_status_payload(body)
+
+
+def test_fault_report_with_extra_upper_flags_bits_is_parsed():
+    body = bytearray(arm_body(state=14))
+    body[16:24] = struct.pack('<BBBBHH', 14, 1, 2, 4, 11580, 0)
+    report = a.arm_status_payload(body)
+    assert report['state_name'] == 'FAULT'
+    assert (report['fault'], report['active_axis'], report['opcode']) == (1, 2, 4)
+    assert report['flags'] == 11580
+    assert report['tray_enabled'] and report['tray_uncertain'] and report['grip_done_required']
+    assert report['standalone_test_mode'] and not report['origins_valid']
 
 
 def test_interleaved_arm_events_do_not_satisfy_route_ack_and_missing_report_fails():
@@ -134,3 +144,15 @@ def test_invalid_v7_tray_fields_are_rejected(count, slot, flags):
     body[20:24] = bytes([flags, 0, count, slot])
     with pytest.raises(ValueError, match='invalid ARM'):
         a.arm_status_payload(body)
+
+
+def test_grip_abort_opcode_9_command_and_status_are_supported():
+    payload = a.arm_command_payload(7, 0, 102, 12, 9, reference_id=10)
+    assert len(payload) == 32
+    assert struct.unpack('<IHHIBBHiiiI', payload) == (7, 0, 102, 12, 9, 0, 0, 0, 0, 0, 10)
+    with pytest.raises(ValueError, match='GRIP_ABORT'):
+        a.arm_command_payload(7, 0, 102, 12, 9, reference_id=0)
+    body = bytearray(arm_body(state=4))
+    body[16:24] = struct.pack('<BBBBHH', 4, 0, 255, 9, 29, 0)
+    report = a.arm_status_payload(body)
+    assert report['state_name'] == 'WAIT_VISION' and report['opcode'] == 9

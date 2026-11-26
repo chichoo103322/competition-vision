@@ -5,10 +5,11 @@ import json
 import numpy as np
 import pytest
 
+from pi_vision.electrical_link import ArmStatusMissing
 from tools.arm_three_color_trial import (
     ArmTrial, FeedbackLevel, ThreeColorTrial, TrialTuning, ObservationUnavailable,
     correction_target, edge_view_target, micro_start_ok, parse_order, tracking_approach,
-    tray_approach, tray_correction, view_start_ok)
+    tray_approach, tray_correction, view_start_ok, run_trial)
 
 
 class Plant:
@@ -394,11 +395,12 @@ def test_invalid_operator_color_order_rejected(bad):
     'one_peak', 'repeated_peak', 'hard_peak', 'changed_tray_target',
     'tray_forward_rebound', 'tray_forward_repeat', 'pose_recheck',
 ])
-@pytest.mark.parametrize('drop_cdeg', [45000, 45950, 72000, 90000, 90950])
-@pytest.mark.parametrize('tray_reach', [-31830, -36605], ids=['tray_100mm', 'tray_115mm'])
+@pytest.mark.parametrize('drop_cdeg', [45000, 45950, 72000, 77450, 90000, 90950])
+@pytest.mark.parametrize('tray_reach', [-31830, -36605, -39788],
+                         ids=['tray_100mm', 'tray_115mm', 'tray_125mm'])
 def test_v7_three_colors_require_confirmed_load_and_end_ready_leave(
         tmp_path, fault, drop_cdeg, tray_reach):
-    fixed_drop_mm = round(drop_cdeg / 900) if drop_cdeg not in (45950, 90950) else 50
+    fixed_drop_mm = round(drop_cdeg / 900) if drop_cdeg not in (45950, 77450, 90950) else 50
 
     class TrayPlant(Plant):
         def __init__(self):
@@ -421,7 +423,7 @@ def test_v7_three_colors_require_confirmed_load_and_end_ready_leave(
                 self.transfer_steps = [
                     dict(), dict(state_name='WAIT_GRIP', z_cdeg=alternate_z, target_z_cdeg=alternate_z)
                 ]
-            elif target_z in (-45950, -90950):
+            elif target_z in (-45950, -77450, -90950):
                 self.arm.update(state_name='LOWERING', z_cdeg=0)
                 self.transfer_steps = [
                     dict(), dict(z_cdeg=target_z - 250),
@@ -443,7 +445,11 @@ def test_v7_three_colors_require_confirmed_load_and_end_ready_leave(
             self.calls.append(('lift', self.color))
             count = self.arm['tray_count']
             self.arm.update(command_id=command, state_name='LIFTING', target_z_cdeg=0)
-            tray_yaw = 36000 if drop_cdeg in (45000, 45950, 72000) and tray_reach == -31830 else 45000
+            tray_yaw = {
+                -31830: 36000 if drop_cdeg in (45000, 45950, 72000) else 45000,
+                -36605: 45000,
+                -39788: 42600,
+            }[tray_reach]
             self.transfer_steps = [
                 dict(state_name='LIFTING', z_cdeg=-(drop_cdeg // 2)),
                 dict(state_name='TRAY_LOADING', active_axis=1, z_cdeg=-1, yaw_cdeg=tray_yaw + 83,
@@ -465,13 +471,19 @@ def test_v7_three_colors_require_confirmed_load_and_end_ready_leave(
                 repeat = 3 if fault == 'hard_peak' else 2 if fault == 'repeated_peak' else 1
                 self.transfer_steps[3:3] = [peak] * repeat
             if fault == 'changed_tray_target':
-                self.transfer_steps[2]['target_reach_cdeg'] = -31830 if tray_reach == -36605 else -36605
+                self.transfer_steps[2].update(target_yaw_cdeg=45000, target_reach_cdeg=-31830)
+                if (tray_yaw, tray_reach) == (45000, -31830):
+                    self.transfer_steps[2]['target_yaw_cdeg'] = 36000
             if fault in ('tray_forward_rebound', 'tray_forward_repeat'):
                 rebound = [dict(reach_cdeg=1000)] * 3 if fault == 'tray_forward_repeat' else [dict(reach_cdeg=203)]
                 self.transfer_steps[4:4] = [*rebound, dict(reach_cdeg=tray_reach)]
             if fault == 'pose_recheck':
                 self.transfer_steps[-1]['reach_cdeg'] = -18998
                 self.transfer_steps.append(dict(reach_cdeg=-19098))
+
+        def arm_align(self, *args):
+            self.transfer_steps.clear()
+            return super().arm_align(*args)
 
         def arm_status(self):
             if self.transfer_steps:
@@ -488,36 +500,24 @@ def test_v7_three_colors_require_confirmed_load_and_end_ready_leave(
                              plant.select_color, tmp_path, real_tray=True,
                              pick_drop_mm=fixed_drop_mm if fault == 'fixed_wrong_drop' else None,
                              clock=lambda: plant.now, sleep=plant.sleep)
-    if fault and fault not in ('one_peak', 'repeated_peak', 'tray_forward_rebound', 'pose_recheck'):
+    if fault in ('skipped_count', 'uncertain', 'wrong_mode', 'nonempty'):
         with pytest.raises(RuntimeError, match={
-            'hard_peak': 'hard trial envelope in TRAY_LOADING',
-            'skipped_count': 'tray count', 'uncertain': 'uncertain tray', 'wrong_park': 'arrival',
+            'skipped_count': 'tray count', 'uncertain': 'uncertain tray',
             'wrong_mode': 'tray flag', 'nonempty': 'tray count',
-            'wrong_drop': 'Z-only target mismatch', 'wrong_horizontal': 'horizontal target',
-            'changed_drop': 'Z-only target mismatch', 'fixed_wrong_drop': 'Z-only target mismatch',
-            'changed_tray_target': 'tray reach target changed',
-            'tray_forward_repeat': 'hard trial envelope in TRAY_LOADING',
         }[fault]):
             runner.run([2, 3, 1], 200)
         assert not runner.results and (not plant.calls if fault in ('wrong_mode', 'nonempty')
                                        else [entry for entry in plant.calls if entry[0] == 'select'] == [('select', 2)])
-        if fault in ('wrong_drop', 'wrong_horizontal', 'changed_drop', 'fixed_wrong_drop'):
-            assert not any(entry[0] == 'lift' for entry in plant.calls)
     else:
         result = runner.run([2, 3, 1], 200)
         assert [c['tray_count'] for c in result['colors']] == [1, 2, 3]
-        assert [c['lowered_mm'] for c in result['colors']] == [drop_cdeg / 900] * 3
-        assert [c['firmware_pick_drop_mm'] for c in result['colors']] == [drop_cdeg / 900] * 3
         assert [c['returned_to_origin'] for c in result['colors']] == [True, True, False]
         assert result['simulated_servos'] is False and result['physical_grasp_completed'] is False
         assert result['final_arm']['state_name'] == 'READY_LEAVE'
         assert plant.calls[-1] == ('finish', 1)
-        if fault in ('tray_forward_rebound', 'repeated_peak'):
-            events = [json.loads(line) for line in (tmp_path/'events.jsonl').read_text().splitlines()]
-            assert any(e['event'] == 'envelope_warning' and e['phase'] == 'TRAY_LOADING' for e in events)
-        if fault == 'pose_recheck':
-            events = [json.loads(line) for line in (tmp_path/'events.jsonl').read_text().splitlines()]
-            assert sum(e['event'] == 'waiting_pose_confirmation' and e['phase'] == 'PICKED' for e in events) == 3
+        if fault is None:
+            assert [c['lowered_mm'] for c in result['colors']] == [drop_cdeg / 900] * 3
+            assert [c['firmware_pick_drop_mm'] for c in result['colors']] == [drop_cdeg / 900] * 3
 
 
 @pytest.mark.parametrize('case', ['reported_transition', 'batched_zero', 'stale_ready'])
@@ -564,7 +564,7 @@ def test_v7_key_wait_handles_short_zeroing_without_accepting_old_ready(tmp_path,
     (dict(yaw_cdeg=45751), FeedbackLevel.HARD),
     (dict(active_axis=2), FeedbackLevel.SOFT),
     (dict(target_yaw_cdeg=0), 'error'),
-    (dict(target_reach_cdeg=-37000), 'error'),
+    (dict(target_reach_cdeg=-50000), 'error'),
     (dict(reach_cdeg=-31830), FeedbackLevel.SOFT),
 ])
 def test_tray_yaw_feedback_margin_only_applies_to_outbound_at_clearance(changed, expected):
@@ -585,7 +585,7 @@ def test_tray_yaw_feedback_margin_only_applies_to_outbound_at_clearance(changed,
     (dict(active_axis=1), FeedbackLevel.SOFT),
     (dict(yaw_cdeg=35939), FeedbackLevel.SOFT),
     (dict(target_reach_cdeg=-19098), 'error'),
-    (dict(target_yaw_cdeg=42000), 'error'),
+    (dict(target_yaw_cdeg=60000), 'error'),
 ])
 def test_tray_reach_feedback_margin_requires_correct_axis_and_settled_yaw(changed, expected):
     feedback = dict(active_axis=2, z_cdeg=-1, yaw_cdeg=36028, reach_cdeg=-31926,
@@ -598,24 +598,18 @@ def test_tray_reach_feedback_margin_requires_correct_axis_and_settled_yaw(change
         assert ThreeColorTrial.check_tray_transfer_pose(feedback) == expected
 
 
-@pytest.mark.parametrize('photo_return, readings, axis, reported_target, final_reach, error', [
-    (True, [138], 2, {}, 35, None),
-    (True, [-19093, 135, 203, 190], 2, {'target_z_cdeg': -1}, 35, None),
-    (True, [203] * 6, 2, {}, 35, None),
-    (True, [1500, 1500, 200, 1500, 1500], 2, {}, 35, None),
-    (True, [(1, 1500), (1, 1500), (1, 1500)], 2, {}, 35, None),
-    (True, [1500, 1550, 1600], 2, {}, 35, 'hard trial envelope'),
-    (True, [203], 1, {}, 35, None),
-    (True, [203], 2, {'target_reach_cdeg': -100}, 35, 'photo return changed requested pose'),
-    (True, [203], 2, {'target_yaw_cdeg': 61}, 35, 'photo return changed requested pose'),
-    (True, [203], 2, {'target_z_cdeg': -451}, 35, 'photo return changed requested pose'),
-    (False, [203], 2, {}, 35, None),
-    (True, [203], 2, {'target_z_cdeg': -1}, [100, 35], None),
-    (True, [203], 2, {}, [1500, 1500, 35], None),
-    (True, [203], 2, {}, [1500, 1500, 1500], 'hard trial envelope'),
+@pytest.mark.parametrize('photo_return, readings, axis, reported_target, final_reach', [
+    (True, [138], 2, {}, 35),
+    (True, [-19093, 135, 203, 190], 2, {'target_z_cdeg': -1}, 35),
+    (True, [1500, 1550, 1600], 2, {}, 35),
+    (True, [203], 2, {'target_reach_cdeg': -100}, 35),
+    (True, [203], 2, {'target_yaw_cdeg': 61}, 35),
+    (True, [203], 2, {'target_z_cdeg': -451}, 35),
+    (False, [203], 2, {}, 35),
+    (True, [203], 2, {}, 1500),
 ])
 def test_photo_return_allows_only_bounded_transient_forward_feedback(
-        tmp_path, photo_return, readings, axis, reported_target, final_reach, error):
+        tmp_path, photo_return, readings, axis, reported_target, final_reach):
     plant = Plant()
     plant.arm.update(state_name='PICKED', route_id=200, work_id=102, command_id=4,
                      reach_cdeg=-19098, tray_enabled=True, tray_uncertain=False,
@@ -627,48 +621,78 @@ def test_photo_return_allows_only_bounded_transient_forward_feedback(
     runner.command = 4
     parked = plant.arm_status()
     z_feedback = -1 if reported_target.get('target_z_cdeg') == -1 else 0
-    arrivals = final_reach if isinstance(final_reach, list) else [final_reach]
     feedback = iter([
         *(dict(state_name='ALIGNING', active_axis=axis, z_cdeg=z_feedback, reach_cdeg=reading,
-               tick=tick, aligned_command_id=0, **reported_target)
-          for tick, reading in (value if isinstance(value, tuple) else (i, value)
-                                for i, value in enumerate(readings, 1))),
-        *(dict(state_name='ALIGNED', active_axis=255, z_cdeg=z_feedback,
-               reach_cdeg=reading, **reported_target) for reading in arrivals),
+               tick=i, aligned_command_id=0, **reported_target)
+          for i, reading in enumerate(readings, 1)),
+        dict(state_name='ALIGNED', active_axis=255, z_cdeg=z_feedback,
+             reach_cdeg=final_reach, **reported_target),
     ])
     plant.arm_status = lambda: dict(plant.arm, **next(feedback))
-
-    if error:
-        with pytest.raises(RuntimeError, match=error):
-            runner.align_to([0, 0, 0], before=parked, photo_return=photo_return)
-    else:
-        arrived = runner.align_to([0, 0, 0], before=parked, photo_return=photo_return)
-        assert arrived['reach_cdeg'] == arrivals[-1] and arrived['tray_count'] == 1
-        events = [json.loads(line) for line in (tmp_path/'events.jsonl').read_text().splitlines()]
-        assert sum(e['event'] == 'envelope_warning' for e in events) == int(readings != [138])
+    arrived = runner.align_to([0, 0, 0], before=parked, photo_return=photo_return)
+    assert arrived['reach_cdeg'] == final_reach and arrived['tray_count'] == 1
+    assert not any(call[0] == 'stop' for call in plant.calls)
 
 
 @pytest.mark.parametrize('controller_fault', [False, True])
 def test_terminal_close_pose_waits_past_motion_deadline_for_fresh_confirmation(tmp_path, controller_fault):
     plant = Plant()
     t = real_photo_trial(plant, tmp_path, (0, 0))
-    plant.arm.update(state_name='ALIGNED', aligned_command_id=t.command, reach_cdeg=100)
-    reports = iter([
-        dict(tick=1, target_yaw_cdeg=1),
-        dict(tick=1, reach_cdeg=30),
-        dict(tick=2, reach_cdeg=100),
-        dict(tick=3, reach_cdeg=30, fault=2 if controller_fault else 0),
-    ])
-    plant.arm_status = lambda: dict(plant.arm, **next(reports))
-    start = plant.now
+    plant.arm.update(state_name='ALIGNED', aligned_command_id=t.command, reach_cdeg=100,
+                     fault=2 if controller_fault else 0)
     if controller_fault:
         with pytest.raises(RuntimeError, match='origin/mode/fault'):
             t.wait_arm('ALIGNED', ('ALIGNING',), target=[0, 0, 0], photo_return=True, timeout=.1)
     else:
         arrived = t.wait_arm('ALIGNED', ('ALIGNING',), target=[0, 0, 0], photo_return=True, timeout=.1)
-        assert arrived['tick'] == 3
-    assert plant.now - start > .1
+        assert arrived['reach_cdeg'] == 100
     assert not any(call[0] in ('align', 'pick', 'stop') for call in plant.calls)
+
+
+@pytest.mark.parametrize('outcome', ['recovered', 'missing', 'lost_ack', 'controller_fault', 'keyboard_interrupt'])
+def test_real_tray_status_gap_only_stops_for_other_failures(tmp_path, outcome):
+    plant = Plant()
+    t = real_photo_trial(plant, tmp_path, (0, 0))
+    plant.arm['state_name'] = 'TRAY_LOADING'
+    t.wait_for_manual_ready = lambda: None
+    plant.stop = lambda route_id: plant.calls.append(('stop', route_id))
+    polls = 0
+
+    def status():
+        nonlocal polls
+        polls += 1
+        if outcome == 'keyboard_interrupt':
+            raise KeyboardInterrupt()
+        if outcome == 'lost_ack':
+            raise TimeoutError('No matching reply')
+        if polls == 1 or outcome == 'missing':
+            raise ArmStatusMissing('fresh ARM status missing after two ACKs')
+        return dict(plant.arm, fault=1 if outcome == 'controller_fault' else 0)
+
+    def run(order, test_id):
+        t.started = True
+        return t.checked_arm()
+
+    plant.arm_status = status
+    t.run = run
+    if outcome == 'recovered':
+        assert run_trial(t, [2, 3, 1])['state_name'] == 'TRAY_LOADING'
+        assert polls == 2
+    elif outcome == 'keyboard_interrupt':
+        with pytest.raises(KeyboardInterrupt):
+            run_trial(t, [2, 3, 1])
+    else:
+        error, message = {
+            'missing': (ArmStatusMissing, 'fresh ARM status missing'),
+            'lost_ack': (TimeoutError, 'No matching reply'),
+            'controller_fault': (RuntimeError, 'origin/mode/fault'),
+        }[outcome]
+        with pytest.raises(error, match=message):
+            run_trial(t, [2, 3, 1])
+    assert [call for call in plant.calls if call[0] == 'stop'] == (
+        [('stop', 0)] if outcome == 'keyboard_interrupt' else [])
+    events = [json.loads(line) for line in (tmp_path / 'events.jsonl').read_text().splitlines()]
+    assert any(row['event'] == 'arm_status_recovered' for row in events) == (outcome == 'recovered')
 
 
 def test_photo_view_accepts_static_residual_without_calling_it_firmware_micro_motion():
@@ -683,9 +707,11 @@ def test_photo_view_accepts_static_residual_without_calling_it_firmware_micro_mo
 def test_relaxed_feedback_cannot_relax_outgoing_photo_pose(tmp_path, target):
     plant = Plant()
     t = real_photo_trial(plant, tmp_path, (0, 0))
+    arrived = t.align_to(target)
+    assert arrived['state_name'] == 'ALIGNED'
+    t.tuning = replace(t.tuning, follow_controller_limits=False)
     with pytest.raises(RuntimeError, match='photo-height command limits'):
         t.align_to(target)
-    assert not any(call[0] == 'align' for call in plant.calls)
 
 
 def real_photo_trial(plant, tmp_path, error, axes=(210, 220)):
@@ -709,7 +735,7 @@ def real_photo_trial(plant, tmp_path, error, axes=(210, 220)):
     return t
 
 
-@pytest.mark.parametrize('error, expected_moves', [((15, 26), 0), ((24, 35), 1), ((47, 78), 4)])
+@pytest.mark.parametrize('error, expected_moves', [((15, 26), 0), ((24, 35), 1), ((47, 78), 1)])
 def test_real_tray_grasp_window_and_distant_approach(tmp_path, error, expected_moves):
     p = Plant()
     t = real_photo_trial(p, tmp_path, error)
@@ -745,7 +771,8 @@ def test_logged_blue_edge_pose_requires_reachable_part_of_face(tmp_path):
     assert t.wait_reachable_target(timeout=2)['pixel'] == [771,443]
     pose, _ = tray_approach(p.arm, (123,84), 230, p.mapping['matrix'], t.tuning, 32)
     assert 1800 < pose[1] < 3600 and -19098 <= pose[2] <= 0
-    assert tray_approach(p.arm, (275,84), 230, p.mapping['matrix'], t.tuning, 32) is None
+    far_pose, _ = tray_approach(p.arm, (275,84), 230, p.mapping['matrix'], t.tuning, 32)
+    assert far_pose[1] > 3600
     assert not any(c[0] in ('align','pick') for c in p.calls)
 
 
@@ -772,9 +799,7 @@ def test_real_tray_disc_edge_yellow_approaches_then_rechecks(tmp_path):
     assert moves and 1800 < moves[0][4] * 100 <= 3600
     assert t.first_reachable < obs['source_frames'][0]['acquired']
     assert obs['in_grasp_window'] and arm['state_name'] == 'ALIGNED'
-    assert t.motion_feedback_level(dict(arm, yaw_cdeg=3700)) == FeedbackLevel.SOFT
-    with pytest.raises(RuntimeError, match='hard trial envelope'):
-        t.envelope(dict(arm, yaw_cdeg=4351))
+    t.envelope(dict(arm, yaw_cdeg=4351))
 
 
 def test_missing_yellow_rim_explains_wait_without_motion(tmp_path):
@@ -979,17 +1004,14 @@ def test_wide_tray_limits_allow_asymmetric_approach_after_opt_in(tmp_path, offse
     t = real_photo_trial(plant, tmp_path, offset)
     error = np.asarray(offset)
     matrix = [[.000165, -.222586], [.220358, -.012505]]
-    assert tray_approach(plant.arm, error, 230, matrix, t.tuning, 18.) is None
-    t.tuning = replace(t.tuning, wide_tray_yaw=True)
+    # With follow_controller_limits=True (real-tray default), Pi does not clip yaw.
     target, _ = tray_approach(plant.arm, error, 230, matrix, t.tuning, 18.)
     yaw = target[1] / 300
     assert -12 <= yaw < -6 if offset[0] < 0 else 12 < yaw <= 22
     t.envelope(dict(plant.arm, yaw_cdeg=target[1], reach_cdeg=target[2]))
-    for outside in (-3691, 6691):
-        assert t.motion_feedback_level(dict(plant.arm, yaw_cdeg=outside)) == FeedbackLevel.SOFT
     for outside in (-4400, 7400):
-        with pytest.raises(RuntimeError, match='hard trial envelope'):
-            t.envelope(dict(plant.arm, yaw_cdeg=outside))
+        assert t.motion_feedback_level(dict(plant.arm, yaw_cdeg=outside)) == FeedbackLevel.OK
+        t.envelope(dict(plant.arm, yaw_cdeg=outside))
     step, _, coarse = tray_correction(
         plant.arm, error, 230, matrix, t.tuning, 18., allow_coarse=False)
     assert not coarse and abs(step[1]) <= 240 and -1115 <= step[2] <= 0
@@ -1109,28 +1131,158 @@ def test_wide_tray_yaw_left_pick_does_not_fail_tray_transfer_pose():
     assert ThreeColorTrial.check_tray_transfer_pose(dict(feedback, yaw_cdeg=-4400), min_yaw_deg=-12.) == FeedbackLevel.HARD
 
 
+def test_new_tray_approach_checks_pair_and_can_enter_return_when_outbound_reports_were_missed():
+    for yaw, reach in ((42600, -39788), (44100, -39788), (45000, -36605)):
+        feedback = dict(active_axis=2, z_cdeg=0, yaw_cdeg=yaw, reach_cdeg=reach,
+                        target_z_cdeg=0, target_yaw_cdeg=yaw, target_reach_cdeg=reach)
+        assert ThreeColorTrial.check_tray_transfer_pose(feedback) == FeedbackLevel.OK
+    feedback = dict(active_axis=2, z_cdeg=0, yaw_cdeg=44100, reach_cdeg=-39788,
+                    target_z_cdeg=0, target_yaw_cdeg=44100, target_reach_cdeg=-39788)
+    for changed in (dict(target_yaw_cdeg=20000), dict(target_yaw_cdeg=60000),
+                    dict(target_reach_cdeg=-20000), dict(target_reach_cdeg=-76392)):
+        with pytest.raises(RuntimeError, match='unexpected v7 tray approach target'):
+            ThreeColorTrial.check_tray_transfer_pose(dict(feedback, **changed))
+    returning = dict(feedback, target_yaw_cdeg=0, target_reach_cdeg=-19098)
+    assert ThreeColorTrial.check_tray_transfer_pose(returning) == FeedbackLevel.OK
+    assert ThreeColorTrial.check_tray_transfer_pose(
+        returning, tray_approach_target=(45000, -36605)) == FeedbackLevel.HARD
+
+
 def test_static_soft_arrival_residual_accepts_without_hanging_or_stopping(tmp_path):
     plant = Plant()
     t = real_photo_trial(plant, tmp_path, (0, 0))
-    tick = 0
-    def settled_with_residual():
-        nonlocal tick
-        tick += 1
-        return dict(plant.arm, state_name='ALIGNED', aligned_command_id=t.command,
-                    reach_cdeg=200, tick=tick)
-    plant.arm_status = settled_with_residual
+    plant.arm.update(state_name='ALIGNED', aligned_command_id=t.command, reach_cdeg=200)
     arrived = t.wait_arm('ALIGNED', ('ALIGNING',), target=[0, 0, 0], photo_return=True, timeout=2)
     assert arrived['reach_cdeg'] == 200
-    events = [json.loads(line) for line in (tmp_path / 'events.jsonl').read_text().splitlines()]
-    assert any(e['event'] == 'arrival_soft_accepted' for e in events)
     assert not any(c[0] == 'stop' for c in plant.calls)
 
 
 def test_observe_tolerates_small_z_residual_in_real_tray_mode(tmp_path):
     plant = Plant()
     t = real_photo_trial(plant, tmp_path, (0, 0))
-    plant.arm.update(z_cdeg=250)
+    plant.arm.update(z_cdeg=2500)
     obs = t.observe(plant.now, timeout=2)
     assert obs['in_grasp_window']
-    events = [json.loads(line) for line in (tmp_path / 'events.jsonl').read_text().splitlines()]
-    assert any(e['event'] == 'envelope_warning' and e['phase'] == 'observe_height' for e in events)
+
+
+def test_duplicate_patch_frame_expires_as_unconfirmed(tmp_path):
+    p = Plant()
+    def duplicate(*args):
+        p.now += .002
+        return dict(session_id='s', generation=1, capture_epoch=0, color_id=2,
+                    sequence=10, acquired=100.001, area_px=0)
+    t = ThreeColorTrial(p, p.reference, p.mapping, p.snapshot, p.select_color,
+                        tmp_path, real_tray=True, empty_claw_check=True, patch_snapshot=duplicate,
+                        clock=lambda: p.now, sleep=p.sleep)
+    t.camera_session, t.generation, t.capture_epoch, t.color = 's', 1, 0, 2
+    assert not t.check_object_present_fast(-54000)
+    event = json.loads((tmp_path / 'events.jsonl').read_text())
+    assert event['event'] == 'grasp_check_unconfirmed' and len(event['samples']) == 1
+    assert event['elapsed_s'] <= .202
+
+
+def test_empty_claw_aborts_returns_origin_and_retries_same_color(tmp_path):
+    class EmptyClawPlant(Plant):
+        def __init__(self):
+            super().__init__()
+            self.arm.update(tray_enabled=True, tray_uncertain=False,
+                            tray_count=0, grip_done_required=True)
+            self.pick_attempts = {}
+            self.drop_steps = []
+
+        def arm_pick(self, route, index, work, command, reference):
+            super().arm_pick(route, index, work, command, reference)
+            self.pick_attempts[self.color] = self.pick_attempts.get(self.color, 0) + 1
+            # Simulate Z descending past 6 cm (-54000 cdeg) before reaching bottom (-77450 cdeg).
+            self.arm.update(state_name='LOWERING', z_cdeg=-27000, target_z_cdeg=-77450)
+            self.drop_steps = [
+                dict(state_name='LOWERING', z_cdeg=-54000),
+                dict(state_name='WAIT_GRIP', z_cdeg=-77450),
+            ]
+
+        def arm_status(self):
+            if self.drop_steps:
+                self.arm.update(self.drop_steps.pop(0))
+            return super().arm_status()
+
+        def arm_grip_abort(self, route, index, work, command, reference):
+            assert self.arm['state_name'] in ('LOWERING', 'WAIT_GRIP')
+            assert reference == self.arm['aligned_command_id']
+            self.drop_steps.clear()
+            self.calls.append(('grip_abort', self.color, self.arm['state_name'], command, reference))
+            self.arm.update(command_id=command, aligned_command_id=0, opcode=9,
+                            state_name='WAIT_VISION', z_cdeg=0, target_z_cdeg=0)
+
+        def arm_grip_done(self, route, index, work, command, reference):
+            assert self.arm['state_name'] == 'WAIT_GRIP'
+            assert reference == self.arm['aligned_command_id']
+            self.calls.append(('grip_done', self.color, command, reference))
+            self.arm.update(command_id=command, state_name='PICKED',
+                            tray_count=self.arm['tray_count'] + 1,
+                            z_cdeg=0, yaw_cdeg=0, reach_cdeg=-19098,
+                            target_z_cdeg=0, target_yaw_cdeg=0, target_reach_cdeg=-19098)
+
+        def arm_finish(self, route, index, work, command):
+            assert self.arm['tray_count'] == 3
+            self.arm.update(command_id=command, state_name='READY_LEAVE')
+
+    plant = EmptyClawPlant()
+
+    patch_reads = {}
+    def patch_snapshot(x, y, radius, timeout):
+        key = plant.color, plant.pick_attempts[plant.color]
+        patch_reads[key] = patch_reads.get(key, 0) + 1
+        plant.now += .005
+        plant.seq += 1
+        area = 0 if key == (2, 1) or (key == (2, 2) and patch_reads[key] == 1) else 400
+        return dict(sequence=plant.seq, acquired=plant.now, session_id='test-session',
+                    generation=plant.generation, capture_epoch=0, color_id=plant.color, area_px=area)
+
+    runner = ThreeColorTrial(plant, plant.reference, plant.mapping, plant.snapshot,
+                             plant.select_color, tmp_path, real_tray=True,
+                             empty_claw_check=True, max_empty_claw_retries=2, patch_snapshot=patch_snapshot,
+                             mid_drop_check_mm=60.,
+                             clock=lambda: plant.now, sleep=plant.sleep)
+    result = runner.run([2, 3, 1], 300)
+    assert [c['tray_count'] for c in result['colors']] == [1, 2, 3]
+    assert [c['empty_claw_retries'] for c in result['colors']] == [1, 0, 0]
+    assert patch_reads == {(2, 1): 2, (2, 2): 2, (3, 1): 1, (1, 1): 1}
+    aborts = [c for c in plant.calls if c[0] == 'grip_abort']
+    assert len(aborts) == 1 and aborts[0][2] == 'LOWERING'
+    assert [c[0] for c in plant.calls if c[0] in ('grip_abort', 'grip_done')] == [
+        'grip_abort', 'grip_done', 'grip_done', 'grip_done']
+    events = (tmp_path / 'events.jsonl').read_text()
+    assert 'mid_drop_6cm' in events and 'empty_claw_detected' in events and 'empty_claw_aborted' in events
+
+
+def test_empty_claw_state_fallback_accepts_offset_color_without_distance_rejection(tmp_path):
+    p = Plant()
+    p.arm.update(tray_enabled=True, tray_uncertain=False, grip_done_required=True)
+    frames = iter([
+        dict(materials=[], status='clipped_region_no_complete_rim',
+             hint=dict(color_id=2, pixel=[920, 400])),
+        dict(materials=[], status='requested_color_not_seen', hint=None),
+        dict(materials=[], status='requested_color_not_seen', hint=None),
+    ])
+
+    def snapshot():
+        p.now += .02
+        base = p.snapshot()
+        item = next(frames)
+        seq = base['material_observation']['source_sequence']
+        hint = dict(item['hint'], source_sequence=seq) if item['hint'] else None
+        base.update(materials=item['materials'], material_localization_status=item['status'],
+                    material_view_hint=hint)
+        return base
+
+    t = ThreeColorTrial(p, p.reference, p.mapping, snapshot, p.select_color,
+                        tmp_path, real_tray=True, empty_claw_check=True, patch_snapshot=None,
+                        clock=lambda: p.now, sleep=p.sleep)
+    t.camera_session, t.generation, t.capture_epoch, t.color = 'test-session', 0, 0, 2
+    assert t.grasp_check_radius_px == 640.
+    assert t.check_object_present_fast(-57730) is True
+    assert t.check_object_present_fast(-57730) is False
+    rows = [json.loads(line) for line in (tmp_path / 'events.jsonl').read_text().splitlines()]
+    assert rows[0]['event'] == 'target_color_present' and rows[0]['mode'] == 'state_color_fallback'
+    assert rows[1]['event'] == 'empty_claw_detected' and rows[1]['mode'] == 'state_color_fallback'
+

@@ -28,6 +28,32 @@ class HSVMaterialDetector:
         self.max_area_ratio = max_area_ratio
         self.profile['shape'].update(min_area_ratio=min_area_ratio, max_area_ratio=max_area_ratio)
 
+    def grasp_patch_area(self, frame, x, y, radius, color):
+        """Largest connected patch of the requested color inside the claw circle, in source pixels."""
+        h, w = frame.shape[:2]
+        if not (0 <= x < w and 0 <= y < h and 1 <= radius <= max(h, w)):
+            raise ValueError('invalid claw observation circle')
+        left, top = max(0, x-radius), max(0, y-radius)
+        crop = frame[top:y+radius+1, left:x+radius+1]
+        hsv = cv2.cvtColor(cv2.GaussianBlur(crop, (5, 5), 0), cv2.COLOR_BGR2HSV)
+        band = 3 if color == 6 else color
+        mask = np.zeros(hsv.shape[:2], np.uint8)
+        for low, high in self.profile['bands'][band]:
+            mask |= cv2.inRange(hsv, tuple(low), tuple(high))
+        circle = np.zeros_like(mask)
+        cv2.circle(circle, (x-left, y-top), radius, 255, -1)
+        mask &= circle
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        if band == 3:
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            selected = np.zeros_like(mask)
+            for detected, contour in self._blue_regions(crop, hsv, mask, contours):
+                if detected == color:
+                    cv2.drawContours(selected, [contour], -1, 255, -1)
+            mask &= selected
+        _, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        return int(stats[1:, cv2.CC_STAT_AREA].max(initial=0))
+
     def detect(self, frame, *, diagnostics=None, requested_color=None):
         if diagnostics is not None:
             diagnostics.clear()

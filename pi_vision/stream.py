@@ -268,6 +268,22 @@ class FrameStreamer:
                     return frame
         return None
 
+    def grasp_patch(self, x, y, radius):
+        with self._lock:
+            cap = self._capture_state_locked(time.monotonic())
+            frame = self._latest_raw
+            detector = self._pipeline.material_detector
+            if isinstance(detector, MaterialRegionDetector):
+                detector = detector.detector
+            color = self.material_search_color
+            if (not cap['valid'] or frame is None or not self.enable_materials or color is None
+                    or cap['sequence'] <= self._mode_source_floor or not isinstance(detector, HSVMaterialDetector)):
+                return None
+            sample = dict(session_id=self.session_id, capture_epoch=cap['epoch'], generation=self._qr_generation,
+                          color_id=color, sequence=cap['sequence'], acquired=cap['acquired_monotonic_s'])
+        sample['area_px'] = detector.grasp_patch_area(frame, x, y, radius, color)
+        return sample
+
     def get_material_snapshot(self):
         """Atomic effective results plus source metadata; never refresh cached timestamps."""
         with self._lock:
@@ -478,6 +494,7 @@ class FrameStreamer:
             profile = getattr(detector, 'profile', None)
             return {
                 'schema_version': 2, 'session_id': self.session_id,
+                'grasp_color_patch_supported': True,
                 'server_monotonic_s': now, 'server_unix_s': time.time(),
                 'coordinate_frame': 'camera_image', 'coordinate_units': 'pixels',
                 'camera_source': getattr(getattr(getattr(self._pipeline, 'camera', None),
@@ -1068,6 +1085,14 @@ class StreamHandler(BaseHTTPRequestHandler):
             self.wfile.write(data.tobytes())
         elif path == "/state":
             self._send_state()
+        elif path.startswith('/grasp-patch/'):
+            try:
+                x, y, radius = map(int, path[len('/grasp-patch/'):].split('/'))
+                sample = _streamer.grasp_patch(x, y, radius)
+            except ValueError:
+                self.send_error(400)
+                return
+            self._send_json(sample)
         else:
             self.send_error(404)
 
@@ -1137,7 +1162,10 @@ class StreamHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_state(self) -> None:
-        body = json.dumps(_streamer.get_state()).encode("utf-8")
+        self._send_json(_streamer.get_state())
+
+    def _send_json(self, value) -> None:
+        body = json.dumps(value).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store, no-cache")

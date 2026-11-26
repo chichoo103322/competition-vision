@@ -1,6 +1,7 @@
 """Regression checks for duplicate MJPEG traffic and shared-lock blocking."""
 
 import io
+import json
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -26,6 +27,24 @@ class PreviewTests(unittest.TestCase):
         handler.end_headers = Mock()
         handler.wfile = io.BytesIO()
         return handler
+
+    def test_grasp_patch_http_uses_raw_capture_and_ignores_preselection_frames(self):
+        s = self.streamer
+        s.enable_materials = True
+        s._pipeline.material_detector = stream.HSVMaterialDetector()
+        s.material_search_color = 2
+        s._latest_raw = np.full((80, 100, 3), (0, 255, 255), np.uint8)
+        s._raw_sequence = 17
+        s._raw_acquired_at = 14.95
+        handler = self.handler()
+        handler.path = '/grasp-patch/50/40/20'
+        with patch.object(stream, '_streamer', s), patch.object(stream.time, 'monotonic', return_value=15):
+            handler.do_GET()
+            sample = json.loads(handler.wfile.getvalue())
+            self.assertGreater(sample['area_px'], 1000)
+            self.assertEqual((sample['color_id'], sample['sequence'], sample['acquired']), (2, 17, 14.95))
+            s._mode_source_floor = 17
+            self.assertIsNone(s.grasp_patch(50, 40, 20))
 
     def test_http_does_not_resend_one_jpeg_as_multiple_frames(self):
         clock = [1.0]

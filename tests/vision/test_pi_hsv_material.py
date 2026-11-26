@@ -24,6 +24,22 @@ def paint(image, center, hsv, radius=38):
 
 
 class HSVMaterialTests(unittest.TestCase):
+    def test_grasp_check_counts_overlap_even_with_center_outside_and_no_top_face(self):
+        detector = HSVMaterialDetector(center_method='top_face')
+        frame = background()
+        frame[190:210, 460:526] = (0, 255, 255)  # center 192.5 px away; strip crosses the claw circle
+        self.assertGreaterEqual(detector.grasp_patch_area(frame, 300, 200, 180, 2), 255)
+        self.assertEqual(detector.grasp_patch_area(frame, 300, 200, 180, 1), 0)
+        self.assertEqual(detector.grasp_patch_area(frame, 270, 200, 180, 2), 0)
+
+    def test_grasp_patch_preserves_blue_cyan_identity(self):
+        detector = HSVMaterialDetector()
+        for color, hsv, other in ((3, (115, 240, 220), 6), (6, (98, 130, 240), 3)):
+            frame = background()
+            paint(frame, (200, 200), hsv)
+            self.assertGreater(detector.grasp_patch_area(frame, 200, 200, 180, color), 255)
+            self.assertLess(detector.grasp_patch_area(frame, 200, 200, 180, other), 255)
+
     def test_six_distinct_colors_including_black_and_lightblue(self):
         image = background()
         colors = [(0, 240, 220), (27, 220, 220), (115, 240, 220),

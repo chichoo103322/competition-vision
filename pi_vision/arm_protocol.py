@@ -13,12 +13,14 @@ def arm_command_payload(route_id, point_index, work_id, command_id, opcode,
                         z_deg=0, yaw_deg=0, reach_deg=0, reference_id=0):
     values = [scaled(v, 100, 21474836, n) for v, n in
               zip((z_deg, yaw_deg, reach_deg), ('z_deg', 'yaw_deg', 'reach_deg'))]
-    integer(opcode, 1, 6, 'opcode')
+    integer(opcode, 1, 9, 'opcode')
+    if opcode in (7, 8):
+        raise ValueError('tray place/reload opcodes require dedicated slot payload')
     integer(reference_id, 0, 0xffffffff, 'reference_id')
     if opcode != 2 and any(values):
         raise ValueError('only ALIGN accepts motor angles')
-    if opcode in (3, 4) and not reference_id or opcode not in (3, 4) and reference_id:
-        raise ValueError('PICK/GRIP_DONE require the last aligned command ID only')
+    if opcode in (3, 4, 9) and not reference_id or opcode not in (3, 4, 9) and reference_id:
+        raise ValueError('PICK/GRIP_DONE/GRIP_ABORT require the last aligned command ID only')
     if opcode == 1:
         if route_id or point_index or work_id:
             raise ValueError('ZERO requires empty context; never zero automatically')
@@ -35,7 +37,7 @@ def arm_command_payload(route_id, point_index, work_id, command_id, opcode,
 
 def arm_status_payload(payload):
     if len(payload) != 52:
-        raise ValueError('expected 52-byte ARM status, not route status')
+        raise ValueError(f'expected 52-byte ARM status, got {len(payload)} bytes')
     names = ('route_id', 'point_index', 'work_id', 'command_id', 'aligned_command_id',
              'state', 'fault', 'active_axis', 'opcode', 'flags', 'reserved',
              'z_cdeg', 'yaw_cdeg', 'reach_cdeg',
@@ -45,12 +47,15 @@ def arm_status_payload(payload):
     tray_uncertain = bool(result['flags'] & 32)
     tray_count, destination_slot = result['reserved'] & 255, result['reserved'] >> 8
     if (result['state'] >= (len(ARM_STATES) if tray_enabled else 17)
-            or result['fault'] > (5 if tray_enabled else 4) or result['flags'] & ~63
+            or result['fault'] > (5 if tray_enabled else 4)
             or result['active_axis'] not in (0, 1, 2, 255)
-            or result['opcode'] > (8 if tray_enabled else 6) or result['point_index'] > 63
+            or result['opcode'] > (9 if tray_enabled else 6) or result['point_index'] > 63
             or (tray_enabled and (tray_count > 3 or destination_slot > 3))
             or (not tray_enabled and (tray_uncertain or result['reserved']))):
-        raise ValueError('invalid ARM status fields')
+        raise ValueError(f"invalid ARM status fields: state={result['state']}, fault={result['fault']}, "
+                         f"axis={result['active_axis']}, opcode={result['opcode']}, "
+                         f"flags={result['flags']}, reserved={result['reserved']}, "
+                         f"point_index={result['point_index']}")
     result.update(tray_enabled=tray_enabled, tray_uncertain=tray_uncertain,
                   tray_count=tray_count, destination_slot=destination_slot,
                   grip_done_required=bool(result['flags'] & 4))
