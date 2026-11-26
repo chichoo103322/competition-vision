@@ -10,15 +10,17 @@ ARM_STATES = ('NEED_ORIGIN', 'ZEROING', 'READY', 'PREPARING', 'WAIT_VISION',
 
 
 def arm_command_payload(route_id, point_index, work_id, command_id, opcode,
-                        z_deg=0, yaw_deg=0, reach_deg=0, reference_id=0):
+                        z_deg=0, yaw_deg=0, reach_deg=0, reference_id=0, *, auto_load=False):
     values = [scaled(v, 100, 21474836, n) for v, n in
               zip((z_deg, yaw_deg, reach_deg), ('z_deg', 'yaw_deg', 'reach_deg'))]
-    integer(opcode, 1, 9, 'opcode')
+    integer(opcode, 1, 10, 'opcode')
     if opcode in (7, 8):
         raise ValueError('tray place/reload opcodes require dedicated slot payload')
+    if not isinstance(auto_load, bool) or (auto_load and opcode != 10):
+        raise ValueError('auto_load requires ALIGN_PICK')
     integer(reference_id, 0, 0xffffffff, 'reference_id')
-    if opcode != 2 and any(values):
-        raise ValueError('only ALIGN accepts motor angles')
+    if opcode not in (2, 10) and any(values):
+        raise ValueError('only ALIGN/ALIGN_PICK accepts motor angles')
     if opcode in (3, 4, 9) and not reference_id or opcode not in (3, 4, 9) and reference_id:
         raise ValueError('PICK/GRIP_DONE/GRIP_ABORT require the last aligned command ID only')
     if opcode == 1:
@@ -30,9 +32,10 @@ def arm_command_payload(route_id, point_index, work_id, command_id, opcode,
         integer(work_id, 102, 107, 'work_id')
         if opcode == 6 and (point_index != 0 or command_id != 1):
             raise ValueError('TEST_BEGIN requires point_index=0 and command_id=1')
+    slot = int(auto_load) if opcode == 10 else 0
     return struct.pack('<IHHIBBHiiiI', integer(route_id, 0, 0xffffffff, 'route_id'),
         integer(point_index, 0, 63, 'point_index'), integer(work_id, 0, 65535, 'work_id'),
-        integer(command_id, 1, 0xffffffff, 'command_id'), opcode, 0, 0, *values, reference_id)
+        integer(command_id, 1, 0xffffffff, 'command_id'), opcode, slot, 0, *values, reference_id)
 
 
 def arm_status_payload(payload):
@@ -49,7 +52,7 @@ def arm_status_payload(payload):
     if (result['state'] >= (len(ARM_STATES) if tray_enabled else 17)
             or result['fault'] > (5 if tray_enabled else 4)
             or result['active_axis'] not in (0, 1, 2, 255)
-            or result['opcode'] > (9 if tray_enabled else 6) or result['point_index'] > 63
+            or result['opcode'] > 10 or result['point_index'] > 63
             or (tray_enabled and (tray_count > 3 or destination_slot > 3))
             or (not tray_enabled and (tray_uncertain or result['reserved']))):
         raise ValueError(f"invalid ARM status fields: state={result['state']}, fault={result['fault']}, "

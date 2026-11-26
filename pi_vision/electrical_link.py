@@ -152,11 +152,11 @@ class ElectricalClient:
         raise ArmStatusMissing('fresh ARM status missing after two ACKs.' + detail)
 
     def arm_command(self, route_id, point_index, work_id, command_id, opcode,
-                    z_deg=0, yaw_deg=0, reach_deg=0, reference_id=0):
+                    z_deg=0, yaw_deg=0, reach_deg=0, reference_id=0, *, auto_load=False):
         # Retries keep the exact frame/command_id; MCU deduplicates the last accepted command.
         return self._exchange(arm.ARM_COMMAND, arm.arm_command_payload(
             route_id, point_index, work_id, command_id, opcode,
-            z_deg, yaw_deg, reach_deg, reference_id))
+            z_deg, yaw_deg, reach_deg, reference_id, auto_load=auto_load))
 
     def arm_zero(self, command_id):
         """Explicit operator action after physically placing the manual origin. Never auto-called."""
@@ -165,6 +165,11 @@ class ElectricalClient:
     def arm_align(self, route_id, point_index, work_id, command_id, z_deg, yaw_deg, reach_deg):
         return self.arm_command(route_id, point_index, work_id, command_id, 2,
                                 z_deg, yaw_deg, reach_deg)
+
+    def arm_align_pick(self, route_id, point_index, work_id, command_id, z_deg, yaw_deg, reach_deg, *,
+                       auto_load=False):
+        return self.arm_command(route_id, point_index, work_id, command_id, 10,
+                                z_deg, yaw_deg, reach_deg, auto_load=auto_load)
 
     def arm_test_begin(self, test_id, work_id):
         return self.arm_command(test_id, 0, work_id, 1, 6)

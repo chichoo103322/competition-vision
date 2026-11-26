@@ -1286,3 +1286,92 @@ def test_empty_claw_state_fallback_accepts_offset_color_without_distance_rejecti
     assert rows[0]['event'] == 'target_color_present' and rows[0]['mode'] == 'state_color_fallback'
     assert rows[1]['event'] == 'empty_claw_detected' and rows[1]['mode'] == 'state_color_fallback'
 
+
+@pytest.mark.parametrize('empty_claw_check', [False, True])
+def test_align_pick_simultaneous_three_axis_auto_load_and_empty_claw_abort(tmp_path, empty_claw_check):
+    class AlignPickPlant(Plant):
+        def __init__(self):
+            super().__init__()
+            self.arm.update(tray_enabled=True, tray_uncertain=False,
+                            tray_count=0, grip_done_required=True)
+            self.initial_errors = {2: (90, 60), 3: (-40, 80), 1: (0, 0)}
+            self.steps = []
+            self.attempts = {}
+
+        def arm_align_pick(self, route, index, work, command, z, yaw, reach, *, auto_load=False):
+            self.attempts[self.color] = self.attempts.get(self.color, 0) + 1
+            self.calls.append(('align_pick', self.color, command, round(z * 100), round(yaw * 100),
+                               round(reach * 100), auto_load))
+            target_z, target_yaw, target_reach = round(z * 100), round(yaw * 100), round(reach * 100)
+            self.arm.update(command_id=command, aligned_command_id=command, opcode=10,
+                            state_name='ALIGNING', z_cdeg=-27000,
+                            target_z_cdeg=target_z, target_yaw_cdeg=target_yaw, target_reach_cdeg=target_reach)
+            if auto_load:
+                self.steps = [
+                    dict(state_name='ALIGNING', z_cdeg=target_z, yaw_cdeg=target_yaw, reach_cdeg=target_reach),
+                    dict(state_name='LIFTING', z_cdeg=-10000),
+                    dict(state_name='TRAY_LOADING', z_cdeg=0, tray_count=self.arm['tray_count'] + 1),
+                    dict(state_name='PICKED', z_cdeg=0, yaw_cdeg=0, reach_cdeg=-19098,
+                         target_z_cdeg=0, target_yaw_cdeg=0, target_reach_cdeg=-19098),
+                ]
+            else:
+                self.steps = [
+                    dict(state_name='ALIGNING', z_cdeg=-54000, yaw_cdeg=target_yaw, reach_cdeg=target_reach),
+                    dict(state_name='WAIT_GRIP', z_cdeg=target_z, yaw_cdeg=target_yaw, reach_cdeg=target_reach),
+                ]
+
+        def arm_status(self):
+            if self.steps:
+                self.arm.update(self.steps.pop(0))
+            return super().arm_status()
+
+        def arm_grip_abort(self, route, index, work, command, reference):
+            assert self.arm['state_name'] == 'WAIT_GRIP'
+            assert reference == self.arm['aligned_command_id']
+            self.calls.append(('grip_abort', self.color, command, reference))
+            self.arm.update(command_id=command, aligned_command_id=0, opcode=9,
+                            state_name='WAIT_VISION', z_cdeg=0, target_z_cdeg=0)
+
+        def arm_grip_done(self, route, index, work, command, reference):
+            assert self.arm['state_name'] == 'WAIT_GRIP'
+            assert reference == self.arm['aligned_command_id']
+            self.calls.append(('grip_done', self.color, command, reference))
+            self.arm.update(command_id=command, state_name='PICKED',
+                            tray_count=self.arm['tray_count'] + 1,
+                            z_cdeg=0, yaw_cdeg=0, reach_cdeg=-19098,
+                            target_z_cdeg=0, target_yaw_cdeg=0, target_reach_cdeg=-19098)
+
+        def arm_finish(self, route, index, work, command):
+            assert self.arm['tray_count'] == 3
+            self.arm.update(command_id=command, state_name='READY_LEAVE')
+
+    plant = AlignPickPlant()
+
+    def patch_snapshot(x, y, radius, timeout):
+        plant.now += .005
+        plant.seq += 1
+        area = 0 if (plant.color == 2 and plant.attempts.get(2, 0) == 1) else 400
+        return dict(sequence=plant.seq, acquired=plant.now, session_id='test-session',
+                    generation=plant.generation, capture_epoch=0, color_id=plant.color, area_px=area)
+
+    runner = ThreeColorTrial(plant, plant.reference, plant.mapping, plant.snapshot,
+                             plant.select_color, tmp_path, real_tray=True,
+                             direct_pick_after_align=True, align_pick=True,
+                             empty_claw_check=empty_claw_check,
+                             patch_snapshot=patch_snapshot if empty_claw_check else None,
+                             clock=lambda: plant.now, sleep=plant.sleep)
+    result = runner.run([2, 3, 1], 400)
+    assert [c['tray_count'] for c in result['colors']] == [1, 2, 3]
+    align_picks = [c for c in plant.calls if c[0] == 'align_pick']
+    assert all(c[3] == -59450 and c[6] is (not empty_claw_check) for c in align_picks)
+    assert not any(c[0] == 'pick' for c in plant.calls)
+    if empty_claw_check:
+        assert [c['empty_claw_retries'] for c in result['colors']] == [1, 0, 0]
+        assert len(align_picks) == 4
+        assert [c[0] for c in plant.calls if c[0] in ('grip_abort', 'grip_done')] == [
+            'grip_abort', 'grip_done', 'grip_done', 'grip_done']
+    else:
+        assert len(align_picks) == 3
+        assert not any(c[0] in ('grip_abort', 'grip_done') for c in plant.calls)
+
+

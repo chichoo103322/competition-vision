@@ -356,9 +356,10 @@ ARM_AXES = ('z', 'yaw', 'reach')
 PICK_MOTOR_CDEG_PER_MM = 900
 GRASP_LIFT_CLEAR_MM = 5
 DEFAULT_PICK_DROP_MM = 100
+DEFAULT_ALIGN_PICK_DROP_CDEG = 59450
 REAL_TRAY_PICK_DROPS_MM = (50, 80, DEFAULT_PICK_DROP_MM)
 # 45950 cdeg was reported on the car. 77450 (+35 mm) and 90950 (+50 mm) extend that stroke.
-REAL_TRAY_PICK_DROPS_CDEG = (45000, 45950, 72000, 77450, 90000, 90950)
+REAL_TRAY_PICK_DROPS_CDEG = (45000, 45950, 59450, 72000, 77450, 90000, 90950)
 
 
 class FeedbackLevel(IntEnum):
@@ -660,7 +661,8 @@ class ThreeColorTrial(ArmTrial):
                  empty_claw_check=False, max_empty_claw_retries=3,
                  mid_drop_check_mm=60., grasp_check_radius_px=640., grasp_close_wait_s=.55,
                  grasp_check_frames=3, grasp_check_min_hits=2, grasp_check_timeout_s=2.5,
-                 direct_pick_after_align=False, patch_snapshot=None):
+                 direct_pick_after_align=False, patch_snapshot=None,
+                 align_pick=False, align_pick_drop_cdeg=None):
         if (simulate_servos is True) == (real_tray is True):
             raise ValueError('choose exactly one of --simulate-servos and --real-tray')
         for k in ('camera_source', 'hsv_profile_sha256', 'resolution', 'origin_radius_mm'):
@@ -677,6 +679,8 @@ class ThreeColorTrial(ArmTrial):
             raise ValueError('wide yaw requires real tray mode')
         if empty_claw_check and not self.real_tray:
             raise ValueError('empty-claw check requires real tray mode')
+        if align_pick and not self.real_tray:
+            raise ValueError('align-pick requires real tray mode')
         allowed_drops = REAL_TRAY_PICK_DROPS_MM if self.real_tray else (DEFAULT_PICK_DROP_MM,)
         if pick_drop_mm is None and not self.real_tray:
             pick_drop_mm = DEFAULT_PICK_DROP_MM
@@ -700,6 +704,13 @@ class ThreeColorTrial(ArmTrial):
         self.grasp_check_min_hits = int(grasp_check_min_hits)
         self.grasp_check_timeout_s = float(grasp_check_timeout_s)
         self.direct_pick_after_align = bool(direct_pick_after_align)
+        self.align_pick = bool(align_pick)
+        self.align_pick_drop_cdeg = (int(align_pick_drop_cdeg) if align_pick_drop_cdeg is not None
+                                     else (pick_drop_mm * PICK_MOTOR_CDEG_PER_MM if pick_drop_mm is not None
+                                           else DEFAULT_ALIGN_PICK_DROP_CDEG))
+        if self.align_pick_drop_cdeg <= 0:
+            raise ValueError('align_pick_drop_cdeg must be positive')
+        self._pending_align_pick = None
         self.camera_session = self.capture_epoch = self.generation = None
         self.last_sequence, self.last_acquired = 0, float('-inf')
 
@@ -1001,6 +1012,97 @@ class ThreeColorTrial(ArmTrial):
         self.require_tray_count(photo, count_before)
         self.record('empty_claw_aborted', color_id=self.color, arm=photo, tray_count=count_before)
         return photo
+
+    def align_pick_with_check(self, target, *, before, timeout=40):
+        """发 CMD_ALIGN_PICK(opcode=10, auto_load=False)：三轴联动对准并下压，到 6 cm 复核颜色，落底 WAIT_GRIP 后决定入盘或中止。"""
+        self.command += 1
+        self.record('align_pick_request', color_id=self.color, command=self.command,
+                    target_cdeg=target, auto_load=False)
+        try:
+            self.client.arm_align_pick(*self.context, self.command, *(v / 100 for v in target), auto_load=False)
+        except Rejected:
+            self.command -= 1
+            raise
+        start = self.clock()
+        deadline = start + timeout
+        check_drop_cdeg = self.mid_drop_check_mm * PICK_MOTOR_CDEG_PER_MM
+        checked = False
+        grasped = True
+        while self.clock() < deadline:
+            a = self.checked_arm()
+            self.record('feedback', color_id=self.color, arm=a)
+            state = a['state_name']
+            if state not in ('ALIGNING', 'WAIT_GRIP'):
+                raise RuntimeError('unexpected state ' + state)
+            descended = before['z_cdeg'] - a['z_cdeg']
+            if not checked and state == 'ALIGNING' and descended >= check_drop_cdeg:
+                checked = True
+                # 电控 CMD_GRIP_ABORT 仅在 LOWERING/WAIT_GRIP 受理，这里先完成快速拍帧判定，等落底 WAIT_GRIP 立刻发中止。
+                grasped = self.check_object_present_fast(a['z_cdeg'], stage='mid_drop_6cm')
+            if state == 'WAIT_GRIP':
+                if not checked:
+                    checked = True
+                    grasped = self.check_object_present_fast(a['z_cdeg'], stage='wait_grip_fallback')
+                drop_cdeg = max(0, before['z_cdeg'] - a['target_z_cdeg'])
+                self.last_motion = dict(elapsed_s=self.clock() - start, full_avoidance=False)
+                self.record('arrived', state='WAIT_GRIP', **self.last_motion, arm=a)
+                return dict(a, pick_drop_cdeg=drop_cdeg,
+                            pick_drop_mm=drop_cdeg / PICK_MOTOR_CDEG_PER_MM), grasped
+            self.sleep(.05)
+        raise TimeoutError('motion timeout waiting WAIT_GRIP')
+
+    def align_pick_and_load(self, target, *, before, timeout=90):
+        """发 CMD_ALIGN_PICK(opcode=10, auto_load=True)：三轴联动对准下压、闭爪、抬升回缩、入盘一条指令到底。"""
+        count_before = len(self.results)
+        self.require_tray_count(before, count_before)
+        pick_started = self.clock()
+        self.command += 1
+        self.record('align_pick_request', color_id=self.color, command=self.command,
+                    target_cdeg=target, auto_load=True)
+        try:
+            self.client.arm_align_pick(*self.context, self.command, *(v / 100 for v in target), auto_load=True)
+        except Rejected:
+            self.command -= 1
+            raise
+        deadline = pick_started + timeout
+        loading_seen = False
+        lift_clear_s = None
+        count_seen = count_before
+        lowest_z = target[0]
+        while self.clock() < deadline:
+            arm = self.checked_arm()
+            state = arm['state_name']
+            self.record('tray_feedback', color_id=self.color, arm=arm)
+            if state in ('ALIGNING', 'WAIT_GRIP'):
+                lowest_z = min(lowest_z, arm['z_cdeg'])
+                self.require_tray_count(arm, count_before)
+            elif state == 'LIFTING':
+                if (lift_clear_s is None
+                        and arm['z_cdeg'] - lowest_z >= GRASP_LIFT_CLEAR_MM * PICK_MOTOR_CDEG_PER_MM):
+                    lift_clear_s = self.clock()
+                    self.record('grasp_lift_feedback', color_id=self.color,
+                                pick_to_lift_s=round(lift_clear_s - pick_started, 3),
+                                first_target_to_lift_s=round(lift_clear_s - self.first_target_seen, 3)
+                                if self.first_target_seen is not None else None,
+                                lift_mm=round((arm['z_cdeg'] - lowest_z) / PICK_MOTOR_CDEG_PER_MM, 2))
+                if not loading_seen:
+                    self.require_tray_count(arm, count_before)
+            elif state == 'TRAY_LOADING':
+                loading_seen = True
+                count = arm['tray_count']
+                if not count_seen <= count <= count_before + 1:
+                    raise RuntimeError('tray count regressed or incremented more than once')
+                count_seen = count
+            elif state == 'PICKED':
+                self.require_tray_count(arm, count_before + 1)
+                drop_cdeg = max(0, before['z_cdeg'] - target[0])
+                lower = dict(z_cdeg=lowest_z, pick_drop_cdeg=drop_cdeg,
+                             pick_drop_mm=drop_cdeg / PICK_MOTOR_CDEG_PER_MM)
+                return lower, arm
+            else:
+                raise RuntimeError('unexpected state during align_pick tray transfer: ' + state)
+            self.sleep(.05 if state in ('ALIGNING', 'WAIT_GRIP') else .12)
+        raise TimeoutError('STM32 did not confirm PICKED after ALIGN_PICK')
 
     def finish_tray_load(self, aligned, lower, pick_started):
         count_before = len(self.results)
@@ -1375,6 +1477,8 @@ class ThreeColorTrial(ArmTrial):
             self.envelope(a)
             accepted = observation['in_grasp_window'] if self.real_tray else self.tuning.accepts(error)
             if accepted and a['state_name'] == 'ALIGNED':
+                if self.real_tray and self.align_pick:
+                    self._pending_align_pick = ([-self.align_pick_drop_cdeg, a['yaw_cdeg'], a['reach_cdeg']], a)
                 if self.save_frame:
                     self.save_frame(self.output/f'{self.color}_aligned.jpg')
                 return a, observation, error.tolist()
@@ -1446,6 +1550,13 @@ class ThreeColorTrial(ArmTrial):
                 active_since = self.clock()
             self.record('servo_correction',color_id=self.color,predicted_pixel=(
                 observation['pixel'] if distance==0 else pixel.tolist()),step_gain=servo.step_gain)
+            if (self.real_tray and self.align_pick and self.direct_pick_after_align
+                    and (accepted or not self.micro_only)):
+                # 三轴联动模式：不先单独发 ALIGN，直接把 [z_pick, yaw, reach] 交给 CMD_ALIGN_PICK(opcode=10) 一步到位。
+                self._pending_align_pick = ([-self.align_pick_drop_cdeg, target[1], target[2]], a)
+                if self.save_frame:
+                    self.save_frame(self.output/f'{self.color}_aligned.jpg')
+                return a, observation, (error.tolist() if accepted else [0., 0.])
             anchor = (observation,a,error.copy())
             total += distance
             adjustments += 1
@@ -1476,6 +1587,7 @@ class ThreeColorTrial(ArmTrial):
         if self.real_tray:
             empty_claw_retries = 0
             while True:
+                self._pending_align_pick = None
                 aligned, obs, error = self.align_color()
                 now = self.clock()
                 result = dict(color_id=self.color, color_name=COLORS[self.color],
@@ -1493,7 +1605,35 @@ class ThreeColorTrial(ArmTrial):
                             color_to_pick_ready_s=result['color_to_pick_ready_s'],
                             reachable_to_pick_ready_s=result['reachable_to_pick_ready_s'],
                             grasp_radius_px=obs['grasp_radius_px'])
-                if self.empty_claw_check:
+                if self._pending_align_pick is not None:
+                    pick_target, before_arm = self._pending_align_pick
+                    self._pending_align_pick = None
+                    count_before = len(self.results)
+                    self.require_tray_count(before_arm, count_before)
+                    pick_started = self.clock()
+                    try:
+                        if self.empty_claw_check:
+                            lower, grasped = self.align_pick_with_check(pick_target, before=before_arm)
+                        else:
+                            lower, parked = self.align_pick_and_load(pick_target, before=before_arm)
+                            grasped = True
+                    except Rejected as exc:
+                        self.record('controller_rejected_align_pick', color_id=self.color,
+                                    target_cdeg=pick_target, error=str(exc), motion_sent=False)
+                        self.view_targets = set()
+                        self.last_unreachable_view_hint = None
+                        continue
+                    if self.empty_claw_check:
+                        if not grasped:
+                            empty_claw_retries += 1
+                            self.abort_empty_grasp(lower, lower)
+                            if empty_claw_retries > self.max_empty_claw_retries:
+                                raise RuntimeError(f'target color unconfirmed after {self.max_empty_claw_retries} retries')
+                            self.view_targets = set()
+                            self.last_unreachable_view_hint = None
+                            continue
+                        lower, parked = self.finish_tray_load(lower, lower, pick_started)
+                elif self.empty_claw_check:
                     count_before = len(self.results)
                     self.require_tray_count(aligned, count_before)
                     pick_started = self.clock()
@@ -1614,6 +1754,10 @@ def main():
                         help='real tray: allow -12..+22deg after checking physical clearance')
     parser.add_argument('--no-direct-pick', action='store_true',
                         help='real tray: re-observe after one-shot ALIGN instead of picking immediately')
+    parser.add_argument('--no-align-pick', action='store_true',
+                        help='real tray: disable simultaneous 3-axis CMD_ALIGN_PICK (opcode=10) and use legacy ALIGN+PICK')
+    parser.add_argument('--align-pick-drop-cdeg', type=int, default=None,
+                        help=f'real tray: Z drop in motor cdeg for CMD_ALIGN_PICK (default {DEFAULT_ALIGN_PICK_DROP_CDEG}, matching ARM_PICK_DROP_CDEG)')
     parser.add_argument('--empty-claw-check', action='store_true',
                         help='real tray: check a local HSV patch during descent, retry on GRIP_ABORT')
     parser.add_argument('--max-empty-claw-retries', type=int, default=3,
@@ -1690,6 +1834,9 @@ def main():
                 grasp_check_radius_px=args.grasp_check_radius_px,
                 grasp_close_wait_s=args.grasp_close_wait_s,
                 direct_pick_after_align=args.real_tray and not args.no_direct_pick,
+                align_pick=(args.real_tray and not args.no_align_pick
+                            and not args.no_direct_pick and not args.micro_only),
+                align_pick_drop_cdeg=args.align_pick_drop_cdeg,
                 save_failure=save_failure if args.real_tray else None,
                 save_frame=save_frame if args.save_aligned_frame or args.simulate_servos else None)
             run_trial(trial, order)

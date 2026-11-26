@@ -156,3 +156,19 @@ def test_grip_abort_opcode_9_command_and_status_are_supported():
     body[16:24] = struct.pack('<BBBBHH', 4, 0, 255, 9, 29, 0)
     report = a.arm_status_payload(body)
     assert report['state_name'] == 'WAIT_VISION' and report['opcode'] == 9
+
+
+def test_align_pick_opcode_10_command_and_status_are_supported():
+    payload = a.arm_command_payload(7, 0, 102, 12, 10, -594.5, 20.5, -105.4, auto_load=True)
+    assert len(payload) == 32
+    assert struct.unpack('<IHHIBBHiiiI', payload) == (7, 0, 102, 12, 10, 1, 0, -59450, 2050, -10540, 0)
+    payload_wait = a.arm_command_payload(7, 0, 102, 13, 10, -594.5, 20.5, -105.4, auto_load=False)
+    assert struct.unpack('<IHHIBBHiiiI', payload_wait)[5] == 0
+    with pytest.raises(ValueError, match='auto_load'):
+        a.arm_command_payload(7, 0, 102, 12, 2, 0, 0, 0, auto_load=True)
+    with pytest.raises(ValueError, match='GRIP_ABORT'):
+        a.arm_command_payload(7, 0, 102, 12, 10, -594.5, 0, 0, reference_id=10)
+    body = bytearray(arm_body(state=8))
+    body[16:24] = struct.pack('<BBBBHH', 8, 0, 255, 10, 29, 0)
+    report = a.arm_status_payload(body)
+    assert report['state_name'] == 'WAIT_GRIP' and report['opcode'] == 10
